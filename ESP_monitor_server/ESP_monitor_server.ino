@@ -272,7 +272,7 @@ float sim_windDir        = 180.0f;
 float sim_soilMoisture   = 50.0f;
 
 // ── Pipeline simulado / hardware-ready ───────────────────────────────────────
-String pipelineScenario      = "normal";    // normal | leak | burst
+String pipelineScenario      = "normal";    // normal | leak | burst | obstruction
 String pipelineMode          = "sim";       // sim | real
 String pipelineSource        = "sim";       // sim | real | fallback
 bool   pipelinePressureOk    = false;
@@ -330,6 +330,17 @@ void updatePipelineSimValues() {
     sim_pipeline_flow     = valveOpen
       ? max(0.0f, PIPELINE_NOMINAL_Q * 0.08f + fabsf(q_noise) * 0.3f)
       : 0.0f;
+
+  } else if (pipelineScenario == "obstruction") {
+    if (valveOpen) {
+      // Tubería bloqueada: presión no cae (queda cerca de la estática), caudal ~0
+      sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P + p_noise * 0.5f);
+      sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.04f);
+    } else {
+      // Válvula cerrada: igual que escenario normal
+      sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P + p_noise);
+      sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.05f);
+    }
 
   } else if (pipelineScenario == "leak") {
     if (valveOpen) {
@@ -854,7 +865,8 @@ void syncPipelineScenario() {
 #ifndef ESP8266
       if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
 #endif
-      if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
+      if (nextScenario == "normal" || nextScenario == "leak" ||
+          nextScenario == "burst"  || nextScenario == "obstruction") {
         if (nextScenario != pipelineScenario) {
           Serial.printf("[PIPE] Escenario → %s\n", nextScenario.c_str());
         }
@@ -896,7 +908,8 @@ void syncPipelineScenario() {
     }
 
     body.trim();
-    if (body == "normal" || body == "leak" || body == "burst") {
+    if (body == "normal" || body == "leak" ||
+        body == "burst"  || body == "obstruction") {
       if (body != pipelineScenario) {
         Serial.printf("[PIPE] Escenario → %s\n", body.c_str());
       }
@@ -1218,7 +1231,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Proteger escrituras de Strings con mutex (leídas desde Core 1)
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-  if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
+  if (nextScenario == "normal" || nextScenario == "leak" ||
+      nextScenario == "burst"  || nextScenario == "obstruction") {
     if (nextScenario != pipelineScenario) {
       pipelineScenario = nextScenario;
       updatedPipe = true;
