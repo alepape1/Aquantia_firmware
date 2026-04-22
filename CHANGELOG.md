@@ -9,9 +9,20 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [v0.1.0] — 2026-04-22
+
+**Backend compatible:** `v0.1.0`
+
+Primera versión estable del firmware Aquantia. Consolida todas las funcionalidades desarrolladas durante el ciclo beta: MQTT/TLS, perfiles METEO/IRRIGATION, provisioning SoftAP, Flash Tool GUI y simulador pipeline.
+
+### Cambiado
+- Versión de release alineada con backend `v0.1.0`
+
+---
+
 ## [v0.1.0-beta.3] — 2026-04-16
 
-**Backend compatible:** `v0.1.0-beta.2`
+**Backend compatible:** `v0.1.0-beta.3`
 
 Beta de estabilización centrada en dejar la conectividad segura y el flujo de flash más robustos antes del siguiente despliegue.
 
@@ -114,6 +125,7 @@ Primera versión operativa con FreeRTOS. Incluida en `v0.1.0-beta.1`.
 
 ---
 
+[v0.1.0]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0
 [v0.1.0-beta.3]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.3
 [v0.1.0-beta.2]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.2
 [v0.1.0-beta.1]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.1
