@@ -212,8 +212,9 @@ bool htu_ok = false;
 bool dht_ok = false;
 static uint8_t bmp280_addr = 0x00;
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-bool hdc_ok     = false;   // HDC1080 — temperatura y humedad primaria
-bool bh1750_ok  = false;   // BH1750  — iluminancia
+bool hdc_ok        = false;   // HDC1080 — temperatura y humedad primaria
+bool bh1750_ok     = false;   // BH1750  — iluminancia
+bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
 static uint8_t bmp280_addr = 0x00;
 #endif
 bool tsl_ok = false;
@@ -310,6 +311,55 @@ static float agro_calcHeatIndex(float tempC, float hum) {
 static float agro_calcAbsHumidity(float tempC, float hum) {
   float es = 6.112f * expf((17.67f * tempC) / (tempC + 243.5f));
   return (es * hum * 2.1674f) / (273.15f + tempC);
+}
+
+// =============================================================================
+// Qwiic Power Switch — PCA9536 GPIO expander, I2C 0x41 (solo PROFILE_AGROMETEO)
+// GPIO 0 controla el MOSFET de carga: HIGH = sensores encendidos
+// =============================================================================
+#define QWIIC_PS_ADDR 0x41
+
+// Configura GPIO 0 del PCA9536 como salida y deja los sensores apagados.
+static bool qwiic_ps_init() {
+  // Registro de configuración 0x03: 0xFE → solo GPIO 0 es salida
+  Wire.beginTransmission(QWIIC_PS_ADDR);
+  Wire.write(0x03);
+  Wire.write(0xFE);
+  if (Wire.endTransmission() != 0) return false;
+  // Registro de salida 0x01: LOW → sensores apagados por defecto
+  Wire.beginTransmission(QWIIC_PS_ADDR);
+  Wire.write(0x01);
+  Wire.write(0x00);
+  return Wire.endTransmission() == 0;
+}
+
+// Enciende o apaga la alimentación del bus de sensores.
+static void qwiic_ps_power(bool on) {
+  if (!qwiic_ps_ok) return;
+  Wire.beginTransmission(QWIIC_PS_ADDR);
+  Wire.write(0x01);           // Output port register
+  Wire.write(on ? 0x01 : 0x00);
+  Wire.endTransmission();
+}
+
+// Re-inicializa los tres sensores tras un ciclo de alimentación.
+// Se llama en cada ciclo de lectura, después de qwiic_ps_power(true).
+static void agro_sensors_reinit() {
+  // BMP280 — restaurar modo normal y configuración de muestreo
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                      Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16,
+                      Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_500);
+  }
+  // HDC1080 — restaurar registro de configuración (15 ms de arranque interno)
+  if (!hdc_ok) hdc_ok = hdc1080_init();
+  else               hdc1080_init();  // reconfigurar siempre tras power-on
+  // BH1750 — restaurar modo continuo de alta resolución
+  bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  if (bh1750_ok) delay(180);  // primera conversión ~120 ms; esperar con margen
 }
 #endif  // PROFILE_AGROMETEO
 
@@ -1887,6 +1937,16 @@ void setup() {
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
+  // ── AGROMETEO: Qwiic Power Switch — enciende el bus de sensores ──────────
+  qwiic_ps_ok = qwiic_ps_init();
+  if (qwiic_ps_ok) {
+    qwiic_ps_power(true);
+    delay(50);   // esperar estabilización de la alimentación antes de init I2C
+    Serial.println("Qwiic Power Switch OK — sensores encendidos");
+  } else {
+    Serial.println("Qwiic Power Switch no detectado — sensores siempre alimentados");
+  }
+
   // ── AGROMETEO: BMP280 + HDC1080 + BH1750 ─────────────────────────────────
   // BMP280 — presión atmosférica y temperatura secundaria
   bmp_ok = beginBMP280();
@@ -2359,6 +2419,14 @@ void loop() {
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
     // ── AGROMETEO: HDC1080 + BMP280 + BH1750 + parámetros calculados ────────
+    // Encender Qwiic Power Switch, re-inicializar sensores y leer valores.
+    // Al terminar se apagan los sensores para reducir consumo en reposo.
+    qwiic_ps_power(true);
+    if (qwiic_ps_ok) {
+      delay(10);              // esperar estabilización de la alimentación
+      agro_sensors_reinit();  // restaura config de BMP280 + HDC1080 + BH1750
+    }
+
     // HDC1080 — temperatura y humedad primaria → temperatureMCP + humidity
     if (hdc_ok) {
       float t = hdc1080_readTemp();
@@ -2420,6 +2488,9 @@ void loop() {
                         ? agro_calcHeatIndex(Tavg, H) : NAN;
       }
     }
+
+    // Apagar sensores tras la lectura para reducir consumo en reposo
+    qwiic_ps_power(false);
 #endif  // PROFILE_AGROMETEO
 
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
