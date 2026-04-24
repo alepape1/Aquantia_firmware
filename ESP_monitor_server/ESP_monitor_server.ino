@@ -178,6 +178,9 @@ const int ledPin = 2;
   Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
   Adafruit_BMP280        bmp280;
   DHTesp                 dht;
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  Adafruit_BMP280        bmp280;
+  BH1750                 bh1750;
 #endif
 
 #ifdef HAS_DISPLAY
