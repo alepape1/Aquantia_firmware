@@ -12,6 +12,7 @@
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
+#define PROFILE_AGROMETEO   3   // ECU agrometeorológica — sin relays, sensores CJMCU-14 (BH1750+HDC1080+BMP280)
 
 #ifndef DEVICE_PROFILE
   #define DEVICE_PROFILE PROFILE_METEO
@@ -65,7 +66,7 @@
 #define PIPELINE_NOISE_Q    0.12f  // L/min — dispersión caudalímetro
 #define PIPELINE_NOMINAL_Q  5.00f  // L/min — caudal nominal del sistema
 
-// Librerías de sensores meteorológicos — solo perfil METEO
+// Librerías de sensores meteorológicos — según perfil
 #if DEVICE_PROFILE == PROFILE_METEO
   #include <SPI.h>
   #include <Wire.h>
@@ -77,6 +78,11 @@
   #include <Adafruit_BMP280.h>
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280)
+  #include <Wire.h>
+  #include <Adafruit_BMP280.h>
+  #include <BH1750.h>
 #else
   // IRRIGATION: solo I2C básico (sin sensores meteo)
   #include <Wire.h>
@@ -117,6 +123,10 @@
   #endif
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN_1, RELAY_PIN_2,
                                                    RELAY_PIN_3, RELAY_PIN_4};
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  // AGROMETEO: sin relays — array dummy para que el código compile sin cambios
+  #define RELAY_COUNT 0
+  static const uint8_t RELAY_PINS[1] = {0};
 #else
   #define RELAY_COUNT 1
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN};
@@ -180,7 +190,8 @@ const int ledPin = 2;
 // ── Relay electroválvula(s) ────────────────────────────────────────────────────
 // JQC-3FF-S-Z activo-LOW: LOW = relay ON (válvula abierta), HIGH = relay OFF
 // relayActive[i] — estado actual de cada relay (índice = bit en bitmask)
-bool relayActive[RELAY_COUNT] = {};
+// RELAY_COUNT puede ser 0 en AGROMETEO — usamos max(1,…) para evitar array de tamaño 0
+bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 
 #ifdef USE_MQTT
 static WiFiClient       mqttTCPClient;
@@ -200,10 +211,14 @@ bool htu_ok = false;
 #if DEVICE_PROFILE == PROFILE_METEO
 bool dht_ok = false;
 static uint8_t bmp280_addr = 0x00;
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+bool hdc_ok     = false;   // HDC1080 — temperatura y humedad primaria
+bool bh1750_ok  = false;   // BH1750  — iluminancia
+static uint8_t bmp280_addr = 0x00;
 #endif
 bool tsl_ok = false;
 
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
 static bool beginBMP280() {
   if (bmp280.begin(0x76)) {
     bmp280_addr = 0x76;
@@ -226,11 +241,84 @@ static bool readBMP280PressureKPa(float& outPressure) {
   outPressure = bmp280.readPressure() / 1000.0f;
   return !isnan(outPressure) && outPressure > 30.0f && outPressure < 120.0f;
 }
-#endif
+#endif  // PROFILE_METEO || PROFILE_AGROMETEO
+
+// =============================================================================
+// HDC1080 — temperatura y humedad I2C (solo PROFILE_AGROMETEO)
+// Dirección 0x40. Se accede directamente via Wire, sin librería externa.
+// NOTA: comparte dirección con HTU2x pero protocolo diferente.
+// =============================================================================
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#define HDC1080_ADDR 0x40
+
+static bool hdc1080_init() {
+  Wire.beginTransmission(HDC1080_ADDR);
+  Wire.write(0x02);  // registro de configuración
+  Wire.write(0x00);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  delay(15);
+  return true;
+}
+
+static float hdc1080_readTemp() {
+  Wire.beginTransmission(HDC1080_ADDR);
+  Wire.write(0x00);  // registro temperatura
+  if (Wire.endTransmission() != 0) return NAN;
+  delay(20);
+  Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2, (uint8_t)1);
+  if (Wire.available() < 2) return NAN;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  float t = (raw / 65536.0f) * 165.0f - 40.0f;
+  return (t > -40.0f && t < 85.0f) ? t : NAN;
+}
+
+static float hdc1080_readHum() {
+  Wire.beginTransmission(HDC1080_ADDR);
+  Wire.write(0x01);  // registro humedad
+  if (Wire.endTransmission() != 0) return NAN;
+  delay(20);
+  Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2, (uint8_t)1);
+  if (Wire.available() < 2) return NAN;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  float h = (raw / 65536.0f) * 100.0f;
+  return (h >= 0.0f && h <= 100.0f) ? h : NAN;
+}
+
+// Parámetros derivados agrometeorologícos
+// Temperatura: HDC1080 primaria, BMP280 secundaria; Tavg = media si ambas disponibles
+static float agro_calcDewPoint(float tempC, float hum) {
+  const float a = 17.271f, b = 237.7f;
+  float g = (a * tempC / (b + tempC)) + logf(hum / 100.0f);
+  return (b * g) / (a - g);
+}
+
+static float agro_calcHeatIndex(float tempC, float hum) {
+  float t = tempC * 9.0f / 5.0f + 32.0f;
+  float hi = -42.379f
+    + 2.04901523f  * t
+    + 10.14333127f * hum
+    - 0.22475541f  * t * hum
+    - 0.00683783f  * t * t
+    - 0.05481717f  * hum * hum
+    + 0.00122874f  * t * t * hum
+    + 0.00085282f  * t * hum * hum
+    - 0.00000199f  * t * t * hum * hum;
+  return (hi - 32.0f) * 5.0f / 9.0f;
+}
+
+static float agro_calcAbsHumidity(float tempC, float hum) {
+  float es = 6.112f * expf((17.67f * tempC) / (tempC + 243.5f));
+  return (es * hum * 2.1674f) / (273.15f + tempC);
+}
+#endif  // PROFILE_AGROMETEO
 
 static const char* temperatureSourceName() {
 #if DEVICE_PROFILE == PROFILE_METEO
   if (mcp_ok) return "MCP9808";
+  if (bmp_temp_ok) return "BMP280";
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  if (hdc_ok) return "HDC1080";
   if (bmp_temp_ok) return "BMP280";
 #endif
   return "SIM";
@@ -239,6 +327,8 @@ static const char* temperatureSourceName() {
 static const char* pressureSourceName() {
 #if DEVICE_PROFILE == PROFILE_METEO
   if (micropressure_ok) return "MicroPressure";
+  if (bmp_pressure_ok) return "BMP280";
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
   if (bmp_pressure_ok) return "BMP280";
 #endif
   return "SIM";
@@ -258,6 +348,14 @@ float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
 float  lightLevel        = 0;
 float  soilMoisture      = 0;   // YL-69 — humedad suelo (0=seco, 100=saturado)
+
+// ── Parámetros calculados AGROMETEO ───────────────────────────────────────────
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+float  agroTempAvg   = NAN;  // media HDC1080 + BMP280 si ambos disponibles
+float  agroDewPoint  = NAN;  // punto de rocío (Magnus)
+float  agroHeatIndex = NAN;  // índice de calor (>27°C y >40% HR)
+float  agroAbsHum    = NAN;  // humedad absoluta (g/m³)
+#endif
 
 // ── Valores simulados (drift lento) ───────────────────────────────────────────
 float sim_tempMCP   = 20.5f;
@@ -648,6 +746,9 @@ struct TelemetrySnapshot {
   float pipePressure, pipeFlow;
   long  heap, uptime;
   int   rssi, relayMask;
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  float dewPoint, heatIndex, absHum;
+#endif
 } _netSnap;
 #endif
 
@@ -1366,8 +1467,21 @@ void takeSnapshot() {
     s.uptime        = (long)(millis() / 1000);
     for (int i = 0; i < RELAY_COUNT; i++)
       if (relayActive[i]) s.relayMask |= (1 << i);
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    s.dewPoint  = agroDewPoint;
+    s.heatIndex = agroHeatIndex;
+    s.absHum    = agroAbsHum;
+#endif
     xSemaphoreGive(dataMutex);
   }
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  else {
+    // Sin mutex: capturar igual los campos AGROMETEO con valores actuales
+    s.dewPoint  = agroDewPoint;
+    s.heatIndex = agroHeatIndex;
+    s.absHum    = agroAbsHum;
+  }
+#endif
 }
 #endif
 
@@ -1498,6 +1612,12 @@ void networkTask(void* pvParameters) {
       doc["ip_address"]            = WiFi.localIP().toString();
       doc["relay_count"]           = RELAY_COUNT;
       doc["firmware_version"]      = FIRMWARE_VERSION;
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+      // Parámetros calculados agrometeorologícos — solo PROFILE_AGROMETEO
+      if (!isnan(snap.dewPoint))   doc["dew_point"]    = r1(snap.dewPoint);
+      if (!isnan(snap.heatIndex))  doc["heat_index"]   = r1(snap.heatIndex);
+      if (!isnan(snap.absHum))     doc["abs_humidity"] = r2(snap.absHum);
+#endif
       // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
       // El backend lo usa como timestamp real de la medición en lugar de NOW().
       {
@@ -1580,7 +1700,8 @@ void setup() {
 #ifdef DEBUG_MODE
   Serial.println("=== DEBUG MODE ACTIVO ===");
   Serial.printf("[TEST] Perfil  : %s (%d)\n",
-    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", DEVICE_PROFILE);
+    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", DEVICE_PROFILE);
   Serial.printf("[TEST] Relays  : %d\n", RELAY_COUNT);
   Serial.printf("[TEST] Display : %s\n",
 #ifdef HAS_DISPLAY
@@ -1765,6 +1886,65 @@ void setup() {
   Serial.println("Barometro — perfil IRRIGATION, sensor omitido");
 #endif
 
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  // ── AGROMETEO: BMP280 + HDC1080 + BH1750 ─────────────────────────────────
+  // BMP280 — presión atmosférica y temperatura secundaria
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                      Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16,
+                      Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_500);
+    float tBmp = NAN, pBmp = NAN;
+    bmp_temp_ok     = readBMP280Temperature(tBmp);
+    bmp_pressure_ok = readBMP280PressureKPa(pBmp);
+    if (bmp_temp_ok)     bmpTemperature = tBmp;
+    if (bmp_pressure_ok) { bmpPressure = pBmp; pressure = pBmp; }
+    bar_ok = bmp_pressure_ok;
+    Serial.printf("BMP280 OK (0x%02X)\n", bmp280_addr);
+  } else {
+    bmp_temp_ok     = false;
+    bmp_pressure_ok = false;
+    bar_ok          = false;
+    pressure        = sim_pressure;
+    Serial.println("BMP280 no detectado — modo simulacion");
+  }
+
+  // HDC1080 — temperatura y humedad primaria
+  hdc_ok = hdc1080_init();
+  if (hdc_ok) {
+    float t = hdc1080_readTemp();
+    float h = hdc1080_readHum();
+    if (!isnan(t) && !isnan(h)) {
+      temperatureMCP = t;
+      humidity       = h;
+      temp_ok        = true;
+      Serial.printf("HDC1080 OK — T:%.1f C  H:%.1f %%\n", t, h);
+    } else {
+      hdc_ok = false;
+    }
+  }
+  if (!hdc_ok) {
+    Serial.println("HDC1080 no detectado — modo simulacion");
+    temperatureMCP = sim_tempMCP;
+    humidity       = sim_humidity;
+  }
+
+  // BH1750 — iluminancia
+  bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  if (bh1750_ok) {
+    delay(200);  // primera conversión ~120ms
+    lightLevel = bh1750.readLightLevel();
+    Serial.printf("BH1750 OK — %.1f lx\n", lightLevel);
+  } else {
+    Serial.println("BH1750 no detectado — modo simulacion");
+    lightLevel = sim_light;
+  }
+#endif  // PROFILE_AGROMETEO
+
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+  // HTU2x — omitido en AGROMETEO (dirección 0x40 ocupada por HDC1080)
   htu_ok = htu_begin();
   if (htu_ok) {
     htu_heater_warmup();
@@ -1783,6 +1963,11 @@ void setup() {
     temperatureDHT = sim_tempDHT;
     humidity       = sim_humidity;
   }
+#else
+  // AGROMETEO: sin HTU2x — HDC1080 ya inicializado
+  htu_ok         = false;
+  temperatureDHT = sim_tempDHT;  // campo no usado en AGROMETEO
+#endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
   // DHT11
@@ -1805,7 +1990,8 @@ void setup() {
   Serial.println("DHT11 — perfil IRRIGATION, sensor omitido");
 #endif
 
-  // TSL2584 — el begin() ya espera la primera integración (450ms)
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+  // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750 inicializado arriba)
   tsl_ok = tsl_begin();
   if (tsl_ok) {
     Serial.println("Sensor luz OK");
@@ -1814,6 +2000,9 @@ void setup() {
     Serial.println("Sensor luz no detectado — modo simulacion");
     lightLevel = sim_light;
   }
+#else
+  tsl_ok = false;  // AGROMETEO usa BH1750, no TSL/APDS
+#endif
 
 #if defined(SOIL_PIN)
   {
@@ -1995,13 +2184,19 @@ void setup() {
 #ifdef DEBUG_MODE
   Serial.println(F("\n====== AQUANTIA BOOT COMPLETO ======"));
   Serial.printf("[TEST] Perfil   : %s | Relays: %d\n",
-    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", RELAY_COUNT);
+    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", RELAY_COUNT);
   Serial.printf("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
   Serial.printf("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
   Serial.printf("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
   Serial.printf("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
   Serial.printf("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
+#else
+  Serial.printf("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
+  Serial.printf("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
+#endif
 #if DEVICE_PROFILE == PROFILE_METEO
   Serial.printf("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
 #endif
@@ -2125,7 +2320,8 @@ void loop() {
     if (!bar_ok) pressure = sim_pressure;
 #endif
 
-    // HTU2x
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+    // HTU2x — omitido en AGROMETEO (0x40 = HDC1080)
     if (htu_ok) {
       float t = htu_readTemp();
       float h = htu_readHumidity();
@@ -2141,6 +2337,7 @@ void loop() {
       temperatureDHT = sim_tempDHT;
       humidity       = sim_humidity;
     }
+#endif  // PROFILE_AGROMETEO
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // DHT11
@@ -2160,7 +2357,73 @@ void loop() {
     }
 #endif
 
-    // TSL2584
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    // ── AGROMETEO: HDC1080 + BMP280 + BH1750 + parámetros calculados ────────
+    // HDC1080 — temperatura y humedad primaria → temperatureMCP + humidity
+    if (hdc_ok) {
+      float t = hdc1080_readTemp();
+      float h = hdc1080_readHum();
+      if (!isnan(t) && !isnan(h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+      } else {
+        hdc_ok  = false;
+        temp_ok = false;
+        Serial.println("HDC1080 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!hdc_ok) {
+      if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+      else             { temperatureMCP = sim_tempMCP;    temp_ok = false; }
+      humidity = sim_humidity;
+    }
+
+    // BMP280 — presión + temperatura secundaria
+    bmp_temp_ok     = false;
+    bmp_pressure_ok = false;
+    if (bmp_ok) {
+      float tBmp = NAN, pBmp = NAN;
+      if (readBMP280Temperature(tBmp)) { bmpTemperature = tBmp; bmp_temp_ok = true; }
+      if (readBMP280PressureKPa(pBmp)) { bmpPressure = pBmp; bmp_pressure_ok = true;
+                                         pressure = pBmp; bar_ok = true; }
+      if (!bmp_temp_ok && !bmp_pressure_ok) {
+        bmp_ok = false;
+        Serial.println("BMP280 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!bar_ok) pressure = sim_pressure;
+
+    // BH1750 — iluminancia → lightLevel
+    if (bh1750_ok) {
+      float lux = bh1750.readLightLevel();
+      if (lux >= 0.0f) {
+        lightLevel = lux;
+      } else {
+        bh1750_ok = false;
+        Serial.println("BH1750 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!bh1750_ok) lightLevel = sim_light;
+
+    // Parámetros derivados agrometeorológicos
+    {
+      float T = temperatureMCP;
+      float H = humidity;
+      // Media HDC1080 + BMP280 si ambos disponibles
+      float Tavg = (hdc_ok && bmp_temp_ok) ? (T + bmpTemperature) / 2.0f : T;
+      agroTempAvg = Tavg;
+      if (!isnan(Tavg) && !isnan(H) && H > 0.0f) {
+        agroDewPoint = agro_calcDewPoint(Tavg, H);
+        agroAbsHum   = agro_calcAbsHumidity(Tavg, H);
+        agroHeatIndex = (Tavg > 27.0f && H > 40.0f)
+                        ? agro_calcHeatIndex(Tavg, H) : NAN;
+      }
+    }
+#endif  // PROFILE_AGROMETEO
+
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+    // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750)
     if (tsl_ok) {
       float lux = tsl_readLux();
       if (lux >= 0.0f) {
@@ -2171,6 +2434,7 @@ void loop() {
       }
     }
     if (!tsl_ok) lightLevel = sim_light;
+#endif  // PROFILE_AGROMETEO (TSL guard)
 
 #if defined(SOIL_PIN)
     {
@@ -2194,6 +2458,10 @@ void loop() {
 
 #ifdef HAS_DISPLAY
     drawScreen();
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+    Serial.printf("[1s] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
+      temperatureMCP, humidity, bmpTemperature, (float)pressure,
+      lightLevel, agroDewPoint, agroHeatIndex, agroAbsHum);
 #else
     Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
       temperatureMCP, temperatureDHT, humidity,
@@ -2254,7 +2522,8 @@ void loop() {
 
     // Perfil e info de compilacion
     Serial.printf("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
-      (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION",
+      (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
+      (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION",
       DEVICE_PROFILE, RELAY_COUNT,
 #ifdef HAS_DISPLAY
       "SI",
@@ -2296,13 +2565,28 @@ void loop() {
       temp_ok ? temperatureSourceName() : "SIM",
       bar_ok ? pressureSourceName() : "SIM",
       dht_ok ? "REAL" : "SIM");
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+    Serial.printf(" HDC1080:%s  BMP280:%s  BH1750:%s",
+      hdc_ok ? "REAL" : "SIM",
+      bmp_ok ? "REAL" : "SIM",
+      bh1750_ok ? "REAL" : "SIM");
 #else
     Serial.print(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
 #endif
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
     Serial.printf("  HTU2x:%s  LuzAmb:%s\n",
       htu_ok ? "REAL" : "SIM", tsl_ok ? "REAL" : "SIM");
+#else
+    Serial.println();  // AGROMETEO: sensores ya listados arriba
+#endif
 
     // Valores medidos / simulados
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    Serial.printf("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
+      temperatureMCP, humidity, bmpTemperature, (float)pressure, lightLevel);
+    Serial.printf("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
+      agroDewPoint, agroHeatIndex, agroAbsHum);
+#else
     Serial.printf("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
       temperatureMCP, temperatureDHT, humidity, lightLevel);
 #if DEVICE_PROFILE == PROFILE_METEO
@@ -2311,6 +2595,7 @@ void loop() {
 #endif
     Serial.printf("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
+#endif
 
     // Estado relays
     Serial.print("[RELAYS]");

@@ -9,6 +9,28 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased] — feature/agrometeo-profile
+
+### Añadido
+- **Nuevo perfil `PROFILE_AGROMETEO` (valor 3)** para placa CJMCU-14 (ESP32 + BH1750 + HDC1080 + BMP280).
+- Soporte inline para **HDC1080** (temperatura y humedad, I2C 0x40) con protocolo propio, sin librería externa, guarded para no interferir con HTU2x en METEO/IRRIGATION.
+- Soporte para **BH1750** (iluminancia, librería `claws/BH1750`) como sensor de luz en AGROMETEO.
+- BMP280 reutilizado en AGROMETEO (existente en METEO) para temperatura secundaria y presión atmosférica (kPa).
+- **Parámetros agrometeorológicos calculados** publicados en telemetría MQTT: `dew_point` (punto de rocío, Magnus), `heat_index` (índice de calor, solo si T>27°C y HR>40%), `abs_humidity` (humedad absoluta g/m³).
+- `RELAY_COUNT=0` en AGROMETEO: sin relays ni control de válvulas; pipeline pressure/flow preparado para futuros sensores (stub `readRealPipelineSensors`).
+- Log serie `[1s]` específico para AGROMETEO con todos los parámetros derivados.
+- Reporte DEBUG_MODE actualizado para mostrar estado de HDC1080 y BH1750 en AGROMETEO.
+
+### Cambiado
+- `RELAY_PINS` usa array dummy de tamaño 1 en AGROMETEO para evitar array de longitud cero.
+- `relayActive` usa `RELAY_COUNT > 0 ? RELAY_COUNT : 1` como tamaño para el mismo motivo.
+- `temperatureSourceName()` y `pressureSourceName()` extendidas con rama `PROFILE_AGROMETEO`.
+- Bloque de init HTU2x en `setup()` y loop guarded con `#if DEVICE_PROFILE != PROFILE_AGROMETEO`.
+- Bloque de init TSL2584/APDS-9930 guarded igual; en AGROMETEO `tsl_ok=false` siempre.
+- Cadenas de nombre de perfil en DEBUG_MODE actualizadas para incluir "AGROMETEO".
+
+---
+
 ## [v0.1.0] — 2026-04-22
 
 **Backend compatible:** `v0.1.0`
