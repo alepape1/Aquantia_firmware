@@ -1455,6 +1455,9 @@ void mqttPublishRegister() {
   doc["sdk_version"]      = ESP.getSdkVersion();
   doc["relay_count"]      = RELAY_COUNT;
   doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["device_profile"]   =
+    (DEVICE_PROFILE == PROFILE_METEO)      ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_IRRIGATION) ? "IRRIGATION" : "AGROMETEO";
 
   char topic[64], buf[768];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
