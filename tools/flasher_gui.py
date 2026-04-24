@@ -83,6 +83,7 @@ ESPOTA_GLOB_PATTERNS = [
 FQBN_BY_PROFILE = {
     "1": "esp32:esp32:lilygo_t_display",   # METEO — LilyGo TTGO T-Display
     "2": "esp32:esp32:esp32",              # IRRIGATION — ESP32 genérico
+    "3": "esp32:esp32:esp32",              # AGROMETEO — ESP32 genérico
 }
 
 BACKEND_URL = "https://meteo.aquantialab.com"
@@ -113,6 +114,7 @@ NVS_GEN_GLOB_PATTERNS = [
 PROFILES = {
     "METEO  — 1 relay  (pantalla TFT)": "1",
     "IRRIGATION — 4 relays (sin pantalla)": "2",
+    "AGROMETEO — sin relays (BH1750+HDC1080+BMP280)": "3",
 }
 
 DEFAULT_PROFILE_LABEL = "METEO  — 1 relay  (pantalla TFT)"
@@ -120,6 +122,7 @@ DEFAULT_PROFILE = PROFILES[DEFAULT_PROFILE_LABEL]
 BOARD_LABEL_BY_PROFILE = {
     "1": "LilyGo T-Display",
     "2": "ESP32 genérico",
+    "3": "ESP32 genérico",
 }
 
 
