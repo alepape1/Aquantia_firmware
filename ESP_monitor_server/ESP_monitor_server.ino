@@ -1936,6 +1936,10 @@ void setup() {
   }
   Serial.printf("Sensores activos → TempExt:%s | Presion:%s\n",
     temperatureSourceName(), pressureSourceName());
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  Serial.println("MCP9808 — perfil AGROMETEO, sensor omitido");
+  Serial.println("BMP280 v2 — inicializado en bloque AGROMETEO");
+  Serial.println("Barometro MicroPressure — perfil AGROMETEO, sensor omitido");
 #else
   Serial.println("MCP9808 — perfil IRRIGATION, sensor omitido");
   Serial.println("BMP280 — perfil IRRIGATION, sensor omitido");
@@ -2052,6 +2056,8 @@ void setup() {
       humidityDHT11    = sim_humDHT11;
     }
   }
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  Serial.println("DHT11 — perfil AGROMETEO, sensor omitido");
 #else
   Serial.println("DHT11 — perfil IRRIGATION, sensor omitido");
 #endif
