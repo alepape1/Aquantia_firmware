@@ -32,6 +32,7 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 - `RELAY_COUNT=0` en AGROMETEO: sin relays ni control de válvulas; pipeline pressure/flow preparado para futuros sensores (stub `readRealPipelineSensors`).
 - Log serie `[1s]` específico para AGROMETEO con todos los parámetros derivados.
 - Reporte DEBUG_MODE actualizado para mostrar estado de HDC1080 y BH1750 en AGROMETEO.
+- **Estado LED `LED_PROVISIONING`**: triple parpadeo lento (300/300 ms × 3, pausa 1,8 s) que se activa al entrar al portal captivo SoftAP. Distingue visualmente "esperando configuración WiFi del usuario" del parpadeo rápido de búsqueda de red (`LED_WIFI_CONNECTING`).
 
 ### Cambiado
 - `RELAY_PINS` usa array dummy de tamaño 1 en AGROMETEO para evitar array de longitud cero.

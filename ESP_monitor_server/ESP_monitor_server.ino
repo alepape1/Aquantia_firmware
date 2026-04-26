@@ -188,6 +188,7 @@ const char* mqtt_pass   = MQTT_PASS;
 // ── LED status no-bloqueante ──────────────────────────────────────────────────
 // Código visual del estado del dispositivo mediante el LED onboard.
 //
+//  LED_PROVISIONING   — triple parpadeo lento cada 3 s → portal AP activo, esperando config
 //  LED_WIFI_CONNECTING — parpadeo rápido 100/100 ms    → buscando red WiFi
 //  LED_MQTT_CONNECTING — doble parpadeo cada ~2 s      → WiFi OK, MQTT pendiente
 //  LED_IDLE            — latido 50 ms / 2950 ms        → conectado, en espera
@@ -195,7 +196,8 @@ const char* mqtt_pass   = MQTT_PASS;
 //  LED_TX_ERROR        — 1 s ON / 1 s OFF              → error de red persistente
 //  LED_RELAY_ON        — encendido fijo                → relay activo (IRRIGATION)
 enum LedStateCode : uint8_t {
-  LED_WIFI_CONNECTING = 0,
+  LED_PROVISIONING = 0,
+  LED_WIFI_CONNECTING,
   LED_MQTT_CONNECTING,
   LED_IDLE,
   LED_TX_OK,      // one-shot: vuelve automáticamente al estado anterior
@@ -206,17 +208,18 @@ enum LedStateCode : uint8_t {
 
 struct LedStep { uint16_t onMs; uint16_t offMs; };
 static const LedStep _ledPat[_LED_STATE_COUNT][4] = {
-  /* WIFI_CONNECTING */ {{100, 100}, {0, 0},   {0, 0},   {0, 0}},
-  /* MQTT_CONNECTING */ {{50,  50 }, {50,1800},{0, 0},   {0, 0}},  // doble blink + pausa
-  /* IDLE            */ {{50, 2950}, {0, 0},   {0, 0},   {0, 0}},  // latido lento
-  /* TX_OK           */ {{50,  50 }, {50,  50},{50, 800},{0, 0}},  // triple blink
-  /* TX_ERROR        */ {{1000,1000},{0, 0},   {0, 0},   {0, 0}},
-  /* RELAY_ON        */ {{0,   0  }, {0, 0},   {0, 0},   {0, 0}},  // sin timer (fijo ON)
+  /* PROVISIONING    */ {{300, 300}, {300,1800},{300,1800},{0, 0}},  // triple blink lento
+  /* WIFI_CONNECTING */ {{100, 100}, {0, 0},    {0, 0},   {0, 0}},
+  /* MQTT_CONNECTING */ {{50,  50 }, {50, 1800},{0, 0},   {0, 0}},  // doble blink + pausa
+  /* IDLE            */ {{50, 2950}, {0, 0},    {0, 0},   {0, 0}},  // latido lento
+  /* TX_OK           */ {{50,  50 }, {50,   50},{50, 800},{0, 0}},  // triple blink
+  /* TX_ERROR        */ {{1000,1000},{0, 0},    {0, 0},   {0, 0}},
+  /* RELAY_ON        */ {{0,   0  }, {0, 0},    {0, 0},   {0, 0}},  // sin timer (fijo ON)
 };
-static const uint8_t _ledPatLen[]  = { 1, 2, 1, 3, 1, 0 };
-static const bool    _ledOneShot[] = { false, false, false, true, false, false };
+static const uint8_t _ledPatLen[]  = { 3, 1, 2, 1, 3, 1, 0 };
+static const bool    _ledOneShot[] = { false, false, false, false, true, false, false };
 
-static volatile LedStateCode _ledState     = LED_WIFI_CONNECTING;
+static volatile LedStateCode _ledState     = LED_PROVISIONING;
 static LedStateCode          _ledPrevState = LED_IDLE;
 static uint8_t               _ledStep      = 0;
 static bool                  _ledPhaseOn   = true;
@@ -1963,6 +1966,7 @@ void setup() {
       drawAPScreen(ap_ssid_buf, ser);
     }
 #endif
+    setLedState(LED_PROVISIONING);  // portal AP activo — triple blink lento
     provisioning_start_ap();  // bloquea hasta que el usuario configure
   }
 
