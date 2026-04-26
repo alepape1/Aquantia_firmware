@@ -2295,6 +2295,10 @@ void setup() {
   DLOGLN(F("[TEST] Iniciando loop() — reporte cada 5s"));
   DLOGLN(F("====================================\n"));
 #endif
+
+  // Forzar primera lectura de sensores en el primer ciclo del loop
+  // (sin este offset, habría que esperar telemetryIntervalMs antes de tener datos)
+  lastSensorRead = millis() - telemetryIntervalMs;
 }
 
 // =============================================================================
