@@ -174,10 +174,12 @@ const char* mqtt_pass   = MQTT_PASS;
 
 // ── Pines ─────────────────────────────────────────────────────────────────────
 // LED onboard por perfil de hardware (activo-HIGH):
-//   METEO      — LilyGo TTGO T-Display : GPIO 2
+//   METEO      — LilyGo T-Display      : sin LED de usuario → -1 (desactivado)
 //   AGROMETEO  — Wemos D1 Mini ESP32   : GPIO 2
 //   IRRIGATION — ESP32 4-Relay Board   : GPIO 23
-#if DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO
+  const int ledPin = -1;   // LilyGo T-Display no tiene LED onboard
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
   const int ledPin = 23;
 #else
   const int ledPin = 2;
@@ -238,6 +240,7 @@ void setLedState(LedStateCode s) {
 
 // Llamar únicamente desde loop() (Core 1). Es la única función que escribe el GPIO.
 void ledTick() {
+  if (ledPin < 0) return;  // placa sin LED onboard (p.ej. LilyGo T-Display)
   LedStateCode state = (LedStateCode)_ledState;
   if (state == LED_RELAY_ON) { digitalWrite(ledPin, LED_ON); return; }
 
@@ -1989,8 +1992,7 @@ void setup() {
   if (found == 0) DLOGLN("  Ningun dispositivo encontrado");
   else DLOGF("  Total: %d dispositivos\n", found);
 
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LED_OFF);
+  if (ledPin >= 0) { pinMode(ledPin, OUTPUT); digitalWrite(ledPin, LED_OFF); }
 
   // Relay(s) — arrancar siempre en OFF (seguro)
   // JQC-3FF-S-Z activo-LOW: HIGH = relay OFF (válvula cerrada)
