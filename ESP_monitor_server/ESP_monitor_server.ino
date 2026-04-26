@@ -41,8 +41,14 @@
   #include <WiFiClientSecure.h>
   #include <ArduinoOTA.h>
   #include "driver/rtc_io.h"
-  #define I2C_SDA          21
-  #define I2C_SCL          22
+  // AGROMETEO usa el módulo CJMCU-14 que tiene SDA/SCL intercambiados respecto al resto de perfiles
+  #if DEVICE_PROFILE == PROFILE_AGROMETEO
+    #define I2C_SDA        22
+    #define I2C_SCL        21
+  #else
+    #define I2C_SDA        21
+    #define I2C_SCL        22
+  #endif
   #define DHTPIN           15
   #define ADC_VOLTAGE_REF  3.41f
   #define ADC_RANGE        4096.0f
@@ -269,7 +275,7 @@ static float hdc1080_readTemp() {
   Wire.beginTransmission(HDC1080_ADDR);
   Wire.write(0x00);  // registro temperatura
   if (Wire.endTransmission() != 0) return NAN;
-  delay(20);
+  delay(35);  // datasheet: 6.5ms; 35ms para cubrir bus ocupado
   Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2, (uint8_t)1);
   if (Wire.available() < 2) return NAN;
   uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
@@ -281,7 +287,7 @@ static float hdc1080_readHum() {
   Wire.beginTransmission(HDC1080_ADDR);
   Wire.write(0x01);  // registro humedad
   if (Wire.endTransmission() != 0) return NAN;
-  delay(20);
+  delay(35);  // datasheet: 6.5ms; 35ms para cubrir bus ocupado
   Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2, (uint8_t)1);
   if (Wire.available() < 2) return NAN;
   uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
@@ -2435,7 +2441,7 @@ void loop() {
     // Al terminar se apagan los sensores para reducir consumo en reposo.
     qwiic_ps_power(true);
     if (qwiic_ps_ok) {
-      delay(10);              // esperar estabilización de la alimentación
+      delay(50);              // esperar estabilización de la alimentación (mín. 50ms)
       agro_sensors_reinit();  // restaura config de BMP280 + HDC1080 + BH1750
     }
 
@@ -2474,9 +2480,13 @@ void loop() {
     }
     if (!bar_ok) pressure = sim_pressure;
 
-    // BH1750 — iluminancia → lightLevel
+    // BH1750 — iluminancia → lightLevel (con retry si falla la primera lectura)
     if (bh1750_ok) {
       float lux = bh1750.readLightLevel();
+      if (lux < 0.0f) {
+        delay(50);
+        lux = bh1750.readLightLevel();  // un reintento tras breve pausa
+      }
       if (lux >= 0.0f) {
         lightLevel = lux;
       } else {
