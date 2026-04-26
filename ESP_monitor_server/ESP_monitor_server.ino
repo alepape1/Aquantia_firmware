@@ -173,7 +173,7 @@ const char* mqtt_pass   = MQTT_PASS;
 #endif
 
 // ── Pines ─────────────────────────────────────────────────────────────────────
-// LED onboard por perfil de hardware (todos activo-LOW):
+// LED onboard por perfil de hardware (activo-HIGH):
 //   METEO      — LilyGo TTGO T-Display : GPIO 2
 //   AGROMETEO  — Wemos D1 Mini ESP32   : GPIO 2
 //   IRRIGATION — ESP32 4-Relay Board   : GPIO 23
@@ -182,8 +182,8 @@ const char* mqtt_pass   = MQTT_PASS;
 #else
   const int ledPin = 2;
 #endif
-#define LED_ON  LOW
-#define LED_OFF HIGH
+#define LED_ON  HIGH
+#define LED_OFF LOW
 
 // ── LED status no-bloqueante ──────────────────────────────────────────────────
 // Código visual del estado del dispositivo mediante el LED onboard.
