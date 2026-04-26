@@ -173,9 +173,103 @@ const char* mqtt_pass   = MQTT_PASS;
 #endif
 
 // ── Pines ─────────────────────────────────────────────────────────────────────
-const int ledPin = 2;
+// LED onboard por perfil de hardware (todos activo-LOW):
+//   METEO      — LilyGo TTGO T-Display : GPIO 2
+//   AGROMETEO  — Wemos D1 Mini ESP32   : GPIO 2
+//   IRRIGATION — ESP32 4-Relay Board   : GPIO 23
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+  const int ledPin = 23;
+#else
+  const int ledPin = 2;
+#endif
 #define LED_ON  LOW
 #define LED_OFF HIGH
+
+// ── LED status no-bloqueante ──────────────────────────────────────────────────
+// Código visual del estado del dispositivo mediante el LED onboard.
+//
+//  LED_WIFI_CONNECTING — parpadeo rápido 100/100 ms    → buscando red WiFi
+//  LED_MQTT_CONNECTING — doble parpadeo cada ~2 s      → WiFi OK, MQTT pendiente
+//  LED_IDLE            — latido 50 ms / 2950 ms        → conectado, en espera
+//  LED_TX_OK           — triple parpadeo (one-shot)    → telemetría enviada OK
+//  LED_TX_ERROR        — 1 s ON / 1 s OFF              → error de red persistente
+//  LED_RELAY_ON        — encendido fijo                → relay activo (IRRIGATION)
+enum LedStateCode : uint8_t {
+  LED_WIFI_CONNECTING = 0,
+  LED_MQTT_CONNECTING,
+  LED_IDLE,
+  LED_TX_OK,      // one-shot: vuelve automáticamente al estado anterior
+  LED_TX_ERROR,
+  LED_RELAY_ON,
+  _LED_STATE_COUNT
+};
+
+struct LedStep { uint16_t onMs; uint16_t offMs; };
+static const LedStep _ledPat[_LED_STATE_COUNT][4] = {
+  /* WIFI_CONNECTING */ {{100, 100}, {0, 0},   {0, 0},   {0, 0}},
+  /* MQTT_CONNECTING */ {{50,  50 }, {50,1800},{0, 0},   {0, 0}},  // doble blink + pausa
+  /* IDLE            */ {{50, 2950}, {0, 0},   {0, 0},   {0, 0}},  // latido lento
+  /* TX_OK           */ {{50,  50 }, {50,  50},{50, 800},{0, 0}},  // triple blink
+  /* TX_ERROR        */ {{1000,1000},{0, 0},   {0, 0},   {0, 0}},
+  /* RELAY_ON        */ {{0,   0  }, {0, 0},   {0, 0},   {0, 0}},  // sin timer (fijo ON)
+};
+static const uint8_t _ledPatLen[]  = { 1, 2, 1, 3, 1, 0 };
+static const bool    _ledOneShot[] = { false, false, false, true, false, false };
+
+static volatile LedStateCode _ledState     = LED_WIFI_CONNECTING;
+static LedStateCode          _ledPrevState = LED_IDLE;
+static uint8_t               _ledStep      = 0;
+static bool                  _ledPhaseOn   = true;
+static volatile bool         _ledNeedsInit = true;
+static unsigned long         _ledPhaseMs   = 0;
+
+// Cambiar estado del LED (seguro desde cualquier tarea — solo escribe variables).
+void setLedState(LedStateCode s) {
+  if ((LedStateCode)_ledState == s) return;
+  if (_ledOneShot[s]) _ledPrevState = (LedStateCode)_ledState;
+  _ledState     = s;
+  _ledStep      = 0;
+  _ledPhaseOn   = true;
+  _ledNeedsInit = true;  // ledTick() aplicará ON en el próximo ciclo
+}
+
+// Llamar únicamente desde loop() (Core 1). Es la única función que escribe el GPIO.
+void ledTick() {
+  LedStateCode state = (LedStateCode)_ledState;
+  if (state == LED_RELAY_ON) { digitalWrite(ledPin, LED_ON); return; }
+
+  if (_ledNeedsInit) {
+    _ledNeedsInit = false;
+    _ledStep    = 0;
+    _ledPhaseOn = true;
+    _ledPhaseMs = millis();
+    digitalWrite(ledPin, LED_ON);
+    return;
+  }
+
+  const LedStep* pat = _ledPat[state];
+  uint8_t len = _ledPatLen[state];
+  unsigned long now = millis();
+  uint16_t dur = _ledPhaseOn ? pat[_ledStep].onMs : pat[_ledStep].offMs;
+  if (now - _ledPhaseMs < dur) return;
+  _ledPhaseMs = now;
+  if (_ledPhaseOn) {
+    digitalWrite(ledPin, LED_OFF);
+    _ledPhaseOn = false;
+  } else {
+    _ledStep++;
+    if (_ledStep >= len) {
+      if (_ledOneShot[state]) {
+        _ledState     = _ledPrevState;
+        _ledNeedsInit = true;
+        return;
+      }
+      _ledStep = 0;
+    }
+    _ledPhaseOn = true;
+    digitalWrite(ledPin, LED_ON);
+  }
+}
 
 // ── Intervalos ─────────────────────────────────────────────────────────────────
 #define WIND_MS          100
@@ -1119,6 +1213,7 @@ void checkRelayCommand() {
     for (int i = 0; i < RELAY_COUNT; i++) {
       if (relayActive[i]) actualMask |= (1 << i);
     }
+    setLedState(anyRelayActive() ? LED_RELAY_ON : LED_IDLE);
     httpPost(serverBaseUrl() + "/api/relay/ack", String(actualMask));
   }
 }
@@ -1390,6 +1485,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       relayActive[relay] = state;
       digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
       DLOGF("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+      setLedState(anyRelayActive() ? LED_RELAY_ON : LED_IDLE);
     }
   }
 
@@ -1602,6 +1698,7 @@ void networkTask(void* pvParameters) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+      setLedState(LED_WIFI_CONNECTING);
       wifiStableSince = 0;
       WiFi.reconnect();
       vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
@@ -1631,11 +1728,13 @@ void networkTask(void* pvParameters) {
 #ifdef USE_MQTT
     // ── Modo MQTT ────────────────────────────────────────────────────────────
     if (!mqttClient.connected()) {
+      setLedState(LED_MQTT_CONNECTING);
       if (!mqttConnect()) {
         vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
         if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
         continue;
       }
+      setLedState(LED_IDLE);
       mqttRetryDelayMs = 2000;
       if (!deviceInfoSent) {
         mqttPublishRegister();
@@ -1707,9 +1806,8 @@ void networkTask(void* pvParameters) {
         DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n",
                       (unsigned)payload_len, (unsigned)sizeof(buf));
       }
-      digitalWrite(ledPin, LED_ON);
       bool ok = mqttClient.publish(topic, buf, false);
-      digitalWrite(ledPin, LED_OFF);
+      setLedState(ok ? LED_TX_OK : LED_TX_ERROR);
       DLOGF("[MQTT] TX %s (%u B): %s\n", ok ? "OK" : "ERROR",
                     (unsigned)payload_len, buf);
 
@@ -1748,9 +1846,8 @@ void networkTask(void* pvParameters) {
       );
 
       DLOGF("[NET] TX: %s\n", msg);
-      digitalWrite(ledPin, LED_ON);
       bool ok = httpPost(url, String(msg));
-      digitalWrite(ledPin, LED_OFF);
+      setLedState(ok ? LED_TX_OK : LED_TX_ERROR);
       DLOGF("[NET] HTTP %s\n", ok ? "200 OK" : "ERROR");
 
       lastServerOK = ok;
@@ -2118,6 +2215,7 @@ void setup() {
   drawBootScreen("Conectando WiFi...");
 #endif
 
+  setLedState(LED_WIFI_CONNECTING);
   DLOGLN("Conectando WiFi...");
   WiFi.begin(ssid, password);
   int tries = 0;
@@ -2132,6 +2230,7 @@ void setup() {
   DLOGLN();
 
   if (WiFi.status() == WL_CONNECTED) {
+    setLedState(LED_MQTT_CONNECTING);
     DLOGLN("WiFi OK: " + WiFi.localIP().toString());
 
 #if !defined(ESP8266) && defined(USE_MQTT)
@@ -2309,6 +2408,8 @@ void loop() {
 #ifdef ESP8266
   ArduinoOTA.handle();
 #endif
+
+  ledTick();  // actualizar LED de estado (no bloqueante)
 
   unsigned long now = millis();
 

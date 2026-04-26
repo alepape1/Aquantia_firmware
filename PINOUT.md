@@ -21,7 +21,7 @@ Dos perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo d
 | Relay 1 (electroválvula) | 26 | Activo-LOW, JQC-3FF-S-Z |
 | Botón izquierdo (BOOT) | 0 | INPUT_PULLUP, activo LOW |
 | Botón derecho | 35 | INPUT, activo LOW |
-| LED onboard | 2 | LED_ON=LOW, LED_OFF=HIGH |
+| LED onboard | 2 | Activo-LOW. Estados: parpadeo rápido=WiFi buscando, doble parpadeo=MQTT pendiente, latido=idle, triple=TX OK, 1s/1s=error |
 
 ### Pantalla TFT — SPI (ST7789 240×135)
 
@@ -90,7 +90,7 @@ Ajustar en `ESP_monitor_server.ino` según el sensor real:
 | Relay 2 (zona 2) | 33 | Activo-LOW |
 | Relay 3 (zona 3) | 25 | Activo-LOW |
 | Relay 4 (zona 4) | 26 | Activo-LOW |
-| LED estado | 23 | Integrado en placa |
+| LED estado | 23 | Activo-LOW. Mismos estados que METEO + encendido fijo cuando relay activo |
 | I2C SDA | 21 | Sin sensores en v actual |
 | I2C SCL | 22 | Sin sensores en v actual |
 
