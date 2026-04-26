@@ -25,9 +25,9 @@
 
 // Macros de log — mapeadas a Serial cuando DEBUG_MODE está activo, no-op en prod
 #ifdef DEBUG_MODE
-  #define DLOGF(fmt, ...)  DLOGF(fmt, ##__VA_ARGS__)
-  #define DLOGLN(msg)      DLOGLN(msg)
-  #define DLOG(msg)        DLOG(msg)
+  #define DLOGF(fmt, ...)  Serial.printf(fmt, ##__VA_ARGS__)
+  #define DLOGLN(msg)      Serial.println(msg)
+  #define DLOG(msg)        Serial.print(msg)
 #else
   #define DLOGF(fmt, ...)  do {} while(0)
   #define DLOGLN(msg)      do {} while(0)
@@ -875,6 +875,7 @@ float calcAndResetWindVector() {
 bool lastServerOK    = false;
 unsigned long lastSendTime   = 0;
 unsigned long lastScreenTime = 0;
+unsigned long lastSensorRead = 0;  // lectura I2C sincronizada con el intervalo de telemetría
 
 
 // ── Info estática del hardware ────────────────────────────────────────────────
@@ -2344,8 +2345,8 @@ void loop() {
     lastWindRead = now;
   }
 
-  // ── 2. Sensores I2C (MCP9808, HTU2x, barometro, luz) + pantalla (cada 1s) ───
-  if (now - lastScreenTime >= SCREEN_MS) {
+  // ── 2. Sensores I2C (cada telemetryIntervalMs, sincronizado con la telemetría) ──
+  if (now - lastSensorRead >= telemetryIntervalMs) {
 #ifndef ESP8266
     bool hasMutex = (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE);
 #endif
@@ -2561,21 +2562,27 @@ void loop() {
     if (hasMutex) xSemaphoreGive(dataMutex);
 #endif
 
-#ifdef HAS_DISPLAY
-    drawScreen();
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
-    DLOGF("[1s] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    DLOGF("[sensor] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
       temperatureMCP, humidity, bmpTemperature, (float)pressure,
       lightLevel, agroDewPoint, agroHeatIndex, agroAbsHum);
 #else
-    DLOGF("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
+    DLOGF("[sensor] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
       temperatureMCP, temperatureDHT, humidity,
       temperatureDHT11, humidityDHT11,
       (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel, soilMoisture);
 #endif
 
+    lastSensorRead = now;
+  }
+
+  // ── 3. Refresco de pantalla (cada SCREEN_MS = 1s, solo si hay display) ────────
+#ifdef HAS_DISPLAY
+  if (now - lastScreenTime >= SCREEN_MS) {
+    drawScreen();
     lastScreenTime = now;
   }
+#endif
 
 #ifdef ESP8266
   // ── ESP8266: red en el loop() (sin FreeRTOS) ─────────────────────────────────
