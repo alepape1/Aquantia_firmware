@@ -12,6 +12,18 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 ## [Unreleased] — feature/agrometeo-profile
 
 ### Añadido
+- **Modo debug configurable** desde el Flash Tool GUI: nueva casilla "🐛 Debug (serie)" que inyecta `-DDEBUG_MODE=1` al compilar. Sin la casilla, toda la salida serie queda silenciada en producción.
+- Macros `DLOGF` / `DLOGLN` / `DLOG` que mapean a `Serial.printf/println/print` cuando `DEBUG_MODE` está definido y son no-ops en caso contrario. Todos los `Serial.printf/println/print` del sketch sustituidos por las macros.
+- El Flash Tool GUI invalida la caché del binario automáticamente al cambiar la casilla de debug, y registra en `build_meta.json` si el binario fue compilado en modo debug o release.
+
+### Cambiado
+- `Serial.begin(115200)` siempre activo (necesario para OTA y monitor de arranque); el resto de salida serie queda gateado por `DEBUG_MODE`.
+
+---
+
+## [feature/agrometeo-profile] — en desarrollo
+
+### Añadido
 - **Nuevo perfil `PROFILE_AGROMETEO` (valor 3)** para placa CJMCU-14 (ESP32 + BH1750 + HDC1080 + BMP280).
 - Soporte inline para **HDC1080** (temperatura y humedad, I2C 0x40) con protocolo propio, sin librería externa, guarded para no interferir con HTU2x en METEO/IRRIGATION.
 - Soporte para **BH1750** (iluminancia, librería `claws/BH1750`) como sensor de luz en AGROMETEO.

@@ -709,7 +709,7 @@ def get_fqbn_for_profile(profile):
     return FQBN_BY_PROFILE.get(profile, "esp32:esp32:esp32")
 
 
-def binary_is_valid(profile, git_ref, fqbn=None, secrets_digest=None):
+def binary_is_valid(profile, git_ref, fqbn=None, secrets_digest=None, debug_mode=None):
     """
     Comprueba si el binario compilado coincide con perfil+versión seleccionada
     y los fuentes no han cambiado desde la compilación.
@@ -732,6 +732,9 @@ def binary_is_valid(profile, git_ref, fqbn=None, secrets_digest=None):
 
     if secrets_digest and meta.get("secrets_digest") != secrets_digest:
         return False, "Configuración local diferente — recompilar"
+
+    if debug_mode is not None and meta.get("debug_mode", False) != debug_mode:
+        return False, "Modo debug diferente — recompilar"
 
     compiled_ref = meta.get("git_ref")   # None = working copy
     if git_ref != compiled_ref:
@@ -929,6 +932,16 @@ class FlasherApp(tk.Tk):
         self._mode_lbl = tk.Label(mode_frame, font=("Segoe UI", 8, "italic"), fg="#888")
         self._mode_lbl.pack(side="left", padx=8)
         self._update_mode_ui()
+
+        # ── Checkbox Debug ──
+        self._debug_var = tk.BooleanVar(value=False)
+        self._chk_debug = tk.Checkbutton(
+            mode_frame, text="🐛 Debug (serie)",
+            variable=self._debug_var,
+            font=("Segoe UI", 9),
+            command=self._on_debug_toggle,
+        )
+        self._chk_debug.pack(side="left", padx=(16, 0))
 
         target_frame = tk.Frame(btn_frame)
         target_frame.grid(row=1, column=0, columnspan=3, pady=(0, 6))
@@ -1336,7 +1349,7 @@ class FlasherApp(tk.Tk):
         profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
         git_ref, _ = self._get_selected_ref()
         secrets_digest = file_sha256(self._SECRETS_PATH)
-        valid, msg = binary_is_valid(profile, git_ref, get_fqbn_for_profile(profile), secrets_digest)
+        valid, msg = binary_is_valid(profile, git_ref, get_fqbn_for_profile(profile), secrets_digest, self._debug_var.get())
         if valid:
             self._bin_status_var.set(f"✓  {msg}")
             self._bin_status_lbl.config(fg="#4ec9b0")
@@ -1641,7 +1654,7 @@ class FlasherApp(tk.Tk):
 
         # ¿Podemos saltarnos la compilación?
         if not force:
-            valid, reason = binary_is_valid(profile, git_ref, fqbn, secrets_digest)
+            valid, reason = binary_is_valid(profile, git_ref, fqbn, secrets_digest, self._debug_var.get())
             if valid:
                 self._log_line(f"✓  Binario en caché válido — flasheando sin recompilar", "#4ec9b0")
                 self._log_line(f"   {reason}", "#888")
@@ -1673,11 +1686,17 @@ class FlasherApp(tk.Tk):
         self._log_line(f"{'─'*60}\n", "#444")
         self._set_status("Compilando...")
 
+        debug_flag = " -DDEBUG_MODE=1" if self._debug_var.get() else ""
+        if self._debug_var.get():
+            self._log_line("  Modo: DEBUG (salida serie activa)", "#ce9178")
+        else:
+            self._log_line("  Modo: RELEASE (salida serie silenciada)", "#888")
+
         cmd = [
             self._arduino_cli, "compile",
             "--fqbn", fqbn,
-            "--build-property", f"compiler.cpp.extra_flags=-DDEVICE_PROFILE={profile}",
-            "--build-property", f"compiler.c.extra_flags=-DDEVICE_PROFILE={profile}",
+            "--build-property", f"compiler.cpp.extra_flags=-DDEVICE_PROFILE={profile}{debug_flag}",
+            "--build-property", f"compiler.c.extra_flags=-DDEVICE_PROFILE={profile}{debug_flag}",
             "--build-property", "build.partitions=min_spiffs",
             "--build-path", BUILD_DIR,
             sketch_path,
@@ -1696,6 +1715,7 @@ class FlasherApp(tk.Tk):
                 "secrets_digest": secrets_digest,
                 "built_at":       now,
                 "bin_size_bytes": size,
+                "debug_mode":     self._debug_var.get(),
             })
             self._log_line(f"\n✓  Compilación OK — {size // 1024} KB", "#4ec9b0")
             self._log_line(f"   Binario: {bin_path}", "#888")
@@ -1706,6 +1726,13 @@ class FlasherApp(tk.Tk):
             return False, None
 
         return True, bin_path
+
+    def _on_debug_toggle(self):
+        """Invalida la caché cuando cambia el modo debug para forzar recompilación."""
+        if os.path.exists(METADATA_FILE):
+            os.remove(METADATA_FILE)
+        mode = "DEBUG" if self._debug_var.get() else "RELEASE"
+        self._log_line(f"ℹ  Modo compilación: {mode} — caché invalidada", "#dcdcaa")
 
     def _compile(self):
         if self._busy:

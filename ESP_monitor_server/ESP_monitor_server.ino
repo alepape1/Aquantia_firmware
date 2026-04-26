@@ -1,4 +1,4 @@
-// MeteoStation — Firmware v3
+﻿// MeteoStation — Firmware v3
 // Compatible con ESP32 (con pantalla ST7789 240×135) y ESP8266 (sin pantalla)
 // Sensores: MCP9808, BMP280, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
@@ -18,9 +18,21 @@
   #define DEVICE_PROFILE PROFILE_METEO
 #endif
 
-// ── Modo debug — activo en rama test, quitar en producción ───────────────────
-//#define DEBUG_MODE 1
+// ── Modo debug — pasar -DDEBUG_MODE=1 al compilador para activarlo ───────────
+// En producción NO definir: elimina toda la salida serie y reduce consumo.
+// El Flash Tool GUI tiene la casilla "Debug" que inyecta el flag automáticamente.
 #define DEBUG_INTERVAL_MS 5000UL   // reporte completo cada 5 s
+
+// Macros de log — mapeadas a Serial cuando DEBUG_MODE está activo, no-op en prod
+#ifdef DEBUG_MODE
+  #define DLOGF(fmt, ...)  DLOGF(fmt, ##__VA_ARGS__)
+  #define DLOGLN(msg)      DLOGLN(msg)
+  #define DLOG(msg)        DLOG(msg)
+#else
+  #define DLOGF(fmt, ...)  do {} while(0)
+  #define DLOGLN(msg)      do {} while(0)
+  #define DLOG(msg)        do {} while(0)
+#endif
 
 // ── Detección de plataforma ───────────────────────────────────────────────────
 #ifdef ESP8266
@@ -618,17 +630,17 @@ static void htu_set_heater(bool on) {
 // Calentamiento de arranque: activa el calefactor ~3 s para evaporar
 // condensación y obtener lecturas de humedad más fiables desde el inicio.
 void htu_heater_warmup() {
-  Serial.println("HTU2x: calentamiento 3s (evaporar condensacion)...");
+  DLOGLN("HTU2x: calentamiento 3s (evaporar condensacion)...");
   htu_set_heater(true);
   for (int i = 3; i > 0; i--) {
     float t = htu_readTemp();
     float h = htu_readHumidity();
-    Serial.printf("  HTU2x heater ON — T:%.1f C  H:%.1f %%  (%ds)\n", t, h, i);
+    DLOGF("  HTU2x heater ON — T:%.1f C  H:%.1f %%  (%ds)\n", t, h, i);
     delay(1000);
   }
   htu_set_heater(false);
   delay(1000);  // estabilización tras apagar calefactor
-  Serial.println("HTU2x: calentamiento completado.");
+  DLOGLN("HTU2x: calentamiento completado.");
 }
 
 // =============================================================================
@@ -687,23 +699,23 @@ bool tsl_begin() {
   // Autodetección: leer ambos registros de ID y mostrarlos
   uint8_t apds_id = light_read8(APDS_ID_REG);  // 0x12 → 0x39 o 0x30 para APDS-9930
   uint8_t tsl_id  = light_read8(TSL_ID_REG);   // 0x0A → 0xAx para TSL2584
-  Serial.printf("[LUZ] ID@0x12=0x%02X  ID@0x0A=0x%02X\n", apds_id, tsl_id);
+  DLOGF("[LUZ] ID@0x12=0x%02X  ID@0x0A=0x%02X\n", apds_id, tsl_id);
 
   // APDS-9930: ID puede ser 0x39 (rev1) o 0x30 (rev0); nibble alto = 0x3
   if ((apds_id & 0xF0) == 0x30) {
     light_is_apds = true;
     // ATIME=0xDB → 37 ciclos × 2.73 ms ≈ 101 ms por conversión
     light_write(LIGHT_TIMING, 0xDB);
-    Serial.printf("[LUZ] APDS-9930 detectado (ID=0x%02X)\n", apds_id);
+    DLOGF("[LUZ] APDS-9930 detectado (ID=0x%02X)\n", apds_id);
   } else if ((tsl_id & 0xF0) == 0xA0) {
     light_is_apds = false;
     light_write(LIGHT_TIMING, 0x02);  // 402 ms, ganancia 1×
-    Serial.printf("[LUZ] TSL2584 detectado (ID=0x%02X)\n", tsl_id);
+    DLOGF("[LUZ] TSL2584 detectado (ID=0x%02X)\n", tsl_id);
   } else {
     // ID desconocido — probar APDS-9930 como fallback (más probable en 0x39)
     light_is_apds = true;
     light_write(LIGHT_TIMING, 0xDB);
-    Serial.printf("[LUZ] ID desconocido — usando registros APDS-9930 (fallback)\n");
+    DLOGF("[LUZ] ID desconocido — usando registros APDS-9930 (fallback)\n");
   }
 
   delay(450);  // Esperar primera integración completa (cubre ambos casos)
@@ -867,19 +879,19 @@ unsigned long lastScreenTime = 0;
 
 // ── Info estática del hardware ────────────────────────────────────────────────
 void printHardwareInfo() {
-  Serial.println("\n=== Hardware Info ===");
+  DLOGLN("\n=== Hardware Info ===");
 #ifdef ESP8266
-  Serial.printf("Chip         : ESP8266 (ID=0x%08X)\n", ESP.getChipId());
+  DLOGF("Chip         : ESP8266 (ID=0x%08X)\n", ESP.getChipId());
 #else
-  Serial.printf("Chip         : %s rev%d\n", ESP.getChipModel(), ESP.getChipRevision());
+  DLOGF("Chip         : %s rev%d\n", ESP.getChipModel(), ESP.getChipRevision());
 #endif
-  Serial.printf("CPU          : %d MHz\n",      ESP.getCpuFreqMHz());
-  Serial.printf("Flash        : %d MB\n",        ESP.getFlashChipSize() / (1024 * 1024));
-  Serial.printf("Free Heap    : %d bytes\n",     ESP.getFreeHeap());
-  Serial.printf("SDK          : %s\n",           ESP.getSdkVersion());
-  Serial.printf("MAC          : %s\n",           WiFi.macAddress().c_str());
-  Serial.printf("IP           : %s\n",           WiFi.localIP().toString().c_str());
-  Serial.println("====================");
+  DLOGF("CPU          : %d MHz\n",      ESP.getCpuFreqMHz());
+  DLOGF("Flash        : %d MB\n",        ESP.getFlashChipSize() / (1024 * 1024));
+  DLOGF("Free Heap    : %d bytes\n",     ESP.getFreeHeap());
+  DLOGF("SDK          : %s\n",           ESP.getSdkVersion());
+  DLOGF("MAC          : %s\n",           WiFi.macAddress().c_str());
+  DLOGF("IP           : %s\n",           WiFi.localIP().toString().c_str());
+  DLOGLN("====================");
 }
 
 static bool serverUseTls() {
@@ -916,7 +928,7 @@ static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000)
   client.setCACert(MQTT_CA_CERT_PEM);
 
   if (!tlsClockReady(5000)) {
-    Serial.println("[TLS] Advertencia: reloj aun no sincronizado; reintentando handshake con la CA cargada");
+    DLOGLN("[TLS] Advertencia: reloj aun no sincronizado; reintentando handshake con la CA cargada");
   }
 }
 #endif
@@ -978,7 +990,7 @@ void postDeviceInfo() {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(json);
   http.end();
-  Serial.printf("[DeviceInfo] POST → %d\n", code);
+  DLOGF("[DeviceInfo] POST → %d\n", code);
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -1028,13 +1040,13 @@ void syncPipelineScenario() {
       if (nextScenario == "normal" || nextScenario == "leak" ||
           nextScenario == "burst"  || nextScenario == "obstruction") {
         if (nextScenario != pipelineScenario) {
-          Serial.printf("[PIPE] Escenario → %s\n", nextScenario.c_str());
+          DLOGF("[PIPE] Escenario → %s\n", nextScenario.c_str());
         }
         pipelineScenario = nextScenario;
       }
       if (nextMode == "sim" || nextMode == "real") {
         if (nextMode != pipelineMode) {
-          Serial.printf("[PIPE] Modo → %s\n", nextMode.c_str());
+          DLOGF("[PIPE] Modo → %s\n", nextMode.c_str());
         }
         pipelineMode = nextMode;
       }
@@ -1045,14 +1057,14 @@ void syncPipelineScenario() {
         unsigned long nextMs = (unsigned long)nextTelemetry * 1000UL;
         if (nextMs != telemetryIntervalMs) {
           telemetryIntervalMs = nextMs;
-          Serial.printf("[PIPE] Telemetría → %lds\n", nextTelemetry);
+          DLOGF("[PIPE] Telemetría → %lds\n", nextTelemetry);
         }
       }
       if (nextSync >= 5 && nextSync <= 3600) {
         unsigned long nextMs = (unsigned long)nextSync * 1000UL;
         if (nextMs != configSyncIntervalMs) {
           configSyncIntervalMs = nextMs;
-          Serial.printf("[PIPE] Sync config → %lds\n", nextSync);
+          DLOGF("[PIPE] Sync config → %lds\n", nextSync);
         }
       }
 #ifdef HAS_DISPLAY
@@ -1060,7 +1072,7 @@ void syncPipelineScenario() {
         unsigned long nextMs = (unsigned long)nextDisplay * 1000UL;
         if (nextMs != displayTimeoutMs) {
           displayTimeoutMs = nextMs;
-          Serial.printf("[PIPE] Pantalla timeout → %lds\n", nextDisplay);
+          DLOGF("[PIPE] Pantalla timeout → %lds\n", nextDisplay);
         }
       }
 #endif
@@ -1071,7 +1083,7 @@ void syncPipelineScenario() {
     if (body == "normal" || body == "leak" ||
         body == "burst"  || body == "obstruction") {
       if (body != pipelineScenario) {
-        Serial.printf("[PIPE] Escenario → %s\n", body.c_str());
+        DLOGF("[PIPE] Escenario → %s\n", body.c_str());
       }
       pipelineScenario = body;
     }
@@ -1086,7 +1098,7 @@ void checkRelayCommand() {
 
   int bitmask = 0;
   if (!parseRelayBitmask(response, bitmask)) {
-    Serial.printf("[Relay] Respuesta invalida ignorada: %s\n", response.c_str());
+    DLOGF("[Relay] Respuesta invalida ignorada: %s\n", response.c_str());
     return;
   }
 
@@ -1097,7 +1109,7 @@ void checkRelayCommand() {
       relayActive[i] = desired;
       // JQC-3FF-S-Z activo-LOW: LOW = relay ON, HIGH = relay OFF
       digitalWrite(RELAY_PINS[i], desired ? LOW : HIGH);
-      Serial.printf("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
+      DLOGF("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
       changed = true;
     }
   }
@@ -1376,7 +1388,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (relay >= 0 && relay < RELAY_COUNT) {
       relayActive[relay] = state;
       digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
-      Serial.printf("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+      DLOGF("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
     }
   }
 
@@ -1419,7 +1431,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (updatedPipe) {
     updatePipelineValues();
-    Serial.printf("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode.c_str(), pipelineScenario.c_str());
+    DLOGF("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode.c_str(), pipelineScenario.c_str());
   }
 }
 
@@ -1440,9 +1452,9 @@ bool mqttConnect() {
     char cmd_topic[64];
     snprintf(cmd_topic, sizeof(cmd_topic), "aquantia/%s/cmd", finca_id);
     mqttClient.subscribe(cmd_topic, 1);
-    Serial.printf("[MQTT] Conectado como %s — suscrito a %s\n", client_id, cmd_topic);
+    DLOGF("[MQTT] Conectado como %s — suscrito a %s\n", client_id, cmd_topic);
   } else {
-    Serial.printf("[MQTT] Error de conexion: rc=%d client_id=%s\n",
+    DLOGF("[MQTT] Error de conexion: rc=%d client_id=%s\n",
                   mqttClient.state(), client_id);
   }
   return ok;
@@ -1469,7 +1481,7 @@ void mqttPublishRegister() {
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
   size_t payload_len = serializeJson(doc, buf, sizeof(buf));
   bool ok = mqttClient.publish(topic, buf, false);
-  Serial.printf("[MQTT] Register %s (%u B)\n",
+  DLOGF("[MQTT] Register %s (%u B)\n",
                 ok ? "publicado" : "ERROR",
                 (unsigned)payload_len);
 }
@@ -1570,10 +1582,10 @@ void networkTask(void* pvParameters) {
   if (mqtt_port == 8883) {
     prepareSecureClient(mqttTLSClient, 10000);
     mqttClient.setClient(mqttTLSClient);
-    Serial.printf("[MQTT] Broker TLS verificado: %s:%d\n", mqtt_server, mqtt_port);
+    DLOGF("[MQTT] Broker TLS verificado: %s:%d\n", mqtt_server, mqtt_port);
   } else {
     mqttClient.setClient(mqttTCPClient);
-    Serial.printf("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
+    DLOGF("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
   }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
@@ -1604,7 +1616,7 @@ void networkTask(void* pvParameters) {
 #ifdef USE_MQTT
     // Reintentar NTP cada 60s si el reloj no está sincronizado (fallo en boot)
     if (time(nullptr) < 1000000000L && (now - lastNtpRetry > 60000 || lastNtpRetry == 0)) {
-      Serial.println("[NTP] Reintentando sincronización...");
+      DLOGLN("[NTP] Reintentando sincronización...");
       configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
       lastNtpRetry = now;
     }
@@ -1691,13 +1703,13 @@ void networkTask(void* pvParameters) {
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       size_t payload_len = serializeJson(doc, buf, sizeof(buf));
       if (payload_len >= sizeof(buf)) {
-        Serial.printf("[MQTT] WARN payload truncado (%u >= %u)\n",
+        DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n",
                       (unsigned)payload_len, (unsigned)sizeof(buf));
       }
       digitalWrite(ledPin, LED_ON);
       bool ok = mqttClient.publish(topic, buf, false);
       digitalWrite(ledPin, LED_OFF);
-      Serial.printf("[MQTT] TX %s (%u B): %s\n", ok ? "OK" : "ERROR",
+      DLOGF("[MQTT] TX %s (%u B): %s\n", ok ? "OK" : "ERROR",
                     (unsigned)payload_len, buf);
 
       lastServerOK = ok;
@@ -1734,11 +1746,11 @@ void networkTask(void* pvParameters) {
         snap.pipePressure, snap.pipeFlow, snap.soil
       );
 
-      Serial.printf("[NET] TX: %s\n", msg);
+      DLOGF("[NET] TX: %s\n", msg);
       digitalWrite(ledPin, LED_ON);
       bool ok = httpPost(url, String(msg));
       digitalWrite(ledPin, LED_OFF);
-      Serial.printf("[NET] HTTP %s\n", ok ? "200 OK" : "ERROR");
+      DLOGF("[NET] HTTP %s\n", ok ? "200 OK" : "ERROR");
 
       lastServerOK = ok;
       lastSendTime = now;
@@ -1757,39 +1769,39 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   setCpuFrequencyMhz(160);
-  Serial.println("\n\n=== MeteoStation BOOT ===");
+  DLOGLN("\n\n=== MeteoStation BOOT ===");
 
 #ifdef DEBUG_MODE
-  Serial.println("=== DEBUG MODE ACTIVO ===");
-  Serial.printf("[TEST] Perfil  : %s (%d)\n",
+  DLOGLN("=== DEBUG MODE ACTIVO ===");
+  DLOGF("[TEST] Perfil  : %s (%d)\n",
     (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
     (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", DEVICE_PROFILE);
-  Serial.printf("[TEST] Relays  : %d\n", RELAY_COUNT);
-  Serial.printf("[TEST] Display : %s\n",
+  DLOGF("[TEST] Relays  : %d\n", RELAY_COUNT);
+  DLOGF("[TEST] Display : %s\n",
 #ifdef HAS_DISPLAY
     "SI (TFT 240x135)"
 #else
     "NO"
 #endif
   );
-  Serial.printf("[TEST] MQTT    : %s\n",
+  DLOGF("[TEST] MQTT    : %s\n",
 #ifdef USE_MQTT
     "HABILITADO"
 #else
     "DESHABILITADO"
 #endif
   );
-  Serial.printf("[TEST] MAC ROM : %s\n", device_serial_get());
+  DLOGF("[TEST] MAC ROM : %s\n", device_serial_get());
 #endif  // DEBUG_MODE
 
   // I2C debe inicializarse antes del TFT para que el periman de ESP32 core 3.x
   // registre los pines correctamente antes de que SPI los reclame.
-  Serial.println("Iniciando I2C...");
+  DLOGLN("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
 #ifndef ESP8266
   Wire.setTimeOut(100);  // timeout 100ms para evitar hang si un sensor no responde
 #endif
-  Serial.println("I2C OK");
+  DLOGLN("I2C OK");
 
   // ── TFT init — debe ir antes del provisioning para poder mostrar ──
   // el portal AP si el dispositivo no tiene credenciales WiFi en NVS
@@ -1801,12 +1813,12 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   void* sprPtr = spr.createSprite(240, 135);
   if (!sprPtr) {
-    Serial.printf("[TFT] ERROR: createSprite falló (heap libre: %ld)\n", (long)ESP.getFreeHeap());
+    DLOGF("[TFT] ERROR: createSprite falló (heap libre: %ld)\n", (long)ESP.getFreeHeap());
     // Fallback: dibujar directamente en tft sin sprite
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawCentreString("SPRITE FAIL", 120, 60, 4);
   } else {
-    Serial.printf("[TFT] Sprite creado OK (heap libre: %ld)\n", (long)ESP.getFreeHeap());
+    DLOGF("[TFT] Sprite creado OK (heap libre: %ld)\n", (long)ESP.getFreeHeap());
   }
   spr.setSwapBytes(true);
   pinMode(BTN_LEFT,  INPUT_PULLUP);
@@ -1828,7 +1840,7 @@ void setup() {
   // ── Credenciales: DEV_MODE (directo) vs PROD (NVS + portal) ──────────────
 #ifdef DEV_MODE
   // ── Modo desarrollo: usa secrets.h directamente, sin NVS ni portal ────────
-  Serial.println("[DEV] DEV_MODE activo — saltando provisioning");
+  DLOGLN("[DEV] DEV_MODE activo — saltando provisioning");
   // ssid/password/finca_id/mqtt_pass ya apuntan a los literales de secrets.h
 #elif !defined(ESP8266)
   // ── Modo producción: factory reset + NVS + portal SoftAP ─────────────────
@@ -1849,7 +1861,7 @@ void setup() {
         snprintf(ap_ssid_buf, sizeof(ap_ssid_buf), "Aquantia-%.6s", ser + 9);
       else
         strlcpy(ap_ssid_buf, "Aquantia-??????", sizeof(ap_ssid_buf));
-      Serial.printf("[TFT] Mostrando pantalla AP: %s\n", ap_ssid_buf);
+      DLOGF("[TFT] Mostrando pantalla AP: %s\n", ap_ssid_buf);
       drawAPScreen(ap_ssid_buf, ser);
     }
 #endif
@@ -1858,22 +1870,22 @@ void setup() {
 
   ssid     = prov_ssid;
   password = prov_password;
-  Serial.printf("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
+  DLOGF("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
 #endif  // DEV_MODE / producción
 
   // Escaner I2C — detecta todos los dispositivos en el bus
-  Serial.println("Escaneando bus I2C...");
+  DLOGLN("Escaneando bus I2C...");
   int found = 0;
   for (uint8_t addr = 1; addr < 127; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      Serial.printf("  Dispositivo en 0x%02X\n", addr);
+      DLOGF("  Dispositivo en 0x%02X\n", addr);
       found++;
     }
     delay(2);
   }
-  if (found == 0) Serial.println("  Ningun dispositivo encontrado");
-  else Serial.printf("  Total: %d dispositivos\n", found);
+  if (found == 0) DLOGLN("  Ningun dispositivo encontrado");
+  else DLOGF("  Total: %d dispositivos\n", found);
 
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LED_OFF);
@@ -1884,14 +1896,14 @@ void setup() {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], HIGH);  // HIGH = OFF para relay activo-LOW
   }
-  Serial.printf("%d relay(s) inicializados en OFF (HIGH)\n", RELAY_COUNT);
+  DLOGF("%d relay(s) inicializados en OFF (HIGH)\n", RELAY_COUNT);
 
 #if defined(ESP32) && !defined(ESP8266)
   analogReadResolution(12);
   #if defined(SOIL_PIN)
   pinMode(SOIL_PIN, ANALOG);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
-  Serial.printf("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
+  DLOGF("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
   #endif
 #endif
   // Nota: TFT ya inicializado al principio de setup() para soportar pantalla AP
@@ -1900,9 +1912,9 @@ void setup() {
   mcp_ok = tempsensor.begin(0x19);
   if (mcp_ok) {
     tempsensor.setResolution(3);
-    Serial.println("MCP9808 OK");
+    DLOGLN("MCP9808 OK");
   } else {
-    Serial.println("MCP9808 no detectado");
+    DLOGLN("MCP9808 no detectado");
   }
 
   bmp_ok = beginBMP280();
@@ -1913,43 +1925,43 @@ void setup() {
     bmp_pressure_ok = readBMP280PressureKPa(pBmp);
     if (bmp_temp_ok) bmpTemperature = tBmp;
     if (bmp_pressure_ok) bmpPressure = pBmp;
-    Serial.printf("BMP280 OK (0x%02X)\n", bmp280_addr);
+    DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
   } else {
     bmp_temp_ok = false;
     bmp_pressure_ok = false;
-    Serial.println("BMP280 no detectado");
+    DLOGLN("BMP280 no detectado");
   }
 
   temp_ok = mcp_ok || bmp_temp_ok;
   if (!temp_ok) {
-    Serial.println("Temperatura externa sin sensor real — modo simulacion");
+    DLOGLN("Temperatura externa sin sensor real — modo simulacion");
     temperatureMCP = sim_tempMCP;
   } else if (!mcp_ok && bmp_temp_ok) {
     temperatureMCP = bmpTemperature;
-    Serial.println("Temperatura externa usara BMP280");
+    DLOGLN("Temperatura externa usara BMP280");
   }
 
   micropressure_ok = barometer.begin();
   bar_ok = micropressure_ok || bmp_pressure_ok;
   if (micropressure_ok) {
-    Serial.println("Barometro MicroPressure OK");
+    DLOGLN("Barometro MicroPressure OK");
   } else if (bmp_pressure_ok) {
     pressure = bmpPressure;
-    Serial.println("MicroPressure no detectado — usando BMP280 como barometro");
+    DLOGLN("MicroPressure no detectado — usando BMP280 como barometro");
   } else {
-    Serial.println("Barometro no detectado — modo simulacion");
+    DLOGLN("Barometro no detectado — modo simulacion");
     pressure = sim_pressure;
   }
-  Serial.printf("Sensores activos → TempExt:%s | Presion:%s\n",
+  DLOGF("Sensores activos → TempExt:%s | Presion:%s\n",
     temperatureSourceName(), pressureSourceName());
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-  Serial.println("MCP9808 — perfil AGROMETEO, sensor omitido");
-  Serial.println("BMP280 v2 — inicializado en bloque AGROMETEO");
-  Serial.println("Barometro MicroPressure — perfil AGROMETEO, sensor omitido");
+  DLOGLN("MCP9808 — perfil AGROMETEO, sensor omitido");
+  DLOGLN("BMP280 v2 — inicializado en bloque AGROMETEO");
+  DLOGLN("Barometro MicroPressure — perfil AGROMETEO, sensor omitido");
 #else
-  Serial.println("MCP9808 — perfil IRRIGATION, sensor omitido");
-  Serial.println("BMP280 — perfil IRRIGATION, sensor omitido");
-  Serial.println("Barometro — perfil IRRIGATION, sensor omitido");
+  DLOGLN("MCP9808 — perfil IRRIGATION, sensor omitido");
+  DLOGLN("BMP280 — perfil IRRIGATION, sensor omitido");
+  DLOGLN("Barometro — perfil IRRIGATION, sensor omitido");
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
@@ -1958,9 +1970,9 @@ void setup() {
   if (qwiic_ps_ok) {
     qwiic_ps_power(true);
     delay(50);   // esperar estabilización de la alimentación antes de init I2C
-    Serial.println("Qwiic Power Switch OK — sensores encendidos");
+    DLOGLN("Qwiic Power Switch OK — sensores encendidos");
   } else {
-    Serial.println("Qwiic Power Switch no detectado — sensores siempre alimentados");
+    DLOGLN("Qwiic Power Switch no detectado — sensores siempre alimentados");
   }
 
   // ── AGROMETEO: BMP280 + HDC1080 + BH1750 ─────────────────────────────────
@@ -1978,13 +1990,13 @@ void setup() {
     if (bmp_temp_ok)     bmpTemperature = tBmp;
     if (bmp_pressure_ok) { bmpPressure = pBmp; pressure = pBmp; }
     bar_ok = bmp_pressure_ok;
-    Serial.printf("BMP280 OK (0x%02X)\n", bmp280_addr);
+    DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
   } else {
     bmp_temp_ok     = false;
     bmp_pressure_ok = false;
     bar_ok          = false;
     pressure        = sim_pressure;
-    Serial.println("BMP280 no detectado — modo simulacion");
+    DLOGLN("BMP280 no detectado — modo simulacion");
   }
 
   // HDC1080 — temperatura y humedad primaria
@@ -1996,13 +2008,13 @@ void setup() {
       temperatureMCP = t;
       humidity       = h;
       temp_ok        = true;
-      Serial.printf("HDC1080 OK — T:%.1f C  H:%.1f %%\n", t, h);
+      DLOGF("HDC1080 OK — T:%.1f C  H:%.1f %%\n", t, h);
     } else {
       hdc_ok = false;
     }
   }
   if (!hdc_ok) {
-    Serial.println("HDC1080 no detectado — modo simulacion");
+    DLOGLN("HDC1080 no detectado — modo simulacion");
     temperatureMCP = sim_tempMCP;
     humidity       = sim_humidity;
   }
@@ -2012,9 +2024,9 @@ void setup() {
   if (bh1750_ok) {
     delay(200);  // primera conversión ~120ms
     lightLevel = bh1750.readLightLevel();
-    Serial.printf("BH1750 OK — %.1f lx\n", lightLevel);
+    DLOGF("BH1750 OK — %.1f lx\n", lightLevel);
   } else {
-    Serial.println("BH1750 no detectado — modo simulacion");
+    DLOGLN("BH1750 no detectado — modo simulacion");
     lightLevel = sim_light;
   }
 #endif  // PROFILE_AGROMETEO
@@ -2029,13 +2041,13 @@ void setup() {
     if (!isnan(t) && !isnan(h)) {
       temperatureDHT = t;
       humidity       = h;
-      Serial.printf("HTU2x OK — T:%.1f C  H:%.1f %%\n", t, h);
+      DLOGF("HTU2x OK — T:%.1f C  H:%.1f %%\n", t, h);
     } else {
       htu_ok = false;
     }
   }
   if (!htu_ok) {
-    Serial.println("HTU2x no detectado — modo simulacion");
+    DLOGLN("HTU2x no detectado — modo simulacion");
     temperatureDHT = sim_tempDHT;
     humidity       = sim_humidity;
   }
@@ -2055,27 +2067,27 @@ void setup() {
     if (dht_ok) {
       temperatureDHT11 = th.temperature;
       humidityDHT11    = th.humidity;
-      Serial.println("DHT11 OK");
+      DLOGLN("DHT11 OK");
     } else {
-      Serial.println("DHT11 no detectado — modo simulacion");
+      DLOGLN("DHT11 no detectado — modo simulacion");
       temperatureDHT11 = sim_tempDHT11;
       humidityDHT11    = sim_humDHT11;
     }
   }
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-  Serial.println("DHT11 — perfil AGROMETEO, sensor omitido");
+  DLOGLN("DHT11 — perfil AGROMETEO, sensor omitido");
 #else
-  Serial.println("DHT11 — perfil IRRIGATION, sensor omitido");
+  DLOGLN("DHT11 — perfil IRRIGATION, sensor omitido");
 #endif
 
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
   // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750 inicializado arriba)
   tsl_ok = tsl_begin();
   if (tsl_ok) {
-    Serial.println("Sensor luz OK");
+    DLOGLN("Sensor luz OK");
     lightLevel = tsl_readLux();
   } else {
-    Serial.println("Sensor luz no detectado — modo simulacion");
+    DLOGLN("Sensor luz no detectado — modo simulacion");
     lightLevel = sim_light;
   }
 #else
@@ -2091,21 +2103,21 @@ void setup() {
       (float)(SOIL_RAW_DRY - raw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
       0.0f, 100.0f
     );
-    Serial.printf("YL-69 OK — suelo: %.1f %% (ADC raw=%d)\n", soilMoisture, raw);
+    DLOGF("YL-69 OK — suelo: %.1f %% (ADC raw=%d)\n", soilMoisture, raw);
   }
 #endif
 
 #ifdef ESP8266
-  Serial.println("Plataforma: ESP8266 (sin pantalla, sin veleta)");
+  DLOGLN("Plataforma: ESP8266 (sin pantalla, sin veleta)");
 #else
-  Serial.println("Plataforma: ESP32 (con pantalla TFT)");
+  DLOGLN("Plataforma: ESP32 (con pantalla TFT)");
 #endif
 
 #ifdef HAS_DISPLAY
   drawBootScreen("Conectando WiFi...");
 #endif
 
-  Serial.println("Conectando WiFi...");
+  DLOGLN("Conectando WiFi...");
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
@@ -2113,13 +2125,13 @@ void setup() {
 #ifdef ESP8266
     yield();
 #endif
-    Serial.print(".");
+    DLOG(".");
     tries++;
   }
-  Serial.println();
+  DLOGLN();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi OK: " + WiFi.localIP().toString());
+    DLOGLN("WiFi OK: " + WiFi.localIP().toString());
 
 #if !defined(ESP8266) && defined(USE_MQTT)
   #ifndef DEV_MODE
@@ -2133,7 +2145,7 @@ void setup() {
     if (prov_mqtt_token[0] != '\0') {
       mqtt_pass = prov_mqtt_token;
     } else {
-      Serial.println("[MQTT] ADVERTENCIA: sin token NVS — dispositivo no provisionado de fábrica");
+      DLOGLN("[MQTT] ADVERTENCIA: sin token NVS — dispositivo no provisionado de fábrica");
     }
     // finca_id = MAC hex (identidad del dispositivo; el backend asocia a la finca tras el claim)
     static char _finca_mac[16];
@@ -2144,7 +2156,7 @@ void setup() {
     finca_id = _finca_mac;
   #endif
 
-    Serial.printf("[MQTT] Auth user: %s  |  Serial: %s\n",
+    DLOGF("[MQTT] Auth user: %s  |  Serial: %s\n",
                   mqtt_user, device_serial_get());
 #endif
 
@@ -2161,15 +2173,15 @@ void setup() {
     ArduinoOTA.onStart([]() {
       isUpdatingOTA = true;
       String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
-      Serial.printf("\n[OTA] Inicio de actualización (%s) — relays a OFF por seguridad\n", type.c_str());
+      DLOGF("\n[OTA] Inicio de actualización (%s) — relays a OFF por seguridad\n", type.c_str());
       // Apagar todos los relays por seguridad durante el flash
       for (int i = 0; i < RELAY_COUNT; i++) digitalWrite(RELAY_PINS[i], HIGH);
     });
     ArduinoOTA.onEnd([]() {
-      Serial.println("\n[OTA] Actualización completada — reiniciando");
+      DLOGLN("\n[OTA] Actualización completada — reiniciando");
     });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("[OTA] %u%% (%u/%u bytes)\r", progress * 100 / total, progress, total);
+      DLOGF("[OTA] %u%% (%u/%u bytes)\r", progress * 100 / total, progress, total);
     });
     ArduinoOTA.onError([](ota_error_t error) {
       isUpdatingOTA = false;
@@ -2181,27 +2193,27 @@ void setup() {
         case OTA_RECEIVE_ERROR: msg = "Fallo al recibir datos";  break;
         case OTA_END_ERROR:     msg = "Fallo al finalizar";      break;
       }
-      Serial.printf("[OTA] ERROR %u: %s\n", error, msg);
+      DLOGF("[OTA] ERROR %u: %s\n", error, msg);
     });
     ArduinoOTA.begin();
 
 #if !defined(ESP8266) && defined(USE_MQTT)
     // Sincronizar reloj via NTP — necesario para validar cert TLS de MQTT
     configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-    Serial.print("[NTP] Sincronizando hora");
+    DLOG("[NTP] Sincronizando hora");
     {
       time_t now = time(nullptr);
       int ntpTries = 0;
       while (now < 1000000000L && ntpTries < 40) {
         delay(500);
-        Serial.print(".");
+        DLOG(".");
         now = time(nullptr);
         ntpTries++;
       }
       if (now < 1000000000L) {
-        Serial.println("\n[NTP] WARN: reloj no sincronizado — timestamps no fiables");
+        DLOGLN("\n[NTP] WARN: reloj no sincronizado — timestamps no fiables");
       } else {
-        Serial.printf("\n[NTP] Hora: %s", ctime(&now));
+        DLOGF("\n[NTP] Hora: %s", ctime(&now));
       }
     }
 #endif
@@ -2222,10 +2234,10 @@ void setup() {
       &networkTaskHandle, // handle
       0                   // Core 0
     );
-    Serial.println("NetworkTask creada en Core 0");
+    DLOGLN("NetworkTask creada en Core 0");
 #endif
     WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
-    Serial.println("OTA listo — hostname: " +
+    DLOGLN("OTA listo — hostname: " +
 #ifdef ESP8266
       String("meteostation-esp8266")
 #else
@@ -2244,12 +2256,12 @@ void setup() {
     // Si las credenciales vinieron de NVS y WiFi falló → volver al portal
     // para que el usuario corrija la red (p.ej. contraseña cambiada).
     if (prov_ssid[0] != '\0') {
-      Serial.println("[PROV] WiFi fallido con credenciales NVS — iniciando portal de reconfiguración...");
+      DLOGLN("[PROV] WiFi fallido con credenciales NVS — iniciando portal de reconfiguración...");
       // drawAPScreen se llama desde dentro de provisioning_start_ap() via callback
       provisioning_start_ap();  // no retorna
     }
 #endif
-    Serial.println("Sin WiFi — continuando sin conexion (OTA no disponible)");
+    DLOGLN("Sin WiFi — continuando sin conexion (OTA no disponible)");
 #ifdef HAS_DISPLAY
     drawBootScreen("Sin WiFi — modo offline");
 #endif
@@ -2260,27 +2272,27 @@ void setup() {
 #endif
 
 #ifdef DEBUG_MODE
-  Serial.println(F("\n====== AQUANTIA BOOT COMPLETO ======"));
-  Serial.printf("[TEST] Perfil   : %s | Relays: %d\n",
+  DLOGLN(F("\n====== AQUANTIA BOOT COMPLETO ======"));
+  DLOGF("[TEST] Perfil   : %s | Relays: %d\n",
     (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
     (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", RELAY_COUNT);
-  Serial.printf("[TEST] WiFi     : %s\n",
+  DLOGF("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
-  Serial.printf("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
-  Serial.printf("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
+  DLOGF("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
+  DLOGF("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
-  Serial.printf("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
-  Serial.printf("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
 #else
-  Serial.printf("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
-  Serial.printf("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
-  Serial.printf("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
 #endif
-  Serial.printf("[TEST] Heap     : %ld bytes libres\n", (long)ESP.getFreeHeap());
-  Serial.println(F("[TEST] Iniciando loop() — reporte cada 5s"));
-  Serial.println(F("====================================\n"));
+  DLOGF("[TEST] Heap     : %ld bytes libres\n", (long)ESP.getFreeHeap());
+  DLOGLN(F("[TEST] Iniciando loop() — reporte cada 5s"));
+  DLOGLN(F("====================================\n"));
 #endif
 }
 
@@ -2355,7 +2367,7 @@ void loop() {
       }
       if (!bmp_temp_ok && !bmp_pressure_ok) {
         bmp_ok = false;
-        Serial.println("BMP280 fallo en lectura — cambiando a simulacion");
+        DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
       }
     }
 
@@ -2370,7 +2382,7 @@ void loop() {
         temp_ok = true;
       } else {
         mcp_ok = false;
-        Serial.println("MCP9808 fallo en lectura — probando BMP280");
+        DLOGLN("MCP9808 fallo en lectura — probando BMP280");
       }
     }
     if (!temp_ok && bmp_temp_ok) {
@@ -2388,7 +2400,7 @@ void loop() {
         bar_ok = true;
       } else {
         micropressure_ok = false;
-        Serial.println("MicroPressure fallo en lectura — probando BMP280");
+        DLOGLN("MicroPressure fallo en lectura — probando BMP280");
       }
     }
     if (!bar_ok && bmp_pressure_ok) {
@@ -2408,7 +2420,7 @@ void loop() {
         humidity       = h;
       } else {
         htu_ok = false;
-        Serial.println("HTU2x fallo en lectura — cambiando a simulacion");
+        DLOGLN("HTU2x fallo en lectura — cambiando a simulacion");
       }
     }
     if (!htu_ok) {
@@ -2456,7 +2468,7 @@ void loop() {
       } else {
         hdc_ok  = false;
         temp_ok = false;
-        Serial.println("HDC1080 fallo en lectura — cambiando a simulacion");
+        DLOGLN("HDC1080 fallo en lectura — cambiando a simulacion");
       }
     }
     if (!hdc_ok) {
@@ -2475,7 +2487,7 @@ void loop() {
                                          pressure = pBmp; bar_ok = true; }
       if (!bmp_temp_ok && !bmp_pressure_ok) {
         bmp_ok = false;
-        Serial.println("BMP280 fallo en lectura — cambiando a simulacion");
+        DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
       }
     }
     if (!bar_ok) pressure = sim_pressure;
@@ -2491,7 +2503,7 @@ void loop() {
         lightLevel = lux;
       } else {
         bh1750_ok = false;
-        Serial.println("BH1750 fallo en lectura — cambiando a simulacion");
+        DLOGLN("BH1750 fallo en lectura — cambiando a simulacion");
       }
     }
     if (!bh1750_ok) lightLevel = sim_light;
@@ -2523,7 +2535,7 @@ void loop() {
         lightLevel = lux;
       } else {
         tsl_ok = false;
-        Serial.println("TSL2584 fallo en lectura — cambiando a simulacion");
+        DLOGLN("TSL2584 fallo en lectura — cambiando a simulacion");
       }
     }
     if (!tsl_ok) lightLevel = sim_light;
@@ -2552,11 +2564,11 @@ void loop() {
 #ifdef HAS_DISPLAY
     drawScreen();
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-    Serial.printf("[1s] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
+    DLOGF("[1s] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
       temperatureMCP, humidity, bmpTemperature, (float)pressure,
       lightLevel, agroDewPoint, agroHeatIndex, agroAbsHum);
 #else
-    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
+    DLOGF("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
       temperatureMCP, temperatureDHT, humidity,
       temperatureDHT11, humidityDHT11,
       (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel, soilMoisture);
@@ -2611,10 +2623,10 @@ void loop() {
   if (now - lastDebugReport >= DEBUG_INTERVAL_MS) {
     lastDebugReport = now;
 
-    Serial.println(F("\n====== AQUANTIA TEST REPORT ======"));
+    DLOGLN(F("\n====== AQUANTIA TEST REPORT ======"));
 
     // Perfil e info de compilacion
-    Serial.printf("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
+    DLOGF("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
       (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
       (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION",
       DEVICE_PROFILE, RELAY_COUNT,
@@ -2632,80 +2644,80 @@ void loop() {
 
     // Tiempo y memoria
     unsigned long up = millis() / 1000;
-    Serial.printf("[TIEMPO] Uptime: %luh %02lum %02lus | Heap libre: %ld B\n",
+    DLOGF("[TIEMPO] Uptime: %luh %02lum %02lus | Heap libre: %ld B\n",
       up / 3600, (up % 3600) / 60, up % 60, (long)ESP.getFreeHeap());
 
     // Serial / MAC del dispositivo
-    Serial.printf("[DEVICE] Serial: %s\n", device_serial_get());
+    DLOGF("[DEVICE] Serial: %s\n", device_serial_get());
 
     // WiFi
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("[WIFI  ] CONECTADO | IP: %s | RSSI: %d dBm | SSID: %s\n",
+      DLOGF("[WIFI  ] CONECTADO | IP: %s | RSSI: %d dBm | SSID: %s\n",
         WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.SSID().c_str());
     } else {
-      Serial.println("[WIFI  ] DESCONECTADO");
+      DLOGLN("[WIFI  ] DESCONECTADO");
     }
 
 #if !defined(ESP8266) && defined(USE_MQTT)
-    Serial.printf("[MQTT  ] %s\n",
+    DLOGF("[MQTT  ] %s\n",
       mqttClient.connected() ? "CONECTADO" : "DESCONECTADO");
 #endif
 
     // Estado de sensores
-    Serial.print("[SENSOR]");
+    DLOG("[SENSOR]");
 #if DEVICE_PROFILE == PROFILE_METEO
-    Serial.printf(" TempExt:%s  Barometro:%s  DHT11:%s",
+    DLOGF(" TempExt:%s  Barometro:%s  DHT11:%s",
       temp_ok ? temperatureSourceName() : "SIM",
       bar_ok ? pressureSourceName() : "SIM",
       dht_ok ? "REAL" : "SIM");
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-    Serial.printf(" HDC1080:%s  BMP280:%s  BH1750:%s",
+    DLOGF(" HDC1080:%s  BMP280:%s  BH1750:%s",
       hdc_ok ? "REAL" : "SIM",
       bmp_ok ? "REAL" : "SIM",
       bh1750_ok ? "REAL" : "SIM");
 #else
-    Serial.print(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
+    DLOG(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
 #endif
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
-    Serial.printf("  HTU2x:%s  LuzAmb:%s\n",
+    DLOGF("  HTU2x:%s  LuzAmb:%s\n",
       htu_ok ? "REAL" : "SIM", tsl_ok ? "REAL" : "SIM");
 #else
-    Serial.println();  // AGROMETEO: sensores ya listados arriba
+    DLOGLN();  // AGROMETEO: sensores ya listados arriba
 #endif
 
     // Valores medidos / simulados
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
-    Serial.printf("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
+    DLOGF("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
       temperatureMCP, humidity, bmpTemperature, (float)pressure, lightLevel);
-    Serial.printf("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
+    DLOGF("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
       agroDewPoint, agroHeatIndex, agroAbsHum);
 #else
-    Serial.printf("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
+    DLOGF("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
       temperatureMCP, temperatureDHT, humidity, lightLevel);
 #if DEVICE_PROFILE == PROFILE_METEO
-    Serial.printf("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
+    DLOGF("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
       (float)pressure, temperatureDHT11, humidityDHT11, soilMoisture);
 #endif
-    Serial.printf("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
+    DLOGF("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
 #endif
 
     // Estado relays
-    Serial.print("[RELAYS]");
+    DLOG("[RELAYS]");
     for (int i = 0; i < RELAY_COUNT; i++) {
-      Serial.printf(" R%d:%s", i, relayActive[i] ? "ON " : "OFF");
+      DLOGF(" R%d:%s", i, relayActive[i] ? "ON " : "OFF");
     }
-    Serial.println();
+    DLOGLN();
 
     // Test assertions
     bool allRelaysOff = true;
     for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) { allRelaysOff = false; break; }
 
-    Serial.println("[TEST  ] " + String(allRelaysOff ? "PASS" : "FAIL") +
+    DLOGLN("[TEST  ] " + String(allRelaysOff ? "PASS" : "FAIL") +
                    " — Todos los relays en OFF (estado seguro)");
-    Serial.println("[TEST  ] PASS — Boot completado sin crash (uptime > 0)");
-    Serial.println("[TEST  ] PASS — Sensores: modo SIM cuando no hay hardware conectado");
-    Serial.println(F("==================================\n"));
+    DLOGLN("[TEST  ] PASS — Boot completado sin crash (uptime > 0)");
+    DLOGLN("[TEST  ] PASS — Sensores: modo SIM cuando no hay hardware conectado");
+    DLOGLN(F("==================================\n"));
   }
 #endif  // DEBUG_MODE
 }
