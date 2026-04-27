@@ -91,11 +91,12 @@
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-  // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch
+  // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include <BH1750.h>
   #include <SparkFun_Qwiic_Power_Switch_Arduino_Library.h>
+  #include <SparkFun_MicroPressure.h>
 #else
   // IRRIGATION: solo I2C básico (sin sensores meteo)
   #include <Wire.h>
@@ -295,6 +296,7 @@ void ledTick() {
   Adafruit_BMP280        bmp280;
   BH1750                 bh1750;
   QWIIC_POWER            qwiic_ps;
+  SparkFun_MicroPressure barometer;
 #endif
 
 #ifdef HAS_DISPLAY
@@ -431,36 +433,11 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 }
 
 // =============================================================================
-// Qwiic Power Switch — SparkFun library wrapper (solo PROFILE_AGROMETEO)
-// El objeto qwiic_ps (QWIIC_POWER) gestiona internamente el PCA9536 en 0x41.
-// powerOn()  → GPIO0=HIGH (MOSFET ON) + GPIO1=HIGH (I2C aislador habilitado)
-// powerOff() → GPIO0=LOW  (MOSFET OFF) + GPIO1=LOW  (I2C aislado)
+// Qwiic Power Switch — solo PROFILE_AGROMETEO
+// El objeto qwiic_ps (QWIIC_POWER) gestiona el PCA9536 en 0x41.
+// Se enciende una vez en setup() y permanece ON durante toda la ejecución.
+// powerOn/powerOff siguen disponibles si en el futuro se necesita deep-sleep.
 // =============================================================================
-static void qwiic_ps_power(bool on) {
-  if (!qwiic_ps_ok) return;
-  if (on) qwiic_ps.powerOn();
-  else    qwiic_ps.powerOff();
-}
-
-// Re-inicializa los tres sensores tras un ciclo de alimentación.
-// Se llama en cada ciclo de lectura, después de qwiic_ps_power(true).
-static void agro_sensors_reinit() {
-  // BMP280 — restaurar modo normal y configuración de muestreo
-  bmp_ok = beginBMP280();
-  if (bmp_ok) {
-    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                      Adafruit_BMP280::SAMPLING_X2,
-                      Adafruit_BMP280::SAMPLING_X16,
-                      Adafruit_BMP280::FILTER_X16,
-                      Adafruit_BMP280::STANDBY_MS_500);
-  }
-  // HDC1080 — restaurar registro de configuración (15 ms de arranque interno)
-  // Siempre actualizar hdc_ok con el resultado del reinit tras un ciclo de alimentación.
-  hdc_ok = hdc1080_init();
-  // BH1750 — restaurar modo continuo de alta resolución
-  bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-  if (bh1750_ok) delay(180);  // primera conversión ~120 ms; esperar con margen
-}
 #endif  // PROFILE_AGROMETEO
 
 static const char* temperatureSourceName() {
@@ -479,7 +456,8 @@ static const char* pressureSourceName() {
   if (micropressure_ok) return "MicroPressure";
   if (bmp_pressure_ok) return "BMP280";
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-  if (bmp_pressure_ok) return "BMP280";
+  if (micropressure_ok) return "MicroPressure";
+  if (bmp_pressure_ok)  return "BMP280";
 #endif
   return "SIM";
 }
@@ -2051,8 +2029,7 @@ void setup() {
     temperatureSourceName(), pressureSourceName());
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
   DLOGLN("MCP9808 — perfil AGROMETEO, sensor omitido");
-  DLOGLN("BMP280 v2 — inicializado en bloque AGROMETEO");
-  DLOGLN("Barometro MicroPressure — perfil AGROMETEO, sensor omitido");
+  DLOGLN("BMP280 y MicroPressure — inicializados en bloque AGROMETEO");
 #else
   DLOGLN("MCP9808 — perfil IRRIGATION, sensor omitido");
   DLOGLN("BMP280 — perfil IRRIGATION, sensor omitido");
@@ -2062,8 +2039,18 @@ void setup() {
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
   // Nota: Qwiic Power Switch ya inicializado antes del escáner I2C (ver arriba)
 
-  // ── AGROMETEO: BMP280 + HDC1080 + BH1750 ─────────────────────────────────
-  // BMP280 — presión atmosférica y temperatura secundaria
+  // ── AGROMETEO: MicroPressure + BMP280 + HDC1080 + BH1750 ────────────────
+  // MicroPressure — barómetro principal (0x18); BMP280 como fallback de presión
+  micropressure_ok = barometer.begin();
+  if (micropressure_ok) {
+    double p = barometer.readPressure(KPA);
+    if (p > 50.0 && p < 120.0) { pressure = p; bar_ok = true; }
+    DLOGLN("MicroPressure OK");
+  } else {
+    DLOGLN("MicroPressure no detectado — usando BMP280 como barometro");
+  }
+
+  // BMP280 — temperatura secundaria + presión de respaldo si falta MicroPressure
   bmp_ok = beginBMP280();
   if (bmp_ok) {
     bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
@@ -2075,14 +2062,12 @@ void setup() {
     bmp_temp_ok     = readBMP280Temperature(tBmp);
     bmp_pressure_ok = readBMP280PressureKPa(pBmp);
     if (bmp_temp_ok)     bmpTemperature = tBmp;
-    if (bmp_pressure_ok) { bmpPressure = pBmp; pressure = pBmp; }
-    bar_ok = bmp_pressure_ok;
+    if (bmp_pressure_ok) { bmpPressure = pBmp; if (!micropressure_ok) { pressure = pBmp; bar_ok = true; } }
     DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
   } else {
     bmp_temp_ok     = false;
     bmp_pressure_ok = false;
-    bar_ok          = false;
-    pressure        = sim_pressure;
+    if (!micropressure_ok) { bar_ok = false; pressure = sim_pressure; }
     DLOGLN("BMP280 no detectado — modo simulacion");
   }
 
@@ -2117,11 +2102,11 @@ void setup() {
     lightLevel = sim_light;
   }
 
-  // Apagar sensores hasta el primer ciclo de lectura — el loop los encenderá.
-  // Sin esto el LED del Qwiic PS queda encendido todo el setup (WiFi, OTA…)
-  // dando la impresión de que nunca se apaga.
-  qwiic_ps_power(false);
-  DLOGLN("Qwiic Power Switch — sensores apagados tras init (se encenderan en cada lectura)");
+  // Sensores quedan encendidos permanentemente — el Qwiic Power Switch NO se apaga entre ciclos.
+  // Esto es necesario para que BMP280 (filtro IIR x16) y BH1750 (modo continuo) acumulen
+  // mediciones estables. Apagarlos entre lecturas reinicia los filtros internos y exige
+  // esperar 120-180 ms de conversión en cada ciclo.
+  DLOGLN("Qwiic Power Switch — sensores alimentados de forma continua");
 #endif  // PROFILE_AGROMETEO
 
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
@@ -2550,12 +2535,26 @@ void loop() {
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
     // ── AGROMETEO: HDC1080 + BMP280 + BH1750 + parámetros calculados ────────
-    // Encender Qwiic Power Switch, re-inicializar sensores y leer valores.
-    // Al terminar se apagan los sensores para reducir consumo en reposo.
-    qwiic_ps_power(true);
+    // Sensores siempre alimentados (Qwiic Power Switch ON permanente desde setup).
+    // Solo se reinicializa un sensor concreto si falló en el ciclo anterior.
+    // Esto permite al BMP280 (FILTER_X16) acumular mediciones estables y al BH1750
+    // operar en modo continuo sin necesidad de esperar la conversión inicial cada vez.
+    // Recovery — reinicializar sensores que fallaron en el ciclo anterior
     if (qwiic_ps_ok) {
-      delay(50);              // esperar estabilización de la alimentación (mín. 50ms)
-      agro_sensors_reinit();  // restaura config de BMP280 + HDC1080 + BH1750
+      if (!micropressure_ok) micropressure_ok = barometer.begin();
+      if (!bmp_ok) {
+        bmp_ok = beginBMP280();
+        if (bmp_ok) bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                                       Adafruit_BMP280::SAMPLING_X2,
+                                       Adafruit_BMP280::SAMPLING_X16,
+                                       Adafruit_BMP280::FILTER_X16,
+                                       Adafruit_BMP280::STANDBY_MS_500);
+      }
+      if (!hdc_ok)     hdc_ok     = hdc1080_init();
+      if (!bh1750_ok) {
+        bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+        if (bh1750_ok) delay(180);  // esperar primera conversión solo si se reinicia
+      }
     }
 
     // HDC1080 — temperatura y humedad primaria → temperatureMCP + humidity
@@ -2578,14 +2577,29 @@ void loop() {
       humidity = sim_humidity;
     }
 
-    // BMP280 — presión + temperatura secundaria
+    // MicroPressure — barómetro principal; BMP280 como fallback de presión y temperatura
+    bar_ok = false;
+    if (micropressure_ok) {
+      double p = barometer.readPressure(KPA);
+      if (p > 50.0 && p < 120.0) {
+        pressure = p;
+        bar_ok   = true;
+      } else {
+        micropressure_ok = false;
+        DLOGLN("MicroPressure fallo en lectura — probando BMP280");
+      }
+    }
+
+    // BMP280 — temperatura secundaria + presión de respaldo si MicroPressure falla
     bmp_temp_ok     = false;
     bmp_pressure_ok = false;
     if (bmp_ok) {
       float tBmp = NAN, pBmp = NAN;
       if (readBMP280Temperature(tBmp)) { bmpTemperature = tBmp; bmp_temp_ok = true; }
-      if (readBMP280PressureKPa(pBmp)) { bmpPressure = pBmp; bmp_pressure_ok = true;
-                                         pressure = pBmp; bar_ok = true; }
+      if (readBMP280PressureKPa(pBmp)) {
+        bmpPressure = pBmp; bmp_pressure_ok = true;
+        if (!micropressure_ok) { pressure = pBmp; bar_ok = true; }
+      }
       if (!bmp_temp_ok && !bmp_pressure_ok) {
         bmp_ok = false;
         DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
@@ -2624,8 +2638,6 @@ void loop() {
       }
     }
 
-    // Apagar sensores tras la lectura para reducir consumo en reposo
-    qwiic_ps_power(false);
 #endif  // PROFILE_AGROMETEO
 
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
