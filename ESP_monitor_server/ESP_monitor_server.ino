@@ -53,14 +53,8 @@
   #include <WiFiClientSecure.h>
   #include <ArduinoOTA.h>
   #include "driver/rtc_io.h"
-  // AGROMETEO usa el módulo CJMCU-14 que tiene SDA/SCL intercambiados respecto al resto de perfiles
-  #if DEVICE_PROFILE == PROFILE_AGROMETEO
-    #define I2C_SDA        22
-    #define I2C_SCL        21
-  #else
-    #define I2C_SDA        21
-    #define I2C_SCL        22
-  #endif
+  #define I2C_SDA        21
+  #define I2C_SCL        22
   #define DHTPIN           15
   #define ADC_VOLTAGE_REF  3.41f
   #define ADC_RANGE        4096.0f
@@ -440,27 +434,39 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 // =============================================================================
 #define QWIIC_PS_ADDR 0x41
 
-// Configura GPIO 0 del PCA9536 como salida y deja los sensores apagados.
+// Configura GPIO 0 y GPIO 1 del PCA9536 como salida y deja los sensores apagados.
+// Coincide exactamente con SparkFun_Qwiic_Power_Switch::begin() de la librería oficial.
 static bool qwiic_ps_init() {
-  // Registro de configuración 0x03: 0xFE → solo GPIO 0 es salida
+  // Paso 1: probe — verificar que el dispositivo responde en 0x41
   Wire.beginTransmission(QWIIC_PS_ADDR);
-  Wire.write(0x03);
-  Wire.write(0xFE);
   if (Wire.endTransmission() != 0) return false;
-  // Registro de salida 0x01: LOW → sensores apagados por defecto
+  // Paso 2: Registro de salida 0x01: 0x00 → IO0 e IO1 LOW ANTES de hacerlos outputs.
+  // El latch del PCA9536 vale 0xFF en reset; si se configura la dirección primero,
+  // IO0/IO1 salen HIGH un instante (pulso de alimentación no deseado).
   Wire.beginTransmission(QWIIC_PS_ADDR);
   Wire.write(0x01);
   Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  // Paso 3: Registro de configuración 0x03: 0xFC → IO0 e IO1 como salidas (11111100)
+  // Ahora que el latch ya vale 0x00, al activar los outputs salen directamente LOW.
+  Wire.beginTransmission(QWIIC_PS_ADDR);
+  Wire.write(0x03);
+  Wire.write(0xFC);
   return Wire.endTransmission() == 0;
 }
 
 // Enciende o apaga la alimentación del bus de sensores.
+// GPIO0 = MOSFET de carga (HIGH = power ON)
+// GPIO1 = enable del aislador I2C (HIGH = I2C conectado, LOW = I2C aislado)
+// Ambos bits deben moverse juntos, igual que powerOn()/powerOff() de la librería SparkFun.
 static void qwiic_ps_power(bool on) {
   if (!qwiic_ps_ok) return;
   Wire.beginTransmission(QWIIC_PS_ADDR);
-  Wire.write(0x01);           // Output port register
-  Wire.write(on ? 0x01 : 0x00);
-  Wire.endTransmission();
+  Wire.write(0x01);                    // Output port register
+  Wire.write(on ? 0x03 : 0x00);       // ON: GPIO0=1 + GPIO1=1 | OFF: ambos=0
+  if (Wire.endTransmission() != 0) {
+    DLOGLN("Qwiic PS: fallo I2C en qwiic_ps_power()");
+  }
 }
 
 // Re-inicializa los tres sensores tras un ciclo de alimentación.
@@ -476,8 +482,8 @@ static void agro_sensors_reinit() {
                       Adafruit_BMP280::STANDBY_MS_500);
   }
   // HDC1080 — restaurar registro de configuración (15 ms de arranque interno)
-  if (!hdc_ok) hdc_ok = hdc1080_init();
-  else               hdc1080_init();  // reconfigurar siempre tras power-on
+  // Siempre actualizar hdc_ok con el resultado del reinit tras un ciclo de alimentación.
+  hdc_ok = hdc1080_init();
   // BH1750 — restaurar modo continuo de alta resolución
   bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
   if (bh1750_ok) delay(180);  // primera conversión ~120 ms; esperar con margen
@@ -1978,6 +1984,18 @@ void setup() {
   DLOGF("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
 #endif  // DEV_MODE / producción
 
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  // ── AGROMETEO: Qwiic Power Switch — encender ANTES del escáner ───────────
+  qwiic_ps_ok = qwiic_ps_init();
+  if (qwiic_ps_ok) {
+    qwiic_ps_power(true);
+    delay(50);   // esperar estabilización de alimentación antes de init I2C
+    DLOGLN("Qwiic Power Switch OK — sensores encendidos");
+  } else {
+    DLOGLN("Qwiic Power Switch no detectado — sensores siempre alimentados");
+  }
+#endif
+
   // Escaner I2C — detecta todos los dispositivos en el bus
   DLOGLN("Escaneando bus I2C...");
   int found = 0;
@@ -2069,15 +2087,7 @@ void setup() {
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
-  // ── AGROMETEO: Qwiic Power Switch — enciende el bus de sensores ──────────
-  qwiic_ps_ok = qwiic_ps_init();
-  if (qwiic_ps_ok) {
-    qwiic_ps_power(true);
-    delay(50);   // esperar estabilización de la alimentación antes de init I2C
-    DLOGLN("Qwiic Power Switch OK — sensores encendidos");
-  } else {
-    DLOGLN("Qwiic Power Switch no detectado — sensores siempre alimentados");
-  }
+  // Nota: Qwiic Power Switch ya inicializado antes del escáner I2C (ver arriba)
 
   // ── AGROMETEO: BMP280 + HDC1080 + BH1750 ─────────────────────────────────
   // BMP280 — presión atmosférica y temperatura secundaria
@@ -2133,6 +2143,12 @@ void setup() {
     DLOGLN("BH1750 no detectado — modo simulacion");
     lightLevel = sim_light;
   }
+
+  // Apagar sensores hasta el primer ciclo de lectura — el loop los encenderá.
+  // Sin esto el LED del Qwiic PS queda encendido todo el setup (WiFi, OTA…)
+  // dando la impresión de que nunca se apaga.
+  qwiic_ps_power(false);
+  DLOGLN("Qwiic Power Switch — sensores apagados tras init (se encenderan en cada lectura)");
 #endif  // PROFILE_AGROMETEO
 
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
