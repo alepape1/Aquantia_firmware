@@ -91,10 +91,11 @@
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
-  // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280)
+  // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include <BH1750.h>
+  #include <SparkFun_Qwiic_Power_Switch_Arduino_Library.h>
 #else
   // IRRIGATION: solo I2C básico (sin sensores meteo)
   #include <Wire.h>
@@ -293,6 +294,7 @@ void ledTick() {
 #elif DEVICE_PROFILE == PROFILE_AGROMETEO
   Adafruit_BMP280        bmp280;
   BH1750                 bh1750;
+  QWIIC_POWER            qwiic_ps;
 #endif
 
 #ifdef HAS_DISPLAY
@@ -429,44 +431,15 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 }
 
 // =============================================================================
-// Qwiic Power Switch — PCA9536 GPIO expander, I2C 0x41 (solo PROFILE_AGROMETEO)
-// GPIO 0 controla el MOSFET de carga: HIGH = sensores encendidos
+// Qwiic Power Switch — SparkFun library wrapper (solo PROFILE_AGROMETEO)
+// El objeto qwiic_ps (QWIIC_POWER) gestiona internamente el PCA9536 en 0x41.
+// powerOn()  → GPIO0=HIGH (MOSFET ON) + GPIO1=HIGH (I2C aislador habilitado)
+// powerOff() → GPIO0=LOW  (MOSFET OFF) + GPIO1=LOW  (I2C aislado)
 // =============================================================================
-#define QWIIC_PS_ADDR 0x41
-
-// Configura GPIO 0 y GPIO 1 del PCA9536 como salida y deja los sensores apagados.
-// Coincide exactamente con SparkFun_Qwiic_Power_Switch::begin() de la librería oficial.
-static bool qwiic_ps_init() {
-  // Paso 1: probe — verificar que el dispositivo responde en 0x41
-  Wire.beginTransmission(QWIIC_PS_ADDR);
-  if (Wire.endTransmission() != 0) return false;
-  // Paso 2: Registro de salida 0x01: 0x00 → IO0 e IO1 LOW ANTES de hacerlos outputs.
-  // El latch del PCA9536 vale 0xFF en reset; si se configura la dirección primero,
-  // IO0/IO1 salen HIGH un instante (pulso de alimentación no deseado).
-  Wire.beginTransmission(QWIIC_PS_ADDR);
-  Wire.write(0x01);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) return false;
-  // Paso 3: Registro de configuración 0x03: 0xFC → IO0 e IO1 como salidas (11111100)
-  // Ahora que el latch ya vale 0x00, al activar los outputs salen directamente LOW.
-  Wire.beginTransmission(QWIIC_PS_ADDR);
-  Wire.write(0x03);
-  Wire.write(0xFC);
-  return Wire.endTransmission() == 0;
-}
-
-// Enciende o apaga la alimentación del bus de sensores.
-// GPIO0 = MOSFET de carga (HIGH = power ON)
-// GPIO1 = enable del aislador I2C (HIGH = I2C conectado, LOW = I2C aislado)
-// Ambos bits deben moverse juntos, igual que powerOn()/powerOff() de la librería SparkFun.
 static void qwiic_ps_power(bool on) {
   if (!qwiic_ps_ok) return;
-  Wire.beginTransmission(QWIIC_PS_ADDR);
-  Wire.write(0x01);                    // Output port register
-  Wire.write(on ? 0x03 : 0x00);       // ON: GPIO0=1 + GPIO1=1 | OFF: ambos=0
-  if (Wire.endTransmission() != 0) {
-    DLOGLN("Qwiic PS: fallo I2C en qwiic_ps_power()");
-  }
+  if (on) qwiic_ps.powerOn();
+  else    qwiic_ps.powerOff();
 }
 
 // Re-inicializa los tres sensores tras un ciclo de alimentación.
@@ -1986,9 +1959,9 @@ void setup() {
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
   // ── AGROMETEO: Qwiic Power Switch — encender ANTES del escáner ───────────
-  qwiic_ps_ok = qwiic_ps_init();
+  qwiic_ps_ok = qwiic_ps.begin(Wire);   // begin() devuelve false si no detecta el PCA9536 en 0x41
   if (qwiic_ps_ok) {
-    qwiic_ps_power(true);
+    qwiic_ps.powerOn();
     delay(50);   // esperar estabilización de alimentación antes de init I2C
     DLOGLN("Qwiic Power Switch OK — sensores encendidos");
   } else {
