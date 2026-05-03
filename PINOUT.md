@@ -18,6 +18,7 @@ Dos perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo d
 | Anemómetro (ADC) | 37 | 0–3.3 V → 0–30 m/s, ADC1_CH1 |
 | Veleta dirección (ADC) | 36 | 0–3.3 V → 0–360°, ADC1_CH0 (input-only) |
 | Humedad suelo YL-69 (ADC) | 33 | ADC1_CH5, divisor de tensión |
+| Caudalímetro (pulsos ISR) | 32 | INPUT_PULLUP, ISR FALLING (BC547 NPN, señal invertida) |
 | Relay 1 (electroválvula) | 26 | Activo-LOW, JQC-3FF-S-Z |
 | Botón izquierdo (BOOT) | 0 | INPUT_PULLUP, activo LOW |
 | Botón derecho | 35 | INPUT, activo LOW |
@@ -60,6 +61,7 @@ LilyGo TTGO T-Display
 │  GPIO37 ───────────┼──► Anemómetro salida analógica 0–3.3V
 │  GPIO36 ───────────┼──► Veleta salida analógica 0–3.3V
 │  GPIO33 ───────────┼──► YL-69 AO (tras divisor de tensión)
+│  GPIO32 ───────────┼──► Caudalímetro (colector BC547 NPN)
 │  GPIO26 ───────────┼──► IN del relay (JQC-3FF-S-Z)
 │  GPIO0  ───────────┼──► Botón BOOT (ya integrado en placa)
 │  GPIO35 ───────────┼──► Botón derecho externo
@@ -172,10 +174,17 @@ $$\text{L/min} = \frac{\text{pulsos} \times 60}{t_{seg} \times K_{factor}}$$
 ### Modo de operación
 
 El caudal real solo se usa cuando el firmware está en `pipelineMode = "real"` (activable por MQTT o HTTP desde el backend). En ese modo:
-- **Caudal**: medido por ISR (GPIO 32)
-- **Presión**: estimada por el simulador (sin sensor de presión de tubería instalado aún)
+- **Caudal**: medido por ISR (GPIO 32) → `pipeline_flow_ok = true`
+- **Presión**: estimada por el simulador (sin sensor de presión de tubería instalado aún) → `pipeline_pressure_ok = false`
+- **Fuente**: `pipeline_source = "real"`
 
-El campo `pipelineFlowOk = true` y `pipelinePressureOk = false` reflejan este estado en la telemetría.
+Cuando el modo es `"sim"` (defecto de fábrica):
+- `pipeline_source = "sim"`, `pipeline_flow_ok = false`, `pipeline_pressure_ok = false`
+
+Cuando el modo es `"real"` pero el caudalímetro no responde:
+- `pipeline_source = "fallback"`, `pipeline_flow_ok = false`, `pipeline_pressure_ok = false`
+
+Estos tres campos se almacenan en la base de datos del backend (`pipeline_source`, `pipeline_pressure_ok`, `pipeline_flow_ok`) y están disponibles en `/api/historico` y endpoint de pipeline.
 
 > Perfil afectado: **solo PROFILE_METEO** (LilyGo TTGO T-Display). `FLOW_PIN` y `FLOW_K_FACTOR` están dentro del guard `#if DEVICE_PROFILE == PROFILE_METEO`.
 
