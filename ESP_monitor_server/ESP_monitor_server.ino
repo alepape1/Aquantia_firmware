@@ -64,6 +64,8 @@
     #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
     #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
     #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
+    #define FLOW_PIN         32   // Caudalímetro — pulsos digitales vía BC547 NPN (señal invertida, activo LOW)
+    #define FLOW_K_FACTOR   450   // Pulsos por litro (YF-S201: 450; ajustar según sensor real)
   #endif
   #if DEVICE_PROFILE == PROFILE_METEO
     #define HAS_DISPLAY
@@ -497,6 +499,19 @@ float sim_windSpeed = 3.5f;
 float sim_windDir        = 180.0f;
 float sim_soilMoisture   = 50.0f;
 
+// ── Caudalímetro — conteo de pulsos por ISR ─────────────────────────────────
+// BC547 NPN invierte la señal: pulso del sensor → GPIO LOW → FALLING edge.
+// ISR en IRAM_ATTR para ejecución desde RAM (no se suspende durante cache miss).
+#if defined(FLOW_PIN)
+static volatile uint32_t _flowPulseCount = 0;     // contador crudo (escrito solo por ISR)
+static unsigned long     _flowLastCalcMs = 0;     // marca de tiempo última lectura
+static float             _flowLpm        = 0.0f;  // último caudal calculado (L/min)
+
+void IRAM_ATTR flowPulseISR() {
+  _flowPulseCount++;
+}
+#endif
+
 // ── Pipeline simulado / hardware-ready ───────────────────────────────────────
 String pipelineScenario      = "normal";    // normal | leak | burst | obstruction
 String pipelineMode          = "sim";       // sim | real
@@ -589,12 +604,40 @@ void updatePipelineSimValues() {
 }
 
 static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
-  // Preparado para el futuro caudalímetro y sensor de presión.
-  // Mientras no haya hardware montado devolvemos false y el firmware
-  // usa el simulador como fallback automático.
+#if defined(FLOW_PIN)
+  // Caudalímetro por pulsos (BC547 NPN, señal invertida, FALLING edge).
+  // Devuelve true en cuanto hay datos válidos del caudalímetro.
+  // pressureBar = -1.0f indica "sin sensor de presión real" → el caller
+  // mantiene la estimación simulada para la presión.
+  unsigned long now = millis();
+  unsigned long dt  = now - _flowLastCalcMs;
+
+  if (dt < 500UL) {
+    // Intervalo demasiado corto — reutilizamos el último valor calculado
+    flowLpm     = _flowLpm;
+    pressureBar = -1.0f;
+    return true;
+  }
+
+  noInterrupts();
+  uint32_t pulses  = _flowPulseCount;
+  _flowPulseCount  = 0;
+  interrupts();
+
+  _flowLastCalcMs = now;
+
+  // L/min = (pulsos / dt_s) * (60.0 / K_FACTOR)
+  // Equivalente: pulsos * 60.0 / (dt_s * K_FACTOR)
+  float dt_s  = dt / 1000.0f;
+  _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
+  flowLpm     = _flowLpm;
+  pressureBar = -1.0f;  // sin sensor de presión de tubería — se usará simulador
+  return true;
+#else
   (void)pressureBar;
   (void)flowLpm;
   return false;
+#endif
 }
 
 void updatePipelineValues() {
@@ -606,11 +649,19 @@ void updatePipelineValues() {
     float realPressure = 0.0f;
     float realFlow = 0.0f;
     if (readRealPipelineSensors(realPressure, realFlow)) {
-      sim_pipeline_pressure = max(0.0f, realPressure);
-      sim_pipeline_flow     = max(0.0f, realFlow);
-      pipelineSource        = "real";
-      pipelinePressureOk    = true;
-      pipelineFlowOk        = true;
+      sim_pipeline_flow = max(0.0f, realFlow);
+      pipelineFlowOk    = true;
+      pipelineSource    = "real";
+
+      if (realPressure >= 0.0f) {
+        // Sensor de presión real disponible
+        sim_pipeline_pressure = max(0.0f, realPressure);
+        pipelinePressureOk    = true;
+      } else {
+        // Sin sensor de presión real — estimación por simulador (caudal sigue siendo real)
+        updatePipelineSimValues();
+        pipelinePressureOk = false;
+      }
       return;
     }
 
@@ -1726,6 +1777,9 @@ void networkTask(void* pvParameters) {
       doc["bmp280_ok"]             = bmp_ok && (bmp_temp_ok || bmp_pressure_ok);
       if (!isnan(snap.bmpTemp))     doc["bmp280_temperature"] = r2(snap.bmpTemp);
       if (!isnan(snap.bmpPressure)) doc["bmp280_pressure"] = r2(snap.bmpPressure);
+      // Nuevo: incluir ambas presiones explícitamente
+      doc["pressure_micro"] = r2(snap.pressure);        // MicroPressure (SparkFun)
+      doc["pressure_bmp280"] = r2(snap.bmpPressure);    // BMP280
       doc["windSpeed"]             = r2(snap.windSpeed);
       doc["windDirection"]         = r1(snap.windDir);
       doc["windSpeedFiltered"]     = r2(snap.windSpeedFilt);
@@ -1978,6 +2032,15 @@ void setup() {
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
   DLOGF("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
   #endif
+#endif
+
+#if defined(FLOW_PIN)
+  // Caudalímetro: pull-up interno activo (BC547 NPN invierte señal → FALLING = pulso)
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  _flowLastCalcMs = millis();
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowPulseISR, FALLING);
+  DLOGF("Caudalimetro GPIO%d configurado (ISR FALLING, K=%d pulsos/L)\n",
+        FLOW_PIN, FLOW_K_FACTOR);
 #endif
   // Nota: TFT ya inicializado al principio de setup() para soportar pantalla AP
 

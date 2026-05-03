@@ -129,6 +129,58 @@ Cada relay:
 
 ---
 
+## Caudalímetro de tubería (PROFILE_METEO — LilyGo TTGO T-Display)
+
+El firmware implementa la lectura de caudal mediante **interrupciones hardware** para no perder ningún pulso.
+
+### GPIO y circuito
+
+| Función | GPIO | Notas |
+|---------|:----:|-------|
+| Caudalímetro (pulsos) | **32** | INPUT_PULLUP, ISR FALLING edge |
+
+### Transistor de acondicionamiento BC547 NPN
+
+El sensor de caudal genera pulsos a tensión mayor de 3.3 V. El BC547 la recorta e invierte para que el ESP32 la pueda leer de forma segura:
+
+```
+Sensor (pulso HIGH)
+      │
+     [R_base ~10kΩ]
+      │
+   Base BC547
+   Colector ──────────┬── 3.3V (pull-up interno ESP32)
+                      └── GPIO 32
+   Emisor ────────────── GND
+```
+
+- Sensor pulsa HIGH → BC547 conduce → GPIO 32 baja a LOW → **FALLING edge = 1 pulso**
+- Sensor en reposo LOW → BC547 corta → GPIO 32 sube a HIGH (pull-up)
+
+La señal llega **invertida**: el firmware cuenta flancos `FALLING`.
+
+### Parámetros de calibración (en `ESP_monitor_server.ino`)
+
+| Constante | Valor por defecto | Descripción |
+|-----------|:-----------------:|-------------|
+| `FLOW_K_FACTOR` | `450` | Pulsos por litro — YF-S201; **ajustar según sensor real** con agua calibrada |
+
+Fórmula de cálculo:
+
+$$\text{L/min} = \frac{\text{pulsos} \times 60}{t_{seg} \times K_{factor}}$$
+
+### Modo de operación
+
+El caudal real solo se usa cuando el firmware está en `pipelineMode = "real"` (activable por MQTT o HTTP desde el backend). En ese modo:
+- **Caudal**: medido por ISR (GPIO 32)
+- **Presión**: estimada por el simulador (sin sensor de presión de tubería instalado aún)
+
+El campo `pipelineFlowOk = true` y `pipelinePressureOk = false` reflejan este estado en la telemetría.
+
+> Perfil afectado: **solo PROFILE_METEO** (LilyGo TTGO T-Display). `FLOW_PIN` y `FLOW_K_FACTOR` están dentro del guard `#if DEVICE_PROFILE == PROFILE_METEO`.
+
+---
+
 ## Comportamiento del relay (ambos perfiles)
 
 Los relays **JQC-3FF-S-Z** son **activo-LOW**:
