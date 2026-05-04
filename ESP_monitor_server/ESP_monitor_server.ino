@@ -508,6 +508,9 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   temperatureC = NAN;
   if (_xdb401_addr == 0) return false;
 
+  // Forzar 100 kHz antes de cada transacción — otros sensores pueden haberlo subido a 400 kHz
+  Wire.setClock(100000);
+
   // 1. Trigger conversión presión + temperatura
   Wire.beginTransmission(_xdb401_addr);
   Wire.write(0x30);
@@ -515,6 +518,22 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
     DLOGF("[XDB401] Trigger FAIL endTransmission=%d\n", err);
+    // Error 4 = bus ocupado / SDA retenida por el sensor — intentar recuperación de bus
+    if (err == 4) {
+      Wire.end();
+      delay(10);
+      Wire.begin(I2C_SDA, I2C_SCL);
+      Wire.setClock(100000);
+      // Re-sondear dirección para confirmar que el sensor sigue respondiendo
+      Wire.beginTransmission(_xdb401_addr);
+      if (Wire.endTransmission() != 0) {
+        DLOGLN("[XDB401] Bus no recuperado — marcando sensor como perdido");
+        _xdb401_addr = 0;
+        xdb401_ok = false;
+      } else {
+        DLOGLN("[XDB401] Bus recuperado");
+      }
+    }
     return false;
   }
 
@@ -530,6 +549,12 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   uint8_t d[5];
   for (int i = 0; i < 5; i++) d[i] = Wire.read();
   DLOGF("[XDB401] Raw bytes: %02X %02X %02X %02X %02X\n", d[0],d[1],d[2],d[3],d[4]);
+
+  // Rechazar trama de todos ceros — sensor no inicializado o en fallo silencioso
+  if (d[0]==0 && d[1]==0 && d[2]==0 && d[3]==0 && d[4]==0) {
+    DLOGLN("[XDB401] Trama todo ceros — lectura descartada");
+    return false;
+  }
 
   // 4. Presión — 24 bits con signo en bit 23
   int32_t raw_p = (int32_t)d[0] * 65536L + (int32_t)d[1] * 256L + d[2];
