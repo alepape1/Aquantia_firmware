@@ -482,10 +482,6 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 // Frecuencia I2C: 100 kHz (400 kHz puede fallar en algunos ejemplares).
 // =============================================================================
 
-// Struct definido fuera de #ifndef ESP8266 para que el preprocesador de Arduino
-// lo tenga disponible antes de generar los forward declarations de functions.
-struct Xdb401Reading { float pressureBar; float temperatureC; bool valid; };
-
 #ifndef ESP8266
 static uint8_t _xdb401_addr = 0;   // dirección detectada al inicio
 
@@ -505,55 +501,54 @@ static bool xdb401_begin() {
   return false;
 }
 
-// Lee presión y temperatura. Devuelve valid=false si falla la comunicación.
-static Xdb401Reading xdb401_read() {
-  Xdb401Reading r = {NAN, NAN, false};
-  if (_xdb401_addr == 0) return r;
+// Lee presión y temperatura vía parámetros de salida.
+// Devuelve true si la lectura es válida; pressureBar y temperatureC = NAN si falla.
+static bool xdb401_read(float& pressureBar, float& temperatureC) {
+  pressureBar  = NAN;
+  temperatureC = NAN;
+  if (_xdb401_addr == 0) return false;
 
   // 1. Trigger conversión presión + temperatura
   Wire.beginTransmission(_xdb401_addr);
   Wire.write(0x30);
   Wire.write(0x0A);
-  if (Wire.endTransmission() != 0) return r;
+  if (Wire.endTransmission() != 0) return false;
 
   // 2. Esperar conversión
   delay(50);
 
   // 3. Leer 5 bytes (3 presión + 2 temperatura)
-  if (Wire.requestFrom((uint8_t)_xdb401_addr, (uint8_t)5, (uint8_t)1) < 5) return r;
+  if (Wire.requestFrom((uint8_t)_xdb401_addr, (uint8_t)5, (uint8_t)1) < 5) return false;
   uint8_t d[5];
   for (int i = 0; i < 5; i++) d[i] = Wire.read();
 
   // 4. Presión — 24 bits con signo en bit 23
   int32_t raw_p = (int32_t)d[0] * 65536L + (int32_t)d[1] * 256L + d[2];
   float p_kpa;
-  if (raw_p > 8388608L) {      // > 2^23 → negativo
+  if (raw_p > 8388608L) {
     p_kpa = (float)(raw_p - 16777216L) * (XDB401_FULLSCALE_KPA / 8388608.0f);
   } else {
-    p_kpa = (float)raw_p         * (XDB401_FULLSCALE_KPA / 8388608.0f);
+    p_kpa = (float)raw_p               * (XDB401_FULLSCALE_KPA / 8388608.0f);
   }
-  r.pressureBar = p_kpa / 100.0f;
+  float pb = p_kpa / 100.0f;
 
   // 5. Temperatura — 16 bits con signo en bit 15
   int32_t raw_t = (int32_t)d[3] * 256L + d[4];
-  if (raw_t > 32768L) {
-    r.temperatureC = (float)(raw_t - 65536L) / 256.0f;
-  } else {
-    r.temperatureC = (float)raw_t / 256.0f;
-  }
+  float tc = (raw_t > 32768L) ? (float)(raw_t - 65536L) / 256.0f
+                               : (float)raw_t / 256.0f;
 
   // Validar rangos razonables
   float fs_bar = XDB401_FULLSCALE_KPA / 100.0f;
-  r.valid = (r.pressureBar >= -0.1f && r.pressureBar <= fs_bar * 1.05f
-             && r.temperatureC > -40.0f && r.temperatureC < 125.0f);
-  if (!r.valid) { r.pressureBar = NAN; r.temperatureC = NAN; }
-  return r;
+  bool ok = (pb >= -0.1f && pb <= fs_bar * 1.05f
+             && tc > -40.0f && tc < 125.0f);
+  if (ok) { pressureBar = pb; temperatureC = tc; }
+  return ok;
 }
 
 // Wrapper conveniente: solo presión en bar (NAN si falla).
 static float xdb401_readPressureBar() {
-  Xdb401Reading r = xdb401_read();
-  return r.valid ? r.pressureBar : NAN;
+  float pb, tc;
+  return xdb401_read(pb, tc) ? pb : NAN;
 }
 #endif  // !ESP8266
 
@@ -765,18 +760,22 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   // Intentar leer presión real del XDB401; -1.0f si no disponible (el caller usará sim)
   pressureBar = -1.0f;
   if (xdb401_ok) {
-    float p = xdb401_readPressureBar();
-    if (!isnan(p)) pressureBar = p;
+    float p, tc;
+    if (xdb401_read(p, tc)) {
+      pressureBar      = p;
+      xdb401Temperature = tc;
+    }
   }
   return true;
 #else
   // Sin caudalímetro: si hay XDB401 devolvemos presión real con caudal 0
   #ifndef ESP8266
   if (xdb401_ok) {
-    float p = xdb401_readPressureBar();
-    if (!isnan(p)) {
-      pressureBar = p;
-      flowLpm     = 0.0f;
+    float p, tc;
+    if (xdb401_read(p, tc)) {
+      pressureBar       = p;
+      xdb401Temperature = tc;
+      flowLpm           = 0.0f;
       return true;
     }
   }
