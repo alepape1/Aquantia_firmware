@@ -483,18 +483,58 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 // =============================================================================
 
 #ifndef ESP8266
-static uint8_t _xdb401_addr = 0;   // dirección detectada al inicio
+static uint8_t _xdb401_addr        = 0;      // dirección detectada al inicio
+static bool    _xdb401_continuous  = false;  // true = modo continuo (sin trigger)
 
-// Detecta el sensor en 0x6D o 0x7F. Devuelve true si responde.
+// Lee 5 bytes crudos del sensor. Devuelve el número de bytes recibidos.
+static uint8_t _xdb401_rawread(uint8_t* d, uint8_t n) {
+  uint8_t recv = Wire.requestFrom((uint8_t)_xdb401_addr, n, (uint8_t)1);
+  for (uint8_t i = 0; i < recv && i < n; i++) d[i] = Wire.read();
+  // Vaciar buffer si el sensor envió más bytes de los pedidos
+  while (Wire.available()) Wire.read();
+  return recv;
+}
+
+// Detecta el sensor y el modo de operación (continuo o triggered).
+// Algunos lotes XGZP6847D miden en continuo; otros necesitan trigger 0x30=0x0A.
 static bool xdb401_begin() {
   const uint8_t candidates[] = { XDB401_ADDR_PRIMARY, XDB401_ADDR_ALT };
   for (uint8_t addr : candidates) {
     Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      _xdb401_addr = addr;
-      DLOGF("[XDB401] Detectado en 0x%02X\n", addr);
-      return true;
+    if (Wire.endTransmission() != 0) continue;
+    _xdb401_addr = addr;
+
+    // — Probar modo CONTINUO: leer sin trigger —
+    uint8_t d[5] = {};
+    delay(10);
+    if (_xdb401_rawread(d, 5) == 5) {
+      bool nonzero = d[0]||d[1]||d[2]||d[3]||d[4];
+      if (nonzero) {
+        _xdb401_continuous = true;
+        DLOGF("[XDB401] Detectado en 0x%02X (modo CONTINUO)\n", addr);
+        return true;
+      }
     }
+
+    // — Probar modo TRIGGERED: write 0x30=0x0A, esperar 100 ms —
+    Wire.beginTransmission(addr);
+    Wire.write(0x30);
+    Wire.write(0x0A);
+    if (Wire.endTransmission() == 0) {
+      delay(100);
+      memset(d, 0, 5);
+      if (_xdb401_rawread(d, 5) == 5) {
+        bool nonzero = d[0]||d[1]||d[2]||d[3]||d[4];
+        if (nonzero) {
+          _xdb401_continuous = false;
+          DLOGF("[XDB401] Detectado en 0x%02X (modo TRIGGERED)\n", addr);
+          return true;
+        }
+      }
+    }
+
+    DLOGF("[XDB401] 0x%02X ACK pero sin datos — ignorado\n", addr);
+    _xdb401_addr = 0;
   }
   _xdb401_addr = 0;
   return false;
@@ -507,72 +547,71 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   temperatureC = NAN;
   if (_xdb401_addr == 0) return false;
 
-  // 1. Trigger conversión presión + temperatura
-  Wire.beginTransmission(_xdb401_addr);
-  Wire.write(0x30);
-  Wire.write(0x0A);
-  uint8_t err = Wire.endTransmission();
-  if (err != 0) {
-    DLOGF("[XDB401] Trigger FAIL endTransmission=%d\n", err);
-    // Error 4 = bus ocupado / SDA retenida por el sensor — intentar recuperación de bus
-    if (err == 4) {
-      Wire.end();
-      delay(10);
-      Wire.begin(I2C_SDA, I2C_SCL);
-      Wire.setClock(100000);  // restaurar 100 kHz tras reinit
-      // Re-sondear dirección para confirmar que el sensor sigue respondiendo
-      Wire.beginTransmission(_xdb401_addr);
-      if (Wire.endTransmission() != 0) {
-        DLOGLN("[XDB401] Bus no recuperado — marcando sensor como perdido");
-        _xdb401_addr = 0;
-        xdb401_ok = false;
-      } else {
-        DLOGLN("[XDB401] Bus recuperado");
-      }
+  uint8_t d[5] = {};
+
+  if (_xdb401_continuous) {
+    // Modo continuo: leer directamente sin trigger
+    if (_xdb401_rawread(d, 5) < 5) {
+      DLOGLN("[XDB401] Read FAIL (continuo)");
+      return false;
     }
-    return false;
+  } else {
+    // Modo triggered: write 0x30=0x0A → esperar 100 ms → leer
+    Wire.beginTransmission(_xdb401_addr);
+    Wire.write(0x30);
+    Wire.write(0x0A);
+    uint8_t err = Wire.endTransmission();
+    if (err != 0) {
+      DLOGF("[XDB401] Trigger FAIL endTransmission=%d\n", err);
+      if (err == 4) {
+        // Bus bloqueado — intentar recuperación
+        Wire.end();
+        delay(10);
+        Wire.begin(I2C_SDA, I2C_SCL);
+        Wire.setClock(100000);  // restaurar 100 kHz tras reinit
+        Wire.beginTransmission(_xdb401_addr);
+        if (Wire.endTransmission() != 0) {
+          DLOGLN("[XDB401] Bus no recuperado — marcando sensor como perdido");
+          _xdb401_addr = 0;
+          xdb401_ok = false;
+        } else {
+          DLOGLN("[XDB401] Bus recuperado");
+        }
+      }
+      return false;
+    }
+    delay(100);  // ESPEasy P177: ~100ms para conversión completa (50ms era insuficiente)
+    if (_xdb401_rawread(d, 5) < 5) {
+      DLOGLN("[XDB401] Read FAIL (triggered — bytes insuficientes)");
+      return false;
+    }
   }
 
-  // 2. Esperar conversión
-  delay(50);
-
-  // 3. Leer 5 bytes (3 presión + 2 temperatura)
-  uint8_t recv = Wire.requestFrom((uint8_t)_xdb401_addr, (uint8_t)5, (uint8_t)1);
-  if (recv < 5) {
-    DLOGF("[XDB401] Read FAIL — solo %d bytes (esperados 5)\n", recv);
-    return false;
-  }
-  uint8_t d[5];
-  for (int i = 0; i < 5; i++) d[i] = Wire.read();
   DLOGF("[XDB401] Raw bytes: %02X %02X %02X %02X %02X\n", d[0],d[1],d[2],d[3],d[4]);
 
-  // Rechazar trama de todos ceros — sensor no inicializado o en fallo silencioso
+  // Rechazar trama de todos ceros — sensor no inicializado o sin datos
   if (d[0]==0 && d[1]==0 && d[2]==0 && d[3]==0 && d[4]==0) {
     DLOGLN("[XDB401] Trama todo ceros — lectura descartada");
     return false;
   }
 
-  // 4. Presión — 24 bits con signo en bit 23
+  // Presión — 24 bits con signo en bit 23
   int32_t raw_p = (int32_t)d[0] * 65536L + (int32_t)d[1] * 256L + d[2];
-  float p_kpa;
-  if (raw_p > 8388608L) {
-    p_kpa = (float)(raw_p - 16777216L) * (XDB401_FULLSCALE_KPA / 8388608.0f);
-  } else {
-    p_kpa = (float)raw_p               * (XDB401_FULLSCALE_KPA / 8388608.0f);
-  }
-  float pb = p_kpa / 100.0f;
+  if (raw_p > 8388608L) raw_p -= 16777216L;
+  float pb = (float)raw_p * (XDB401_FULLSCALE_KPA / 8388608.0f) / 100.0f;
 
-  // 5. Temperatura — 16 bits con signo en bit 15
-  int32_t raw_t = (int32_t)d[3] * 256L + d[4];
-  float tc = (raw_t > 32768L) ? (float)(raw_t - 65536L) / 256.0f
-                               : (float)raw_t / 256.0f;
+  // Temperatura — 16 bits unsigned con offset fijo de +10°C (verificado con ESPEasy P177)
+  // Fórmula datasheet estándar da T = raw/256; este lote de sensores requiere raw/256 + 10
+  uint16_t raw_t = (uint16_t)d[3] * 256U + d[4];
+  float tc = (float)raw_t / 256.0f + 10.0f;
 
-  DLOGF("[XDB401] raw_p=%ld (%.3f bar)  raw_t=%ld (%.1f C)\n", raw_p, pb, raw_t, tc);
+  DLOGF("[XDB401] raw_p=%ld (%.3f bar)  raw_t=%u (%.1f C)  modo=%s\n",
+        raw_p, pb, raw_t, _xdb401_continuous ? "continuo" : "triggered");
 
   // Validar rangos razonables
   float fs_bar = XDB401_FULLSCALE_KPA / 100.0f;
-  bool ok = (pb >= -0.1f && pb <= fs_bar * 1.05f
-             && tc > -40.0f && tc < 125.0f);
+  bool ok = (pb >= -0.5f && pb <= fs_bar * 1.05f
+             && tc > -10.0f && tc < 125.0f);
   if (!ok) {
     DLOGF("[XDB401] Validacion FAIL — pb=%.3f bar (max=%.1f) tc=%.1f C\n", pb, fs_bar, tc);
   }
