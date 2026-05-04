@@ -53,6 +53,7 @@
   #include <WiFiClientSecure.h>
   #include <ArduinoOTA.h>
   #include "driver/rtc_io.h"
+  #include "esp_task_wdt.h"
   #define I2C_SDA        21
   #define I2C_SCL        22
   #define DHTPIN           15
@@ -348,6 +349,12 @@ static uint8_t bmp280_addr = 0x00;
 #endif
 bool tsl_ok   = false;
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
+#ifndef ESP8266
+static uint8_t       xdb401_failures  = 0;       // fallos consecutivos de lectura
+static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar reinit
+static constexpr uint8_t  XDB401_MAX_FAILURES  = 5;
+static constexpr uint32_t XDB401_RETRY_INTERVAL = 30000UL;  // ms entre reintentos
+#endif
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
 static bool beginBMP280() {
@@ -727,24 +734,48 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   flowLpm     = _flowLpm;
   // Intentar leer presión real del XDB401; -1.0f si no disponible (el caller usará sim)
   pressureBar = -1.0f;
+  #ifndef ESP8266
+  if (!xdb401_ok && millis() >= xdb401_retry_at) {
+    xdb401_ok = xdb401_begin();
+    if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
+    else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+  }
   if (xdb401_ok) {
     float p, tc;
     if (xdb401_read(p, tc)) {
-      pressureBar      = p;
+      pressureBar       = p;
       xdb401Temperature = tc;
+      xdb401_failures   = 0;
+    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
+      xdb401_ok        = false;
+      xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
+      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
+            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
     }
   }
+  #endif
   return true;
 #else
   // Sin caudalímetro: si hay XDB401 devolvemos presión real con caudal 0
   #ifndef ESP8266
+  if (!xdb401_ok && millis() >= xdb401_retry_at) {
+    xdb401_ok = xdb401_begin();
+    if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
+    else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+  }
   if (xdb401_ok) {
     float p, tc;
     if (xdb401_read(p, tc)) {
       pressureBar       = p;
       xdb401Temperature = tc;
       flowLpm           = 0.0f;
+      xdb401_failures   = 0;
       return true;
+    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
+      xdb401_ok        = false;
+      xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
+      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
+            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
     }
   }
   #endif
@@ -755,10 +786,8 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
 }
 
 void updatePipelineValues() {
-  // NOTA: esta función se llama desde loop() con dataMutex ya tomado.
-  // Las escrituras de pipelineMode/pipelineScenario desde Core 0 están
-  // protegidas por dataMutex en syncPipelineScenario() y mqttCallback(),
-  // así que la lectura aquí (bajo el mutex del caller) es segura.
+  // pipelineMode/pipelineScenario son escritos por Core 0 (MQTT callback) con dataMutex.
+  // La lectura aquí (Core 1) es eventual-consistent: como máximo un ciclo de 20s desfasado.
   if (pipelineMode == "real") {
     float realPressure = 0.0f;
     float realFlow = 0.0f;
@@ -1032,6 +1061,7 @@ const char* degToCompass(float d) {
 volatile bool        isUpdatingOTA = false;
 portMUX_TYPE         windMux       = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t    dataMutex     = nullptr;
+QueueHandle_t        telemetryQueue = nullptr;  // Core 1 escribe, Core 0 lee — sin mutex
 TaskHandle_t         networkTaskHandle = nullptr;
 
 // ── Snapshot de telemetría — struct global para evitar auto-prototype de Arduino ──
@@ -1834,73 +1864,15 @@ void mqttPublishRegister() {
 // =============================================================================
 #ifndef ESP8266
 void takeSnapshot() {
-  TelemetrySnapshot &s = _netSnap;
-  // Defaults sin mutex (último valor conocido)
-  s.tempMCP       = temperatureMCP;
-  s.pressure      = (float)pressure;
-  s.tempDHT       = temperatureDHT;
-  s.humidity      = humidity;
-  s.windSpeed     = windSpeed;
-  s.windDir       = currentWindDirDeg;
-  s.windSpeedFilt = windSpeedFiltered;
-  s.avgWindDir    = currentWindDirDeg;
-  s.light         = lightLevel;
-  s.tempDHT11     = temperatureDHT11;
-  s.humDHT11      = humidityDHT11;
-  s.soil          = soilMoisture;
-  s.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
-  s.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
-  s.pipePressure  = sim_pipeline_pressure;
-  s.pipeFlow      = sim_pipeline_flow;
-  s.xdb401Temp    = xdb401Temperature;
-  s.heap          = (long)ESP.getFreeHeap();
-  s.rssi          = WiFi.RSSI();
-  s.uptime        = (long)(millis() / 1000);
-  s.relayMask     = 0;
-
-  if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    s.tempMCP       = temperatureMCP;
-    s.pressure      = (float)pressure;
-    s.tempDHT       = temperatureDHT;
-    s.humidity      = humidity;
-    s.windSpeed     = windSpeed;
-    s.windDir       = currentWindDirDeg;
-    s.windSpeedFilt = windSpeedFiltered;
-    s.avgWindDir    = calcAndResetWindVector();
-    s.light         = lightLevel;
-    s.tempDHT11     = temperatureDHT11;
-    s.humDHT11      = humidityDHT11;
-    s.soil          = soilMoisture;
-    s.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
-    s.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
-    s.pipePressure  = sim_pipeline_pressure;
-    s.pipeFlow      = sim_pipeline_flow;
-    s.xdb401Temp    = xdb401Temperature;
-    s.heap          = (long)ESP.getFreeHeap();
-    s.rssi          = WiFi.RSSI();
-    s.uptime        = (long)(millis() / 1000);
-    for (int i = 0; i < RELAY_COUNT; i++)
-      if (relayActive[i]) s.relayMask |= (1 << i);
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
-    s.dewPoint  = agroDewPoint;
-    s.heatIndex = agroHeatIndex;
-    s.absHum    = agroAbsHum;
-#endif
-    xSemaphoreGive(dataMutex);
+  // Core 1 construye el snapshot completo y lo publica en telemetryQueue.
+  // Core 0 solo lo lee aquí — sin bloqueo, sin mutex, sin latencia de 50ms.
+  if (telemetryQueue) {
+    xQueuePeek(telemetryQueue, &_netSnap, 0);
   }
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
-  else {
-    // Sin mutex: capturar igual los campos AGROMETEO con valores actuales
-    s.xdb401Temp = xdb401Temperature;
-    s.dewPoint  = agroDewPoint;
-    s.heatIndex = agroHeatIndex;
-    s.absHum    = agroAbsHum;
-  }
-#else
-  else {
-    s.xdb401Temp = xdb401Temperature;
-  }
-#endif
+  // Campos que Core 0 puede leer directamente (thread-safe en ESP32: 32-bit, same-core read)
+  _netSnap.heap   = (long)ESP.getFreeHeap();
+  _netSnap.rssi   = WiFi.RSSI();
+  _netSnap.uptime = (long)(millis() / 1000);
 }
 #endif
 
@@ -1912,6 +1884,9 @@ void takeSnapshot() {
 void networkTask(void* pvParameters) {
   // Tarea separada de red para no bloquear sensores ni la UI principal.
   // Mantiene yields periódicos con vTaskDelay() al final del bucle.
+
+  esp_task_wdt_init(30, true);  // reset automático si networkTask se bloquea >30s
+  esp_task_wdt_add(NULL);
 
   static bool          deviceInfoSent   = false;
   static unsigned long lastRelayCheck   = 0;
@@ -1938,6 +1913,7 @@ void networkTask(void* pvParameters) {
 #endif
 
   for (;;) {
+    esp_task_wdt_reset();
     ArduinoOTA.handle();  // siempre primero, alta frecuencia
 
     if (isUpdatingOTA) {
@@ -2612,7 +2588,8 @@ void setup() {
 
 #ifndef ESP8266
     // FreeRTOS: crear tarea de red en Core 0
-    dataMutex = xSemaphoreCreateMutex();
+    dataMutex      = xSemaphoreCreateMutex();
+    telemetryQueue = xQueueCreate(1, sizeof(TelemetrySnapshot));
     xTaskCreatePinnedToCore(
       networkTask,        // función
       "NetworkTask",      // nombre
@@ -2761,9 +2738,6 @@ void loop() {
 
   // ── 2. Sensores I2C (cada telemetryIntervalMs, sincronizado con la telemetría) ──
   if (now - lastSensorRead >= telemetryIntervalMs) {
-#ifndef ESP8266
-    bool hasMutex = (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE);
-#endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // BMP280 — leer siempre para mandar sus datos explícitos por telemetría
@@ -3000,7 +2974,40 @@ void loop() {
     updatePipelineValues();
 
 #ifndef ESP8266
-    if (hasMutex) xSemaphoreGive(dataMutex);
+    // Construir snapshot y publicar en la queue para Core 0 — sin mutex, sin bloqueo
+    if (telemetryQueue) {
+      TelemetrySnapshot snap = {};
+      snap.tempMCP       = temperatureMCP;
+      snap.pressure      = (float)pressure;
+      snap.tempDHT       = temperatureDHT;
+      snap.humidity      = humidity;
+      snap.windSpeed     = windSpeed;
+      snap.windDir       = currentWindDirDeg;
+      snap.windSpeedFilt = windSpeedFiltered;
+      snap.avgWindDir    = calcAndResetWindVector();
+      snap.light         = lightLevel;
+      snap.tempDHT11     = temperatureDHT11;
+      snap.humDHT11      = humidityDHT11;
+      snap.soil          = soilMoisture;
+      snap.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
+      snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
+      snap.pipePressure  = sim_pipeline_pressure;
+      snap.pipeFlow      = sim_pipeline_flow;
+      snap.xdb401Temp    = xdb401Temperature;
+      snap.relayMask     = 0;
+      // relayActive[] es escrito por Core 0 (MQTT callback) — mutex breve solo aquí
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        for (int i = 0; i < RELAY_COUNT; i++)
+          if (relayActive[i]) snap.relayMask |= (1 << i);
+        xSemaphoreGive(dataMutex);
+      }
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+      snap.dewPoint  = agroDewPoint;
+      snap.heatIndex = agroHeatIndex;
+      snap.absHum    = agroAbsHum;
+#endif
+      xQueueOverwrite(telemetryQueue, &snap);
+    }
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
