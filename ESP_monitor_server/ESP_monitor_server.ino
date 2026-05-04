@@ -65,7 +65,11 @@
     #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
     #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
     #define FLOW_PIN         32   // Caudalímetro — pulsos digitales vía BC547 NPN (señal invertida, activo LOW)
-    #define FLOW_K_FACTOR   450   // Pulsos por litro (YF-S201: 450; ajustar según sensor real)
+    // K factor según modelo:
+    //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
+    //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
+    //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
+    #define FLOW_K_FACTOR   288   // YF-B9 — ajustar con medición real si es necesario
   #endif
   #if DEVICE_PROFILE == PROFILE_METEO
     #define HAS_DISPLAY
@@ -504,17 +508,27 @@ float sim_soilMoisture   = 50.0f;
 // ISR en IRAM_ATTR para ejecución desde RAM (no se suspende durante cache miss).
 #if defined(FLOW_PIN)
 static volatile uint32_t _flowPulseCount = 0;     // contador crudo (escrito solo por ISR)
+static volatile uint32_t _flowPulseTotal = 0;     // acumulador histórico — nunca se resetea
 static unsigned long     _flowLastCalcMs = 0;     // marca de tiempo última lectura
+static unsigned long     _flowLastDtMs   = 0;     // duración del último intervalo de cálculo (ms)
+static uint32_t          _flowLastPulses = 0;     // pulsos contados en el último intervalo
 static float             _flowLpm        = 0.0f;  // último caudal calculado (L/min)
 
 void IRAM_ATTR flowPulseISR() {
   _flowPulseCount++;
+  _flowPulseTotal++;
 }
 #endif
 
 // ── Pipeline simulado / hardware-ready ───────────────────────────────────────
 String pipelineScenario      = "normal";    // normal | leak | burst | obstruction
+// Si FLOW_PIN está definido arrancamos en "real" directamente; de lo contrario "sim".
+// El backend puede cambiar este valor en runtime via MQTT pipeline_config o HTTP /api/pipeline/config.
+#if defined(FLOW_PIN)
+String pipelineMode          = "real";      // sim | real
+#else
 String pipelineMode          = "sim";       // sim | real
+#endif
 String pipelineSource        = "sim";       // sim | real | fallback
 bool   pipelinePressureOk    = false;
 bool   pipelineFlowOk        = false;
@@ -625,6 +639,8 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   interrupts();
 
   _flowLastCalcMs = now;
+  _flowLastDtMs   = dt;       // guardamos para el debug
+  _flowLastPulses = pulses;   // guardamos para el debug
 
   // L/min = (pulsos / dt_s) * (60.0 / K_FACTOR)
   // Equivalente: pulsos * 60.0 / (dt_s * K_FACTOR)
@@ -658,8 +674,12 @@ void updatePipelineValues() {
         sim_pipeline_pressure = max(0.0f, realPressure);
         pipelinePressureOk    = true;
       } else {
-        // Sin sensor de presión real — estimación por simulador (caudal sigue siendo real)
+        // Sin sensor de presión real — estimación por simulador solo para presión.
+        // IMPORTANTE: guardamos el caudal real antes y lo restauramos porque
+        // updatePipelineSimValues() también sobreescribe sim_pipeline_flow.
+        float savedFlow = sim_pipeline_flow;
         updatePipelineSimValues();
+        sim_pipeline_flow  = savedFlow;  // restaurar caudal real
         pipelinePressureOk = false;
       }
       return;
@@ -2873,6 +2893,8 @@ void loop() {
       temperatureMCP, humidity, bmpTemperature, (float)pressure, lightLevel);
     DLOGF("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
       agroDewPoint, agroHeatIndex, agroAbsHum);
+    DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario.c_str());
 #else
     DLOGF("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
       temperatureMCP, temperatureDHT, humidity, lightLevel);
@@ -2880,9 +2902,21 @@ void loop() {
     DLOGF("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
       (float)pressure, temperatureDHT11, humidityDHT11, soilMoisture);
 #endif
+    DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario.c_str());
+#if defined(FLOW_PIN)
+    DLOGF("[FLOW  ] Pulsos/intervalo:%lu  Total:%lu  Intervalo:%lu ms  K:%d p/L\n",
+      (unsigned long)_flowLastPulses, (unsigned long)_flowPulseTotal,
+      (unsigned long)_flowLastDtMs, FLOW_K_FACTOR);
+#endif
     DLOGF("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
+#if defined(FLOW_PIN)
+    if (_flowPulseTotal == 0) {
+      DLOGLN("[FLOW  ] WARN — sin pulsos recibidos (verif. cableado GPIO" + String(FLOW_PIN) + " y transistor BC547)");
+    }
 #endif
+#endif  // PROFILE_AGROMETEO / else
 
     // Estado relays
     DLOG("[RELAYS]");
