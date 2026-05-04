@@ -76,12 +76,15 @@
   #endif
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 
-  // XDB401 — sensor de presión de tubería I2C (todos los perfiles ESP32)
-  #define XDB401_ADDR     0x6D   // dirección I2C fija del XDB401
-  #ifndef XDB401_FS_BAR
-    #define XDB401_FS_BAR 4.0f   // fondo de escala en bar — ajustar según modelo:
-    //   XDB401-A04 → 4 bar | A10 → 10 bar | A40 → 40 bar
+  // Sensor presión tubería I2C (familia XGZP6847D / XDB401 digital)
+  #define XDB401_ADDR_PRIMARY   0x6D   // dirección principal (datasheet)
+  #define XDB401_ADDR_ALT       0x7F   // dirección alternativa (algunos lotes)
+  #ifndef XDB401_FULLSCALE_KPA
+    #define XDB401_FULLSCALE_KPA 1000.0f  // kPa fondo de escala — ajustar según modelo:
+    //   0-10 bar → 1000 kPa  |  0-4 bar → 400 kPa  |  0-40 bar → 4000 kPa
   #endif
+  // Frecuencia I2C recomendada: 100 kHz (modo standard).
+  // Algunos ejemplares fallan a 400 kHz — setClock() se aplica al init.
 #endif
 
 // ── Pipeline — constantes físicas del simulador ───────────────────────────────
@@ -456,35 +459,99 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 #endif  // PROFILE_AGROMETEO
 
 // =============================================================================
-// XDB401 Series — sensor de presión de tubería I2C (sin librería externa)
-// Dirección fija 0x6D. Lectura de 4 bytes en una sola transacción requestFrom:
-//   Byte 0: [7:6]=status  [5:0]=presión high
-//   Byte 1: presión low
-//   Byte 2: temperatura high (11 bits MSB)
-//   Byte 3: temperatura low  (3 bits en [7:5])
-// Status: 0x00=normal, 0x01=command mode, 0x02=stale, 0x03=diagnóstico.
-// Fórmula presión: pct = (raw - 1638) / 13107;  P_bar = pct * XDB401_FS_BAR
+// Sensor presión tubería I2C — familia XGZP6847D / XDB401 digital
+// Compatible con cualquier sensor chino que use el mismo protocolo.
+//
+// Protocolo (datasheet XGZP6847D):
+//   1. Trigger: I2C Write 0x6D → reg 0x30 = 0x0A  (inicia conversión P+T)
+//   2. Esperar 50 ms (tiempo de conversión)
+//   3. Read 5 bytes desde el sensor:
+//        Bytes 0-2 (reg 0x06,0x07,0x08): presión  24 bits unsigned
+//        Bytes 3-4 (reg 0x09,0x0A):     temperatura 16 bits unsigned (con signo)
+//
+// Cálculo presión (24 bits con signo en bit 23):
+//   raw_p > 2^23 → valor_real = raw_p − 2^24
+//   P_kPa = valor_real × FULLSCALE_KPA / 8388608
+//   P_bar = P_kPa / 100
+//
+// Cálculo temperatura (16 bits con signo en bit 15):
+//   raw_t > 2^15 → T = (raw_t − 65536) / 256.0
+//   Si no         T = raw_t / 256.0
+//
+// Dirección I2C: 0x6D principal; 0x7F en algunos lotes (autodetectado).
+// Frecuencia I2C: 100 kHz (400 kHz puede fallar en algunos ejemplares).
 // =============================================================================
 #ifndef ESP8266
+static uint8_t _xdb401_addr = 0;   // dirección detectada al inicio
+
+// Detecta el sensor en 0x6D o 0x7F. Devuelve true si responde.
 static bool xdb401_begin() {
-  Wire.beginTransmission(XDB401_ADDR);
-  return Wire.endTransmission() == 0;
+  Wire.setClock(100000);  // 100 kHz — protocolo falla a 400 kHz en algunos lotes
+  const uint8_t candidates[] = { XDB401_ADDR_PRIMARY, XDB401_ADDR_ALT };
+  for (uint8_t addr : candidates) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      _xdb401_addr = addr;
+      DLOGF("[XDB401] Detectado en 0x%02X\n", addr);
+      return true;
+    }
+  }
+  _xdb401_addr = 0;
+  return false;
 }
 
-// Devuelve presión en bar, o NAN si error/dato obsoleto.
+// Estructura con los datos de la última medición
+struct Xdb401Reading { float pressureBar; float temperatureC; bool valid; };
+
+// Lee presión y temperatura. Devuelve valid=false si falla la comunicación.
+static Xdb401Reading xdb401_read() {
+  Xdb401Reading r = {NAN, NAN, false};
+  if (_xdb401_addr == 0) return r;
+
+  // 1. Trigger conversión presión + temperatura
+  Wire.beginTransmission(_xdb401_addr);
+  Wire.write(0x30);
+  Wire.write(0x0A);
+  if (Wire.endTransmission() != 0) return r;
+
+  // 2. Esperar conversión
+  delay(50);
+
+  // 3. Leer 5 bytes (3 presión + 2 temperatura)
+  if (Wire.requestFrom((uint8_t)_xdb401_addr, (uint8_t)5, (uint8_t)1) < 5) return r;
+  uint8_t d[5];
+  for (int i = 0; i < 5; i++) d[i] = Wire.read();
+
+  // 4. Presión — 24 bits con signo en bit 23
+  int32_t raw_p = (int32_t)d[0] * 65536L + (int32_t)d[1] * 256L + d[2];
+  float p_kpa;
+  if (raw_p > 8388608L) {      // > 2^23 → negativo
+    p_kpa = (float)(raw_p - 16777216L) * (XDB401_FULLSCALE_KPA / 8388608.0f);
+  } else {
+    p_kpa = (float)raw_p         * (XDB401_FULLSCALE_KPA / 8388608.0f);
+  }
+  r.pressureBar = p_kpa / 100.0f;
+
+  // 5. Temperatura — 16 bits con signo en bit 15
+  int32_t raw_t = (int32_t)d[3] * 256L + d[4];
+  if (raw_t > 32768L) {
+    r.temperatureC = (float)(raw_t - 65536L) / 256.0f;
+  } else {
+    r.temperatureC = (float)raw_t / 256.0f;
+  }
+
+  // Validar rangos razonables
+  float fs_bar = XDB401_FULLSCALE_KPA / 100.0f;
+  r.valid = (r.pressureBar >= -0.1f && r.pressureBar <= fs_bar * 1.05f
+             && r.temperatureC > -40.0f && r.temperatureC < 125.0f);
+  if (!r.valid) { r.pressureBar = NAN; r.temperatureC = NAN; }
+  return r;
+}
+
+// Wrapper conveniente: solo presión en bar (NAN si falla).
 static float xdb401_readPressureBar() {
-  if (Wire.requestFrom((uint8_t)XDB401_ADDR, (uint8_t)4, (uint8_t)1) < 4) return NAN;
-  uint8_t b0 = Wire.read();
-  uint8_t b1 = Wire.read();
-  Wire.read();  // temp high — no usado
-  Wire.read();  // temp low  — no usado
-  uint8_t status = (b0 >> 6) & 0x03;
-  if (status == 0x02 || status == 0x03) return NAN;  // stale o diagnóstico
-  uint16_t raw = ((uint16_t)(b0 & 0x3F) << 8) | b1;
-  // Output mínimo 10% FS (raw=1638) — máximo 90% FS (raw=14746)
-  float pct = (float)(raw - 1638) / 13107.0f;
-  float bar = pct * XDB401_FS_BAR;
-  return (bar >= -0.05f && bar <= XDB401_FS_BAR * 1.05f) ? bar : NAN;
+  Xdb401Reading r = xdb401_read();
+  return r.valid ? r.pressureBar : NAN;
 }
 #endif  // !ESP8266
 
@@ -500,6 +567,9 @@ static const char* temperatureSourceName() {
 }
 
 static const char* pressureSourceName() {
+#if !defined(ESP8266)
+  if (xdb401_ok) return "XDB401";
+#endif
 #if DEVICE_PROFILE == PROFILE_METEO
   if (micropressure_ok) return "MicroPressure";
   if (bmp_pressure_ok) return "BMP280";

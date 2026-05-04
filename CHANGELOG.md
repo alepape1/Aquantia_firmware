@@ -12,14 +12,22 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 ## [Unreleased] — feature/xdb401-pressure
 
 ### Añadido
-- **Soporte sensor XDB401** (sensor de presión de tubería I2C, 0x6D) en todos los perfiles ESP32.
-  - Driver inline sin librería externa: lectura de 4 bytes con conversión `P_bar = (raw − 1638) / 13107 × XDB401_FS_BAR`.
-  - `#define XDB401_FS_BAR 4.0f` configurable en tiempo de compilación (A04=4 bar, A10=10 bar, A40=40 bar).
-  - `xdb401_ok` flag global: `true` si el sensor responde en I2C al arrancar.
-  - Si XDB401 detectado: `readRealPipelineSensors()` devuelve la presión real (`pressureBar ≥ 0`); si no, devuelve −1.0f y el caller usa el simulador.
-  - En perfiles sin `FLOW_PIN` (AGROMETEO), si XDB401 está presente sí se devuelve `return true` con `flowLpm = 0` para que `updatePipelineValues()` entre en la rama real.
-  - En `setup()`: si XDB401 detectado y `pipelineMode == "sim"`, se cambia automáticamente a `"real"` (el backend puede revertirlo por MQTT/HTTP).
+- **Soporte sensor de presión de tubería I2C (familia XGZP6847D / XDB401 digital)** en todos los perfiles ESP32.
+  - Protocolo real implementado: trigger `reg 0x30 = 0x0A` → espera 50 ms → lectura de 5 bytes (3 presión + 2 temperatura).
+  - Presión: 24 bits con signo (corrección en bit 23), fórmula `P_bar = raw × FULLSCALE_KPA / 8388608 / 100`.
+  - Temperatura interna: 16 bits con signo (corrección en bit 15), `T_C = raw / 256`.
+  - `XDB401_FULLSCALE_KPA` configurable en tiempo de compilación (defecto 1000 kPa = 10 bar; 400 para 4 bar).
+  - Autodetección de dirección I2C: prueba `0x6D` (principal) y `0x7F` (lotes alternativos), almacena la que responde.
+  - Bus forzado a 100 kHz en `xdb401_begin()` (algunos ejemplares fallan a 400 kHz).
+  - `xdb401_ok` flag global: `true` si el sensor responde al arrancar.
+  - `readRealPipelineSensors()`: devuelve presión real si XDB401 detectado; `pressureBar = -1.0f` si no (caller usa simulador).
+  - Sin `FLOW_PIN` (AGROMETEO): si XDB401 presente devuelve `true` con `flowLpm = 0` para activar el path real de presión.
+  - En `setup()`: si XDB401 detectado y `pipelineMode == "sim"`, cambia automáticamente a `"real"`.
+  - `pressureSourceName()` devuelve `"XDB401"` cuando el sensor está activo (tiene prioridad sobre MicroPressure/BMP280).
   - Campo `xdb401_ok` añadido al payload MQTT de telemetría.
+
+### Corregido
+- Driver inicial basado en protocolo incorrecto (requestFrom directo sin trigger, fórmula 14-bit) sustituido por el protocolo real del datasheet XGZP6847D.
 
 ---
 
