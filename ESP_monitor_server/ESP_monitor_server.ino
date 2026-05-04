@@ -488,11 +488,16 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 static uint8_t _xdb401_addr        = 0;      // dirección detectada al inicio
 static bool    _xdb401_continuous  = false;  // true = modo continuo (sin trigger)
 
-// Lee 5 bytes crudos del sensor. Devuelve el número de bytes recibidos.
+// Lee 5 bytes desde el registro 0x06 (presión MSB) usando repeated-start.
+// El XGZP6847D requiere apuntar al registro antes de leer — requestFrom directo
+// retorna datos del registro 0x00 que siempre vale 0.
 static uint8_t _xdb401_rawread(uint8_t* d, uint8_t n) {
+  // Apuntar al registro 0x06 (presión MSB) con repeated-start
+  Wire.beginTransmission(_xdb401_addr);
+  Wire.write(0x06);
+  Wire.endTransmission(false);  // repeated start — no liberar el bus
   uint8_t recv = Wire.requestFrom((uint8_t)_xdb401_addr, n, (uint8_t)1);
   for (uint8_t i = 0; i < recv && i < n; i++) d[i] = Wire.read();
-  // Vaciar buffer si el sensor envió más bytes de los pedidos
   while (Wire.available()) Wire.read();
   return recv;
 }
