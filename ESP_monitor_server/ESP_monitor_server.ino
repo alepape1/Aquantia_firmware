@@ -1885,7 +1885,15 @@ void networkTask(void* pvParameters) {
   // Tarea separada de red para no bloquear sensores ni la UI principal.
   // Mantiene yields periódicos con vTaskDelay() al final del bucle.
 
-  esp_task_wdt_init(30, true);  // reset automático si networkTask se bloquea >30s
+  // En IDF 5.x el sistema ya inicia el TWDT para las tareas IDLE.
+  // esp_task_wdt_init() devuelve ESP_ERR_INVALID_STATE si ya está inicializado
+  // y el timeout corto del sistema permanecería activo — usar reconfigure como fallback.
+  {
+    esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+    if (esp_task_wdt_init(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+      esp_task_wdt_reconfigure(&wdt_cfg);
+    }
+  }
   esp_task_wdt_add(NULL);
 
   static bool          deviceInfoSent   = false;

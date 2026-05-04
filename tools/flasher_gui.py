@@ -865,7 +865,7 @@ class FlasherApp(tk.Tk):
         self._bin_status_lbl = tk.Label(bin_frame, textvariable=self._bin_status_var,
                                         font=("Segoe UI", 9), anchor="w")
         self._bin_status_lbl.pack(side="left", fill="x", expand=True)
-        ttk.Button(bin_frame, text="🗑", width=3,
+        ttk.Button(bin_frame, text="🗑 Build", width=8,
                    command=self._clean_build).pack(side="right")
 
         # ── Puerto COM ──
@@ -1366,6 +1366,7 @@ class FlasherApp(tk.Tk):
             self._log_line(f"Error limpiando build: {e}", "#f44747")
         self._refresh_binary_status()
 
+
     def _update_commit_info(self, git_ref):
         """Actualiza el panel de info del commit seleccionado."""
         details = get_commit_details(git_ref)
@@ -1699,6 +1700,7 @@ class FlasherApp(tk.Tk):
             "--build-property", f"compiler.c.extra_flags=-DDEVICE_PROFILE={profile}{debug_flag}",
             "--build-property", "build.partitions=min_spiffs",
             "--build-path", BUILD_DIR,
+            "--jobs", str(os.cpu_count() or 4),
             sketch_path,
         ]
         ok, _ = self._run_cmd(cmd, cwd=sketch_path)

@@ -22,16 +22,20 @@ static bool _write_register(uint8_t reg, uint8_t value) {
 }
 
 /**
- * Lee N bytes a partir de un registro usando repeated-start.
+ * Lee N bytes a partir de un registro usando stop-start (NO repeated-start).
+ * Muchos sensores chinos de esta familia no implementan repeated-start
+ * correctamente — un stop completo entre escritura y lectura es más compatible.
  * Retorna true si se recibieron exactamente n_bytes.
  */
 static bool _read_registers(uint8_t reg, uint8_t *buf, uint8_t n_bytes) {
+    // Fase 1: escribir la dirección del registro con STOP completo
     Wire.beginTransmission(PRESSURE_SENSOR_I2C_ADDR);
     Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) {   // repeated start
+    if (Wire.endTransmission(true) != 0) {   // STOP — compatible con sensores sin repeated-start
         return false;
     }
 
+    // Fase 2: leer N bytes en nueva transacción (START fresco)
     uint8_t received = Wire.requestFrom((uint8_t)PRESSURE_SENSOR_I2C_ADDR, n_bytes);
     if (received != n_bytes) {
         return false;
