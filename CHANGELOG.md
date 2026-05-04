@@ -9,6 +9,26 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased] — feat/firmware-stability-phase1
+
+### Añadido
+- **Watchdog de aplicación en `networkTask`** (`esp_task_wdt`, timeout 30s, reset en pánico):
+  - Si `networkTask` se bloquea (handshake TLS colgado, broker con TCP half-open, etc.) el ESP32 hace reset automático sin intervención humana.
+  - `esp_task_wdt_reset()` se llama al inicio de cada iteración del bucle.
+- **`telemetryQueue`** (FreeRTOS Queue, tamaño 1): arquitectura lock-free para la telemetría entre cores.
+  - Core 1 construye el `TelemetrySnapshot` completo (incluyendo `calcAndResetWindVector()`) y publica con `xQueueOverwrite` — nunca bloquea.
+  - Core 0 lee con `xQueuePeek` — nunca bloquea.
+  - `dataMutex` queda reservado exclusivamente para proteger escrituras de config desde Core 0 (`pipelineScenario`, `telemetryIntervalMs`, `relayActive[]`) y la lectura brevísima (5ms max) de `relayActive[]` al construir el snapshot.
+  - Elimina la latencia de hasta 50ms del antiguo `xSemaphoreTake(dataMutex, 50ms)` en `takeSnapshot()`.
+- **Retry controlado para XDB401**: tras 5 fallos consecutivos de lectura el sensor se suspende 30s y reintenta `xdb401_begin()` automáticamente, en lugar de caer en modo simulación permanente sin aviso.
+
+### Cambiado
+- `takeSnapshot()` simplificada: solo hace `xQueuePeek` + actualización de `heap`/`rssi`/`uptime`. Toda la construcción del snapshot se mueve a Core 1 (loop) al finalizar la lectura de sensores.
+- Lectura de sensores I2C en `loop()` ya no adquiere `dataMutex` (los sensores solo los escribe Core 1).
+- Comentario obsoleto en `updatePipelineValues()` sobre `dataMutex` actualizado.
+
+---
+
 ## [Unreleased] — feature/agrometeo-profile
 
 ### Cambiado

@@ -226,24 +226,26 @@ El motivo es que en PROD el broker identifica cada dispositivo **por su MAC** y 
 Core 1 — loop()
  ├─ Cada 100ms  → Leer ADC anemómetro/veleta (METEO)
  │               Acumular vector de viento para promedio vectorial
- ├─ Cada 1s     → Leer I2C: MCP9808, HTU2x, barómetro, luz (METEO)
+ ├─ Cada 20s    → Leer I2C: MCP9808, HTU2x, barómetro, luz (METEO)
  │               Leer ADC YL-69 humedad suelo (METEO)
+ │               Construir TelemetrySnapshot → xQueueOverwrite (sin bloqueo)
  │               Actualizar pantalla TFT (METEO)
  └─ Siempre     → Gestionar botones y timeout de pantalla (METEO)
 
-Core 0 — networkTask()  [prioridad 2]
+Core 0 — networkTask()  [prioridad 2, watchdog 30s]
  ├─ Cada ~10ms  → ArduinoOTA.handle()  ← nunca bloqueado
  ├─ Al arrancar → [HTTP] POST /api/device_info
  │                [MQTT] mqttConnect() + publish register
  ├─ Continuo    → [MQTT] mqttClient.loop()  ← recibe comandos relay
  ├─ Cada 2s     → [HTTP] GET /api/relay/command → actuar relays + ack
- └─ Cada 20s    → Snapshot bajo dataMutex → envío telemetría
+ └─ Cada 20s    → xQueuePeek (sin bloqueo) → envío telemetría
                   [HTTP] CSV → POST /send_message
                   [MQTT] JSON → publish aquantia/<finca_id>/telemetry
 ```
 
 Sincronización entre cores:
-- **`dataMutex`** (FreeRTOS Mutex): protege el snapshot de sensores al construir el payload
+- **`telemetryQueue`** (FreeRTOS Queue, tamaño 1): Core 1 publica el snapshot con `xQueueOverwrite`; Core 0 lo consume con `xQueuePeek`. Nunca bloquea ningún core.
+- **`dataMutex`** (FreeRTOS Mutex): protege exclusivamente las escrituras de config desde Core 0 (`pipelineScenario`, `telemetryIntervalMs`, `relayActive[]`) que Core 1 lee.
 - **`windMux`** (sección crítica): protege los acumuladores vectoriales del viento
 
 ### Seguridad OTA
