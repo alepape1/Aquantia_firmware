@@ -600,8 +600,9 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   uint16_t raw_t = (uint16_t)d[3] * 256U + d[4];
   float tc = (float)raw_t / 256.0f + 10.0f;
 
-  DLOGF("[XDB401] raw_p=%ld (%.3f bar)  raw_t=%u (%.1f C)  modo=%s\n",
-        raw_p, pb, raw_t, _xdb401_continuous ? "continuo" : "triggered");
+  DLOGF("[XDB401] raw_p=%d  raw_t=%u  modo=%s\n",
+        (int)raw_p, (unsigned)raw_t, _xdb401_continuous ? "continuo" : "triggered");
+  DLOGF("[XDB401] Presion=%.3f bar  Temp=%.1f C\n", pb, tc);
 
   // Validar rangos razonables
   float fs_bar = XDB401_FULLSCALE_KPA / 100.0f;
