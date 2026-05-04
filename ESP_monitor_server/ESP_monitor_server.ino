@@ -646,6 +646,7 @@ bool   pipelinePressureOk    = false;
 bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
+float  xdb401Temperature     = NAN;  // temperatura interna del sensor de presión (XDB401)
 unsigned long telemetryIntervalMs  = 20000UL;
 unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
 #ifdef HAS_DISPLAY
@@ -1071,6 +1072,7 @@ struct TelemetrySnapshot {
   float light, tempDHT11, humDHT11, soil;
   float bmpTemp, bmpPressure;
   float pipePressure, pipeFlow;
+  float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
   long  heap, uptime;
   int   rssi, relayMask;
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
@@ -1639,7 +1641,7 @@ void drawPipelineScreen() {
   spr.drawRightString(pipeSim || !pipelineFlowOk ? "[SIM]" : "[OK]",
                       237, cY + cH - 14, 1);
 
-  // ── Franja inferior: modo + escenario ─────────────────────────────────────
+  // ── Franja inferior: modo + escenario + temperatura agua ──────────────────
   int bY = cY + cH + 3;
   int bH = 135 - bY;
   spr.fillRoundRect(0, bY, 240, bH, 3, C_CARD);
@@ -1654,6 +1656,18 @@ void drawPipelineScreen() {
   spr.drawString("Escenario:", 6, bY + 14, 1);
   spr.setTextColor(C_TEXT, C_CARD);
   spr.drawString(pipelineScenario.c_str(), 68, bY + 14, 1);
+
+  // Temperatura interna del sensor de presión (temperatura del agua)
+  if (xdb401_ok && !isnan(xdb401Temperature)) {
+    char tbuf[10];
+    snprintf(tbuf, sizeof(tbuf), "%.1f", xdb401Temperature);
+    spr.setTextColor(C_LABEL, C_CARD);
+    spr.drawString("Taq:", 148, bY + 14, 1);
+    spr.setTextColor(C_REAL, C_CARD);
+    spr.drawString(tbuf, 170, bY + 14, 1);
+    spr.setTextColor(C_LABEL, C_CARD);
+    spr.drawString("\xB0C", 198, bY + 14, 1);
+  }
 
   spr.pushSprite(0, 0);
 }
@@ -1869,6 +1883,7 @@ void takeSnapshot() {
   s.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
   s.pipePressure  = sim_pipeline_pressure;
   s.pipeFlow      = sim_pipeline_flow;
+  s.xdb401Temp    = xdb401Temperature;
   s.heap          = (long)ESP.getFreeHeap();
   s.rssi          = WiFi.RSSI();
   s.uptime        = (long)(millis() / 1000);
@@ -1891,6 +1906,7 @@ void takeSnapshot() {
     s.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
     s.pipePressure  = sim_pipeline_pressure;
     s.pipeFlow      = sim_pipeline_flow;
+    s.xdb401Temp    = xdb401Temperature;
     s.heap          = (long)ESP.getFreeHeap();
     s.rssi          = WiFi.RSSI();
     s.uptime        = (long)(millis() / 1000);
@@ -1906,9 +1922,14 @@ void takeSnapshot() {
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
   else {
     // Sin mutex: capturar igual los campos AGROMETEO con valores actuales
+    s.xdb401Temp = xdb401Temperature;
     s.dewPoint  = agroDewPoint;
     s.heatIndex = agroHeatIndex;
     s.absHum    = agroAbsHum;
+  }
+#else
+  else {
+    s.xdb401Temp = xdb401Temperature;
   }
 #endif
 }
@@ -2044,6 +2065,7 @@ void networkTask(void* pvParameters) {
       doc["pipeline_pressure_ok"]  = pipelinePressureOk;
       doc["pipeline_flow_ok"]      = pipelineFlowOk;
       doc["xdb401_ok"]             = xdb401_ok;
+      if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
       doc["mac_address"]           = WiFi.macAddress();
       doc["ip_address"]            = WiFi.localIP().toString();
       doc["relay_count"]           = RELAY_COUNT;

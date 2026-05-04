@@ -12,19 +12,16 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 ## [Unreleased] — feature/xdb401-pressure
 
 ### Añadido
-- **Soporte sensor de presión de tubería I2C (familia XGZP6847D / XDB401 digital)** en todos los perfiles ESP32.
-  - Protocolo real implementado: trigger `reg 0x30 = 0x0A` → espera 50 ms → lectura de 5 bytes (3 presión + 2 temperatura).
-  - Presión: 24 bits con signo (corrección en bit 23), fórmula `P_bar = raw × FULLSCALE_KPA / 8388608 / 100`.
-  - Temperatura interna: 16 bits con signo (corrección en bit 15), `T_C = raw / 256`.
-  - `XDB401_FULLSCALE_KPA` configurable en tiempo de compilación (defecto 1000 kPa = 10 bar; 400 para 4 bar).
-  - Autodetección de dirección I2C: prueba `0x6D` (principal) y `0x7F` (lotes alternativos), almacena la que responde.
-  - Bus forzado a 100 kHz en `xdb401_begin()` (algunos ejemplares fallan a 400 kHz).
-  - `xdb401_ok` flag global: `true` si el sensor responde al arrancar.
-  - `readRealPipelineSensors()`: devuelve presión real si XDB401 detectado; `pressureBar = -1.0f` si no (caller usa simulador).
-  - Sin `FLOW_PIN` (AGROMETEO): si XDB401 presente devuelve `true` con `flowLpm = 0` para activar el path real de presión.
-  - En `setup()`: si XDB401 detectado y `pipelineMode == "sim"`, cambia automáticamente a `"real"`.
-  - `pressureSourceName()` devuelve `"XDB401"` cuando el sensor está activo (tiene prioridad sobre MicroPressure/BMP280).
-  - Campo `xdb401_ok` añadido al payload MQTT de telemetría.
+- **Umbrales de alerta de presión** como `#define` en la sección de constantes pipeline:
+  - `PRESSURE_MIN_NORMAL 1.5 bar` — umbral bajo (ajustado para red pública de Lanzarote que puede bajar a ~2 bar en verano)
+  - `PRESSURE_MAX_NORMAL 7.0 bar` — umbral de sobrepresión
+  - `PRESSURE_DROP_ALERT 1.0 bar` — caída rápida (fuga activa)
+  - `PRESSURE_HYDRO_TARGET 3.5 bar` y `PRESSURE_HYDRO_MARGIN 0.5 bar` — control del hidropresor
+- **Temperatura del agua via XDB401**: el sensor de presión reporta temperatura interna del fluido.
+  - Variable global `xdb401Temperature` (NAN si sensor no disponible).
+  - `readRealPipelineSensors()` actualiza `xdb401Temperature` en cada lectura real (usa `xdb401_read()` en lugar de `xdb401_readPressureBar()`).
+  - Campo `xdb401_temperature` añadido al payload MQTT de telemetría (solo si el sensor está presente y la lectura es válida).
+  - Pantalla TFT pipeline view: muestra `Taq: XX.X °C` en la franja inferior cuando XDB401 está activo.
 
 ### Corregido
 - Driver inicial basado en protocolo incorrecto (requestFrom directo sin trigger, fórmula 14-bit) sustituido por el protocolo real del datasheet XGZP6847D.
