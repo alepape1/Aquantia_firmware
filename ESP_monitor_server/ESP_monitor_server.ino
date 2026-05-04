@@ -75,6 +75,13 @@
     #define HAS_DISPLAY
   #endif
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
+
+  // XDB401 — sensor de presión de tubería I2C (todos los perfiles ESP32)
+  #define XDB401_ADDR     0x6D   // dirección I2C fija del XDB401
+  #ifndef XDB401_FS_BAR
+    #define XDB401_FS_BAR 4.0f   // fondo de escala en bar — ajustar según modelo:
+    //   XDB401-A04 → 4 bar | A10 → 10 bar | A40 → 40 bar
+  #endif
 #endif
 
 // ── Pipeline — constantes físicas del simulador ───────────────────────────────
@@ -343,7 +350,8 @@ bool bh1750_ok     = false;   // BH1750  — iluminancia
 bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
 static uint8_t bmp280_addr = 0x00;
 #endif
-bool tsl_ok = false;
+bool tsl_ok   = false;
+bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
 static bool beginBMP280() {
@@ -446,6 +454,39 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 // powerOn/powerOff siguen disponibles si en el futuro se necesita deep-sleep.
 // =============================================================================
 #endif  // PROFILE_AGROMETEO
+
+// =============================================================================
+// XDB401 Series — sensor de presión de tubería I2C (sin librería externa)
+// Dirección fija 0x6D. Lectura de 4 bytes en una sola transacción requestFrom:
+//   Byte 0: [7:6]=status  [5:0]=presión high
+//   Byte 1: presión low
+//   Byte 2: temperatura high (11 bits MSB)
+//   Byte 3: temperatura low  (3 bits en [7:5])
+// Status: 0x00=normal, 0x01=command mode, 0x02=stale, 0x03=diagnóstico.
+// Fórmula presión: pct = (raw - 1638) / 13107;  P_bar = pct * XDB401_FS_BAR
+// =============================================================================
+#ifndef ESP8266
+static bool xdb401_begin() {
+  Wire.beginTransmission(XDB401_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+// Devuelve presión en bar, o NAN si error/dato obsoleto.
+static float xdb401_readPressureBar() {
+  if (Wire.requestFrom((uint8_t)XDB401_ADDR, (uint8_t)4, (uint8_t)1) < 4) return NAN;
+  uint8_t b0 = Wire.read();
+  uint8_t b1 = Wire.read();
+  Wire.read();  // temp high — no usado
+  Wire.read();  // temp low  — no usado
+  uint8_t status = (b0 >> 6) & 0x03;
+  if (status == 0x02 || status == 0x03) return NAN;  // stale o diagnóstico
+  uint16_t raw = ((uint16_t)(b0 & 0x3F) << 8) | b1;
+  // Output mínimo 10% FS (raw=1638) — máximo 90% FS (raw=14746)
+  float pct = (float)(raw - 1638) / 13107.0f;
+  float bar = pct * XDB401_FS_BAR;
+  return (bar >= -0.05f && bar <= XDB401_FS_BAR * 1.05f) ? bar : NAN;
+}
+#endif  // !ESP8266
 
 static const char* temperatureSourceName() {
 #if DEVICE_PROFILE == PROFILE_METEO
@@ -648,9 +689,25 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   float dt_s  = dt / 1000.0f;
   _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
   flowLpm     = _flowLpm;
-  pressureBar = -1.0f;  // sin sensor de presión de tubería — se usará simulador
+  // Intentar leer presión real del XDB401; -1.0f si no disponible (el caller usará sim)
+  pressureBar = -1.0f;
+  if (xdb401_ok) {
+    float p = xdb401_readPressureBar();
+    if (!isnan(p)) pressureBar = p;
+  }
   return true;
 #else
+  // Sin caudalímetro: si hay XDB401 devolvemos presión real con caudal 0
+  #ifndef ESP8266
+  if (xdb401_ok) {
+    float p = xdb401_readPressureBar();
+    if (!isnan(p)) {
+      pressureBar = p;
+      flowLpm     = 0.0f;
+      return true;
+    }
+  }
+  #endif
   (void)pressureBar;
   (void)flowLpm;
   return false;
@@ -1916,6 +1973,7 @@ void networkTask(void* pvParameters) {
       doc["pipeline_source"]       = pipelineSource;
       doc["pipeline_pressure_ok"]  = pipelinePressureOk;
       doc["pipeline_flow_ok"]      = pipelineFlowOk;
+      doc["xdb401_ok"]             = xdb401_ok;
       doc["mac_address"]           = WiFi.macAddress();
       doc["ip_address"]            = WiFi.localIP().toString();
       doc["relay_count"]           = RELAY_COUNT;
@@ -2369,6 +2427,18 @@ void setup() {
   DLOGLN("Plataforma: ESP8266 (sin pantalla, sin veleta)");
 #else
   DLOGLN("Plataforma: ESP32 (con pantalla TFT)");
+#endif
+
+  // ── XDB401 — sensor de presión de tubería I2C (todos los perfiles ESP32) ──
+#ifndef ESP8266
+  xdb401_ok = xdb401_begin();
+  if (xdb401_ok) {
+    DLOGLN("XDB401 OK — sensor presion tuberia detectado");
+    // Si no hay caudalímetro, activar modo real para aprovechar la presión real
+    if (pipelineMode == "sim") pipelineMode = "real";
+  } else {
+    DLOGLN("XDB401 no detectado — presion tuberia en modo simulacion");
+  }
 #endif
 
 #ifdef HAS_DISPLAY

@@ -9,6 +9,20 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased] — feature/xdb401-pressure
+
+### Añadido
+- **Soporte sensor XDB401** (sensor de presión de tubería I2C, 0x6D) en todos los perfiles ESP32.
+  - Driver inline sin librería externa: lectura de 4 bytes con conversión `P_bar = (raw − 1638) / 13107 × XDB401_FS_BAR`.
+  - `#define XDB401_FS_BAR 4.0f` configurable en tiempo de compilación (A04=4 bar, A10=10 bar, A40=40 bar).
+  - `xdb401_ok` flag global: `true` si el sensor responde en I2C al arrancar.
+  - Si XDB401 detectado: `readRealPipelineSensors()` devuelve la presión real (`pressureBar ≥ 0`); si no, devuelve −1.0f y el caller usa el simulador.
+  - En perfiles sin `FLOW_PIN` (AGROMETEO), si XDB401 está presente sí se devuelve `return true` con `flowLpm = 0` para que `updatePipelineValues()` entre en la rama real.
+  - En `setup()`: si XDB401 detectado y `pipelineMode == "sim"`, se cambia automáticamente a `"real"` (el backend puede revertirlo por MQTT/HTTP).
+  - Campo `xdb401_ok` añadido al payload MQTT de telemetría.
+
+---
+
 ## [Unreleased] — feature/agrometeo-profile
 
 ### Añadido
