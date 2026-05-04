@@ -487,7 +487,6 @@ static uint8_t _xdb401_addr = 0;   // dirección detectada al inicio
 
 // Detecta el sensor en 0x6D o 0x7F. Devuelve true si responde.
 static bool xdb401_begin() {
-  Wire.setClock(100000);  // 100 kHz — protocolo falla a 400 kHz en algunos lotes
   const uint8_t candidates[] = { XDB401_ADDR_PRIMARY, XDB401_ADDR_ALT };
   for (uint8_t addr : candidates) {
     Wire.beginTransmission(addr);
@@ -508,9 +507,6 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   temperatureC = NAN;
   if (_xdb401_addr == 0) return false;
 
-  // Forzar 100 kHz antes de cada transacción — otros sensores pueden haberlo subido a 400 kHz
-  Wire.setClock(100000);
-
   // 1. Trigger conversión presión + temperatura
   Wire.beginTransmission(_xdb401_addr);
   Wire.write(0x30);
@@ -523,7 +519,7 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
       Wire.end();
       delay(10);
       Wire.begin(I2C_SDA, I2C_SCL);
-      Wire.setClock(100000);
+      Wire.setClock(100000);  // restaurar 100 kHz tras reinit
       // Re-sondear dirección para confirmar que el sensor sigue respondiendo
       Wire.beginTransmission(_xdb401_addr);
       if (Wire.endTransmission() != 0) {
@@ -2221,7 +2217,8 @@ void setup() {
   DLOGLN("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
 #ifndef ESP8266
-  Wire.setTimeOut(100);  // timeout 100ms para evitar hang si un sensor no responde
+  Wire.setClock(100000);  // 100 kHz globales — el XDB401 no aguanta 400 kHz
+  Wire.setTimeOut(100);   // timeout 100ms para evitar hang si un sensor no responde
 #endif
   DLOGLN("I2C OK");
 
