@@ -512,15 +512,24 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   Wire.beginTransmission(_xdb401_addr);
   Wire.write(0x30);
   Wire.write(0x0A);
-  if (Wire.endTransmission() != 0) return false;
+  uint8_t err = Wire.endTransmission();
+  if (err != 0) {
+    DLOGF("[XDB401] Trigger FAIL endTransmission=%d\n", err);
+    return false;
+  }
 
   // 2. Esperar conversión
   delay(50);
 
   // 3. Leer 5 bytes (3 presión + 2 temperatura)
-  if (Wire.requestFrom((uint8_t)_xdb401_addr, (uint8_t)5, (uint8_t)1) < 5) return false;
+  uint8_t recv = Wire.requestFrom((uint8_t)_xdb401_addr, (uint8_t)5, (uint8_t)1);
+  if (recv < 5) {
+    DLOGF("[XDB401] Read FAIL — solo %d bytes (esperados 5)\n", recv);
+    return false;
+  }
   uint8_t d[5];
   for (int i = 0; i < 5; i++) d[i] = Wire.read();
+  DLOGF("[XDB401] Raw bytes: %02X %02X %02X %02X %02X\n", d[0],d[1],d[2],d[3],d[4]);
 
   // 4. Presión — 24 bits con signo en bit 23
   int32_t raw_p = (int32_t)d[0] * 65536L + (int32_t)d[1] * 256L + d[2];
@@ -537,10 +546,15 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   float tc = (raw_t > 32768L) ? (float)(raw_t - 65536L) / 256.0f
                                : (float)raw_t / 256.0f;
 
+  DLOGF("[XDB401] raw_p=%ld (%.3f bar)  raw_t=%ld (%.1f C)\n", raw_p, pb, raw_t, tc);
+
   // Validar rangos razonables
   float fs_bar = XDB401_FULLSCALE_KPA / 100.0f;
   bool ok = (pb >= -0.1f && pb <= fs_bar * 1.05f
              && tc > -40.0f && tc < 125.0f);
+  if (!ok) {
+    DLOGF("[XDB401] Validacion FAIL — pb=%.3f bar (max=%.1f) tc=%.1f C\n", pb, fs_bar, tc);
+  }
   if (ok) { pressureBar = pb; temperatureC = tc; }
   return ok;
 }
