@@ -481,6 +481,11 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 // Dirección I2C: 0x6D principal; 0x7F en algunos lotes (autodetectado).
 // Frecuencia I2C: 100 kHz (400 kHz puede fallar en algunos ejemplares).
 // =============================================================================
+
+// Struct definido fuera de #ifndef ESP8266 para que el preprocesador de Arduino
+// lo tenga disponible antes de generar los forward declarations de functions.
+struct Xdb401Reading { float pressureBar; float temperatureC; bool valid; };
+
 #ifndef ESP8266
 static uint8_t _xdb401_addr = 0;   // dirección detectada al inicio
 
@@ -499,9 +504,6 @@ static bool xdb401_begin() {
   _xdb401_addr = 0;
   return false;
 }
-
-// Estructura con los datos de la última medición
-struct Xdb401Reading { float pressureBar; float temperatureC; bool valid; };
 
 // Lee presión y temperatura. Devuelve valid=false si falla la comunicación.
 static Xdb401Reading xdb401_read() {
