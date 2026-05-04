@@ -310,6 +310,7 @@ void ledTick() {
   TFT_eSprite spr = TFT_eSprite(&tft);
   unsigned long lastActivityTime = 0;
   bool          displayOn        = true;
+  uint8_t       displayView      = 0;   // 0 = meteo, 1 = pipeline
 #endif
 
 // ── Relay electroválvula(s) ────────────────────────────────────────────────────
@@ -1404,6 +1405,10 @@ void drawScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("METEOSTATION", 6, 4, 2);
 
+  // Indicadores de vista: ● • (punto 1 activo, punto 2 inactivo)
+  spr.fillCircle(114, 9, 3, C_TEXT);   // vista 1 (meteo) — activa
+  spr.fillCircle(123, 9, 3, C_LABEL);  // vista 2 (pipeline) — inactiva
+
   // Luz en la cabecera (icono + valor lux)
   uint16_t luxCol = tsl_ok ? C_REAL : C_SIM;
   iconSun(118, 9, luxCol);
@@ -1430,6 +1435,98 @@ void drawScreen() {
   drawCard(0, 1, "PRESION", (float)pressure,    "KPa",  !bar_ok);
   drawCard(1, 1, "VIENTO",  windSpeedFiltered,  "m/s",  false);
   drawCard(2, 1, "DIRECC.", currentWindDirDeg,  "deg",  false, true);
+
+  spr.pushSprite(0, 0);
+}
+
+// ── Vista 2: Pipeline (caudal + presión) ─────────────────────────────────────
+void drawPipelineScreen() {
+  spr.fillSprite(C_BG);
+
+  // Cabecera
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
+  spr.setTextColor(C_TEXT, C_HDR);
+  spr.drawString("PIPELINE", 6, 4, 2);
+
+  // Indicadores de vista: • ● (punto 1 inactivo, punto 2 activo)
+  spr.fillCircle(114, 9, 3, C_LABEL);  // vista 1 (meteo) — inactiva
+  spr.fillCircle(123, 9, 3, C_TEXT);   // vista 2 (pipeline) — activa
+
+  if (WiFi.status() == WL_CONNECTED) {
+    spr.setTextColor(C_REAL, C_HDR);
+    spr.drawString("WiFi", 168, 5, 1);
+  } else {
+    spr.setTextColor(C_RED, C_HDR);
+    spr.drawString("NoWiFi", 157, 5, 1);
+  }
+  uint16_t srvCol = lastServerOK ? C_REAL : C_RED;
+  spr.fillCircle(230, 9, 5, srvCol);
+  spr.drawCircle(230, 9, 5, C_TEXT);
+
+  // Determinar si los valores son simulados
+  bool pipeSim = (pipelineMode == "sim");
+  uint16_t pCol = (pipeSim || !pipelinePressureOk) ? C_SIM : C_REAL;
+  uint16_t fCol = (pipeSim || !pipelineFlowOk)     ? C_SIM : C_REAL;
+
+  // Dos tarjetas anchas: presión (izquierda) | caudal (derecha)
+  // 240px - 2px borde - 2px borde - 2px separación = 234px → 117px cada zona
+  int cY = HDR_H + 2;
+  int cH = 88;
+
+  // ── Tarjeta PRESION ────────────────────────────────────────────────────────
+  spr.fillRoundRect(  1, cY, 115, cH, 4, C_CARD);
+  spr.drawRoundRect(  0, cY, 117, cH, 4, C_BORDER);
+  spr.fillRoundRect(  1, cY, 115,  3, 2, pCol);
+
+  iconGauge(14, cY + 14, pCol);
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("PRESION", 28, cY + 6, 1);
+
+  spr.setTextColor(C_TEXT, C_CARD);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.2f", sim_pipeline_pressure);
+  spr.drawString(buf, 6, cY + 22, 4);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("bar", 6, cY + cH - 14, 1);
+  spr.setTextColor(pCol, C_CARD);
+  spr.drawRightString(pipeSim || !pipelinePressureOk ? "[SIM]" : "[OK]",
+                      113, cY + cH - 14, 1);
+
+  // ── Tarjeta CAUDAL ─────────────────────────────────────────────────────────
+  spr.fillRoundRect(122, cY, 116, cH, 4, C_CARD);
+  spr.drawRoundRect(121, cY, 118, cH, 4, C_BORDER);
+  spr.fillRoundRect(122, cY, 116,  3, 2, fCol);
+
+  iconDrop(134, cY + 14, fCol);
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("CAUDAL", 148, cY + 6, 1);
+
+  spr.setTextColor(C_TEXT, C_CARD);
+  snprintf(buf, sizeof(buf), "%.2f", sim_pipeline_flow);
+  spr.drawString(buf, 126, cY + 22, 4);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("L/min", 126, cY + cH - 14, 1);
+  spr.setTextColor(fCol, C_CARD);
+  spr.drawRightString(pipeSim || !pipelineFlowOk ? "[SIM]" : "[OK]",
+                      237, cY + cH - 14, 1);
+
+  // ── Franja inferior: modo + escenario ─────────────────────────────────────
+  int bY = cY + cH + 3;
+  int bH = 135 - bY;
+  spr.fillRoundRect(0, bY, 240, bH, 3, C_CARD);
+
+  uint16_t modeCol = pipeSim ? C_SIM : C_REAL;
+  spr.setTextColor(modeCol, C_CARD);
+  spr.drawCentreString(
+    pipeSim ? "MODO: SIMULADO" : "MODO: REAL",
+    120, bY + 2, 1);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("Escenario:", 6, bY + 14, 1);
+  spr.setTextColor(C_TEXT, C_CARD);
+  spr.drawString(pipelineScenario.c_str(), 68, bY + 14, 1);
 
   spr.pushSprite(0, 0);
 }
@@ -2477,14 +2574,31 @@ void loop() {
   unsigned long now = millis();
 
 #ifdef HAS_DISPLAY
-  // Botones — cualquiera enciende la pantalla y resetea el timer
-  if (!digitalRead(BTN_LEFT) || !digitalRead(BTN_RIGHT)) {
+  // Botones — detección de flanco para cambiar vista sin rebote
+  static bool prevBtnLeft  = true;
+  static bool prevBtnRight = true;
+  bool curBtnLeft  = digitalRead(BTN_LEFT);
+  bool curBtnRight = digitalRead(BTN_RIGHT);
+
+  // Cualquier botón enciende la pantalla y resetea el timer
+  if (!curBtnLeft || !curBtnRight) {
     if (!displayOn) {
       digitalWrite(TFT_BL, HIGH);
       displayOn = true;
     }
     lastActivityTime = now;
   }
+
+  // BTN_LEFT o BTN_RIGHT: flanco descendente con pantalla ya encendida → cambiar vista
+  bool leftEdge  = (!curBtnLeft  && prevBtnLeft);
+  bool rightEdge = (!curBtnRight && prevBtnRight);
+  if (displayOn && (leftEdge || rightEdge)) {
+    displayView = (displayView == 0) ? 1 : 0;
+  }
+
+  prevBtnLeft  = curBtnLeft;
+  prevBtnRight = curBtnRight;
+
   // Timeout — apagar pantalla tras el tiempo configurado sin actividad
   if (displayTimeoutMs > 0 && displayOn && (now - lastActivityTime >= displayTimeoutMs)) {
     digitalWrite(TFT_BL, LOW);
@@ -2774,7 +2888,8 @@ void loop() {
   // ── 3. Refresco de pantalla (cada SCREEN_MS = 1s, solo si hay display) ────────
 #ifdef HAS_DISPLAY
   if (now - lastScreenTime >= SCREEN_MS) {
-    drawScreen();
+    if (displayView == 1) drawPipelineScreen();
+    else                  drawScreen();
     lastScreenTime = now;
   }
 #endif

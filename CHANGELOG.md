@@ -15,9 +15,11 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 - **Modo debug configurable** desde el Flash Tool GUI: nueva casilla "🐛 Debug (serie)" que inyecta `-DDEBUG_MODE=1` al compilar. Sin la casilla, toda la salida serie queda silenciada en producción.
 - Macros `DLOGF` / `DLOGLN` / `DLOG` que mapean a `Serial.printf/println/print` cuando `DEBUG_MODE` está definido y son no-ops en caso contrario. Todos los `Serial.printf/println/print` del sketch sustituidos por las macros.
 - El Flash Tool GUI invalida la caché del binario automáticamente al cambiar la casilla de debug, y registra en `build_meta.json` si el binario fue compilado en modo debug o release.
+- **Vista pipeline en pantalla TFT (`PROFILE_METEO`)**: pulsando BTN_LEFT o BTN_RIGHT con la pantalla ya encendida se alterna entre la vista meteorológica y una nueva vista de agua que muestra `pipeline_pressure` (bar) y `pipeline_flow` (L/min). Si el modo pipeline es `"sim"`, los valores se muestran en naranja (`C_SIM`) con badge `[SIM]`, igual que el resto de sensores sin hardware real. Puntos de paginación en la cabecera indican la vista activa.
 
 ### Cambiado
 - `Serial.begin(115200)` siempre activo (necesario para OTA y monitor de arranque); el resto de salida serie queda gateado por `DEBUG_MODE`.
+- Lógica de botones en `loop()` reescrita con detección de flanco (rising/falling edge) para evitar cambios de vista repetidos por bounce.
 
 ---
 
