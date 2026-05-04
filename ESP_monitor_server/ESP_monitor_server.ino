@@ -80,8 +80,10 @@
   #define XDB401_ADDR_PRIMARY   0x6D   // dirección principal (datasheet)
   #define XDB401_ADDR_ALT       0x7F   // dirección alternativa (algunos lotes)
   #ifndef XDB401_FULLSCALE_KPA
-    #define XDB401_FULLSCALE_KPA 1000.0f  // kPa fondo de escala — ajustar según modelo:
-    //   0-10 bar → 1000 kPa  |  0-4 bar → 400 kPa  |  0-40 bar → 4000 kPa
+    #define XDB401_FULLSCALE_KPA 400.0f   // kPa fondo de escala — ajustar según modelo:
+    //   0-4 bar (más común en riego) → 400 kPa
+    //   0-10 bar                    → 1000 kPa
+    //   0-40 bar                    → 4000 kPa
   #endif
   // Frecuencia I2C recomendada: 100 kHz (modo standard).
   // Algunos ejemplares fallan a 400 kHz — setClock() se aplica al init.
@@ -496,7 +498,9 @@ static uint8_t _xdb401_rawread(uint8_t* d, uint8_t n) {
 }
 
 // Detecta el sensor y el modo de operación (continuo o triggered).
-// Algunos lotes XGZP6847D miden en continuo; otros necesitan trigger 0x30=0x0A.
+// Criterio de presencia: ACK en la dirección I2C.
+// El sensor puede tardar varios ciclos en dar datos —
+// la validación de datos ocurre en xdb401_read(), no aquí.
 static bool xdb401_begin() {
   const uint8_t candidates[] = { XDB401_ADDR_PRIMARY, XDB401_ADDR_ALT };
   for (uint8_t addr : candidates) {
@@ -504,7 +508,7 @@ static bool xdb401_begin() {
     if (Wire.endTransmission() != 0) continue;
     _xdb401_addr = addr;
 
-    // — Probar modo CONTINUO: leer sin trigger —
+    // Probar modo CONTINUO: leer sin trigger y ver si hay datos no-cero
     uint8_t d[5] = {};
     delay(10);
     if (_xdb401_rawread(d, 5) == 5) {
@@ -516,25 +520,11 @@ static bool xdb401_begin() {
       }
     }
 
-    // — Probar modo TRIGGERED: write 0x30=0x0A, esperar 100 ms —
-    Wire.beginTransmission(addr);
-    Wire.write(0x30);
-    Wire.write(0x0A);
-    if (Wire.endTransmission() == 0) {
-      delay(100);
-      memset(d, 0, 5);
-      if (_xdb401_rawread(d, 5) == 5) {
-        bool nonzero = d[0]||d[1]||d[2]||d[3]||d[4];
-        if (nonzero) {
-          _xdb401_continuous = false;
-          DLOGF("[XDB401] Detectado en 0x%02X (modo TRIGGERED)\n", addr);
-          return true;
-        }
-      }
-    }
-
-    DLOGF("[XDB401] 0x%02X ACK pero sin datos — ignorado\n", addr);
-    _xdb401_addr = 0;
+    // Modo TRIGGERED (default XGZP6847D): sensor presente aunque aún no tenga datos.
+    // xdb401_read() esperará la conversión completa con delay de 100ms.
+    _xdb401_continuous = false;
+    DLOGF("[XDB401] Detectado en 0x%02X (modo TRIGGERED — datos disponibles tras primer ciclo)\n", addr);
+    return true;
   }
   _xdb401_addr = 0;
   return false;
