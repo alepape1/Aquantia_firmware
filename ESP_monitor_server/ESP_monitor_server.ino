@@ -77,16 +77,7 @@
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 
   // Sensor presión tubería I2C (familia XGZP6847D / XDB401 digital)
-  #define XDB401_ADDR_PRIMARY   0x6D   // dirección principal (datasheet)
-  #define XDB401_ADDR_ALT       0x7F   // dirección alternativa (algunos lotes)
-  #ifndef XDB401_FULLSCALE_KPA
-    #define XDB401_FULLSCALE_KPA 400.0f   // kPa fondo de escala — ajustar según modelo:
-    //   0-4 bar (más común en riego) → 400 kPa
-    //   0-10 bar                    → 1000 kPa
-    //   0-40 bar                    → 4000 kPa
-  #endif
-  // Frecuencia I2C recomendada: 100 kHz (modo standard).
-  // Algunos ejemplares fallan a 400 kHz — setClock() se aplica al init.
+  // Configuración en pressure_sensor_i2c.h: PRESSURE_SENSOR_I2C_ADDR y PRESSURE_SENSOR_FULLSCALE
 #endif
 
 // ── Pipeline — constantes físicas del simulador ───────────────────────────────
@@ -462,157 +453,64 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 
 // =============================================================================
 // Sensor presión tubería I2C — familia XGZP6847D / XDB401 digital
-// Compatible con cualquier sensor chino que use el mismo protocolo.
+// Driver: pressure_sensor_i2c (pressure_sensor_i2c.h / .cpp)
 //
-// Protocolo (datasheet XGZP6847D):
-//   1. Trigger: I2C Write 0x6D → reg 0x30 = 0x0A  (inicia conversión P+T)
-//   2. Esperar 50 ms (tiempo de conversión)
-//   3. Read 5 bytes desde el sensor:
-//        Bytes 0-2 (reg 0x06,0x07,0x08): presión  24 bits unsigned
-//        Bytes 3-4 (reg 0x09,0x0A):     temperatura 16 bits unsigned (con signo)
+// Protocolo verificado desde datasheet físico (XGZP6847D):
+//   1. Trigger: escribir 0x30 en registro 0x0A → inicia adquisición P+T
+//   2. Polling registro 0x30 hasta bit 3 (Sco) = 0 (conversión completa)
+//   3. Delay adicional ~50ms (datasheet)
+//   4. Leer presión: 3 bytes desde reg 0x06 (24-bit big-endian, complemento a 2 en bit 23)
+//   5. Leer temperatura: 2 bytes desde reg 0x09 (16-bit big-endian, complemento a 2 en bit 15)
 //
-// Cálculo presión (24 bits con signo en bit 23):
-//   raw_p > 2^23 → valor_real = raw_p − 2^24
-//   P_kPa = valor_real × FULLSCALE_KPA / 8388608
-//   P_bar = P_kPa / 100
-//
-// Cálculo temperatura (16 bits con signo en bit 15):
-//   raw_t > 2^15 → T = (raw_t − 65536) / 256.0
-//   Si no         T = raw_t / 256.0
-//
-// Dirección I2C: 0x6D principal; 0x7F en algunos lotes (autodetectado).
-// Frecuencia I2C: 100 kHz (400 kHz puede fallar en algunos ejemplares).
+// Dirección I2C: PRESSURE_SENSOR_I2C_ADDR (0x6D para hardware Aquantia).
+// Frecuencia I2C: 100 kHz.
+// NOTA: si el sensor responde en 0x7F (lote alternativo), cambiar
+//       PRESSURE_SENSOR_I2C_ADDR en pressure_sensor_i2c.h y reflashear.
 // =============================================================================
 
 #ifndef ESP8266
-static uint8_t _xdb401_addr        = 0;      // dirección detectada al inicio
-static bool    _xdb401_continuous  = false;  // true = modo continuo (sin trigger)
+#include "pressure_sensor_i2c.h"
 
-// Lee 5 bytes desde el registro 0x06 (presión MSB) usando repeated-start.
-// El XGZP6847D requiere apuntar al registro antes de leer — requestFrom directo
-// retorna datos del registro 0x00 que siempre vale 0.
-static uint8_t _xdb401_rawread(uint8_t* d, uint8_t n) {
-  // Apuntar al registro 0x06 (presión MSB) con repeated-start
-  Wire.beginTransmission(_xdb401_addr);
-  Wire.write(0x06);
-  Wire.endTransmission(false);  // repeated start — no liberar el bus
-  uint8_t recv = Wire.requestFrom((uint8_t)_xdb401_addr, n, (uint8_t)1);
-  for (uint8_t i = 0; i < recv && i < n; i++) d[i] = Wire.read();
-  while (Wire.available()) Wire.read();
-  return recv;
-}
-
-// Detecta el sensor y el modo de operación (continuo o triggered).
-// Criterio de presencia: ACK en la dirección I2C.
-// El sensor puede tardar varios ciclos en dar datos —
-// la validación de datos ocurre en xdb401_read(), no aquí.
+// Detecta el sensor en el bus I2C ya inicializado por setup().
+// Wire.begin(I2C_SDA, I2C_SCL) se llama antes — aquí solo forzamos 100 kHz
+// y verificamos ACK en PRESSURE_SENSOR_I2C_ADDR.
 static bool xdb401_begin() {
-  const uint8_t candidates[] = { XDB401_ADDR_PRIMARY, XDB401_ADDR_ALT };
-  for (uint8_t addr : candidates) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() != 0) continue;
-    _xdb401_addr = addr;
-
-    // Probar modo CONTINUO: leer sin trigger y ver si hay datos no-cero
-    uint8_t d[5] = {};
-    delay(10);
-    if (_xdb401_rawread(d, 5) == 5) {
-      bool nonzero = d[0]||d[1]||d[2]||d[3]||d[4];
-      if (nonzero) {
-        _xdb401_continuous = true;
-        DLOGF("[XDB401] Detectado en 0x%02X (modo CONTINUO)\n", addr);
-        return true;
-      }
-    }
-
-    // Modo TRIGGERED (default XGZP6847D): sensor presente aunque aún no tenga datos.
-    // xdb401_read() esperará la conversión completa con delay de 100ms.
-    _xdb401_continuous = false;
-    DLOGF("[XDB401] Detectado en 0x%02X (modo TRIGGERED — datos disponibles tras primer ciclo)\n", addr);
-    return true;
+  Wire.setClock(100000);  // forzar 100 kHz — algunos ejemplares fallan a 400 kHz
+  bool found = pressureSensor_isPresent();
+  if (found) {
+    DLOGF("[XDB401] Detectado en 0x%02X\n", PRESSURE_SENSOR_I2C_ADDR);
   }
-  _xdb401_addr = 0;
-  return false;
+  return found;
 }
 
-// Lee presión y temperatura vía parámetros de salida.
+// Lee presión (bar) y temperatura (°C) usando el driver pressure_sensor_i2c.
 // Devuelve true si la lectura es válida; pressureBar y temperatureC = NAN si falla.
 static bool xdb401_read(float& pressureBar, float& temperatureC) {
   pressureBar  = NAN;
   temperatureC = NAN;
-  if (_xdb401_addr == 0) return false;
 
-  uint8_t d[5] = {};
-
-  if (_xdb401_continuous) {
-    // Modo continuo: leer directamente sin trigger
-    if (_xdb401_rawread(d, 5) < 5) {
-      DLOGLN("[XDB401] Read FAIL (continuo)");
-      return false;
-    }
-  } else {
-    // Modo triggered: write 0x30=0x0A → esperar 100 ms → leer
-    Wire.beginTransmission(_xdb401_addr);
-    Wire.write(0x30);
-    Wire.write(0x0A);
-    uint8_t err = Wire.endTransmission();
-    if (err != 0) {
-      DLOGF("[XDB401] Trigger FAIL endTransmission=%d\n", err);
-      if (err == 4) {
-        // Bus bloqueado — intentar recuperación
-        Wire.end();
-        delay(10);
-        Wire.begin(I2C_SDA, I2C_SCL);
-        Wire.setClock(100000);  // restaurar 100 kHz tras reinit
-        Wire.beginTransmission(_xdb401_addr);
-        if (Wire.endTransmission() != 0) {
-          DLOGLN("[XDB401] Bus no recuperado — marcando sensor como perdido");
-          _xdb401_addr = 0;
-          xdb401_ok = false;
-        } else {
-          DLOGLN("[XDB401] Bus recuperado");
-        }
-      }
-      return false;
-    }
-    delay(100);  // ESPEasy P177: ~100ms para conversión completa (50ms era insuficiente)
-    if (_xdb401_rawread(d, 5) < 5) {
-      DLOGLN("[XDB401] Read FAIL (triggered — bytes insuficientes)");
-      return false;
-    }
-  }
-
-  DLOGF("[XDB401] Raw bytes: %02X %02X %02X %02X %02X\n", d[0],d[1],d[2],d[3],d[4]);
-
-  // Rechazar trama de todos ceros — sensor no inicializado o sin datos
-  if (d[0]==0 && d[1]==0 && d[2]==0 && d[3]==0 && d[4]==0) {
-    DLOGLN("[XDB401] Trama todo ceros — lectura descartada");
+  PressureSensorData_t data;
+  if (!pressureSensor_read(&data) || !data.valid) {
+    DLOGLN("[XDB401] Read FAIL");
     return false;
   }
 
-  // Presión — 24 bits con signo en bit 23
-  int32_t raw_p = (int32_t)d[0] * 65536L + (int32_t)d[1] * 256L + d[2];
-  if (raw_p > 8388608L) raw_p -= 16777216L;
-  float pb = (float)raw_p * (XDB401_FULLSCALE_KPA / 8388608.0f) / 100.0f;
+  float pb = data.pressure_kpa / 100.0f;  // kPa → bar
+  float tc = data.temperature_c;
 
-  // Temperatura — 16 bits unsigned con offset fijo de +10°C (verificado con ESPEasy P177)
-  // Fórmula datasheet estándar da T = raw/256; este lote de sensores requiere raw/256 + 10
-  uint16_t raw_t = (uint16_t)d[3] * 256U + d[4];
-  float tc = (float)raw_t / 256.0f + 10.0f;
-
-  DLOGF("[XDB401] raw_p=%d  raw_t=%u  modo=%s\n",
-        (int)raw_p, (unsigned)raw_t, _xdb401_continuous ? "continuo" : "triggered");
   DLOGF("[XDB401] Presion=%.3f bar  Temp=%.1f C\n", pb, tc);
 
-  // Validar rangos razonables
-  float fs_bar = XDB401_FULLSCALE_KPA / 100.0f;
+  float fs_bar = PRESSURE_SENSOR_FULLSCALE / 100.0f;
   bool ok = (pb >= -0.5f && pb <= fs_bar * 1.05f
              && tc > -10.0f && tc < 125.0f);
   if (!ok) {
     DLOGF("[XDB401] Validacion FAIL — pb=%.3f bar (max=%.1f) tc=%.1f C\n", pb, fs_bar, tc);
+    return false;
   }
-  if (ok) { pressureBar = pb; temperatureC = tc; }
-  return ok;
+
+  pressureBar  = pb;
+  temperatureC = tc;
+  return true;
 }
 
 // Wrapper conveniente: solo presión en bar (NAN si falla).

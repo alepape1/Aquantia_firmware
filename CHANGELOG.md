@@ -9,7 +9,15 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
-## [Unreleased] — feature/xdb401-pressure
+## [Unreleased] — feature/agrometeo-profile
+
+### Cambiado
+- **Driver XDB401 reemplazado por librería `pressure_sensor_i2c`** (`pressure_sensor_i2c.h` / `.cpp`):
+  - Corregido el trigger I2C invertido: el sketch escribía `0x0A` en registro `0x30`; el protocolo correcto (datasheet) es escribir `0x30` en registro `0x0A`. Éste era el origen de las lecturas incorrectas de presión.
+  - El polling activo del bit Sco (reg `0x30`, bit 3) reemplaza el delay fijo de 100ms — más robusto ante variaciones en el tiempo de conversión.
+  - La conversión de temperatura usa la fórmula pura del datasheet (`raw/256`) sin offset empírico; verificar en hardware si el offset de +10°C sigue siendo necesario.
+  - Las constantes `XDB401_ADDR_PRIMARY`, `XDB401_ADDR_ALT` y `XDB401_FULLSCALE_KPA` eliminadas del sketch; toda la configuración queda centralizada en `pressure_sensor_i2c.h` (`PRESSURE_SENSOR_I2C_ADDR = 0x6D`, `PRESSURE_SENSOR_FULLSCALE = 400.0f`).
+  - La API interna del sketch (`xdb401_begin`, `xdb401_read`, `xdb401_readPressureBar`) se mantiene como wrappers finos sobre la librería — sin cambios en el resto del sketch.
 
 ### Añadido
 - **Umbrales de alerta de presión** como `#define` en la sección de constantes pipeline:
