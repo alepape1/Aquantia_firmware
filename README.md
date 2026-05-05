@@ -14,6 +14,7 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 - [Librerías necesarias](#librerías-necesarias)
 - [secrets.h — modo DEV](#secretsh--modo-dev)
 - [Arquitectura del firmware](#arquitectura-del-firmware)
+- [Timings de lectura de sensores](#timings-de-lectura-de-sensores)
 - [Modo MQTT](#modo-mqtt)
 - [Modo HTTP legacy](#modo-http-legacy)
 - [Relay y electroválvulas](#relay-y-electroválvulas)
@@ -254,6 +255,50 @@ Al arrancar una actualización OTA:
 - `networkTask` deja de enviar datos
 - Todos los relays pasan a OFF (HIGH)
 - Core 1 (sensores/pantalla) sigue funcionando
+
+---
+
+## Timings de lectura de sensores
+
+Todos los intervalos son constantes de compilación definidas al inicio de `ESP_monitor_server.ino`. `telemetryIntervalMs` es el único ajustable en tiempo de ejecución vía MQTT/HTTP (valor por defecto 20 s).
+
+### Tabla de ciclos
+
+| Intervalo | Constante | Core | Qué ocurre | Perfiles |
+|----------:|-----------|:----:|-----------|:--------:|
+| **100 ms** | `WIND_MS` | 1 | Lee ADC anemómetro (GPIO 36) → `windSpeed`; ADC veleta → `windDirection`; acumula vector para promedio | METEO |
+| **500 ms** | `PIPELINE_FAST_MS` | 1 | Lee XDB401 (presión + temperatura agua) y caudalímetro → actualiza display y detector de fugas. **Solo activo cuando `pipeline_mode = real`** | Todos |
+| **1 s** | `SCREEN_MS` | 1 | Refresca pantalla TFT (doble buffer, sin parpadeo) | METEO |
+| **2 s** | `RELAY_MS` | 0 | `GET /api/relay/command` — solo modo HTTP legacy | Todos |
+| **5 s** | `DEBUG_INTERVAL_MS` | 1 | Imprime reporte completo de estado por Serial — **solo con `DEBUG_MODE` activo** | Todos |
+| **20 s** \* | `telemetryIntervalMs` | 1 → 0 | Lee todos los sensores I2C + ADC suelo → construye `TelemetrySnapshot` → Core 0 envía MQTT o HTTP | Todos |
+| **20 s** | `PIPELINE_SYNC_MS` | 0 | Sincroniza config pipeline (`pipeline_mode`, escenario) desde el servidor | Todos |
+| **30 s** | `XDB401_RETRY_INTERVAL` | 1 | Reintenta `xdb401_begin()` tras 5 fallos consecutivos de lectura | Todos |
+| **60 s** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones | METEO |
+
+\* `telemetryIntervalMs` puede modificarse en tiempo de ejecución mediante MQTT (`telemetry_interval_s`) o HTTP `/api/pipeline/config`. El valor por defecto (y el usado para sincronizar las lecturas I2C) es **20 s**.
+
+### Sensores leídos en el ciclo de 20 s (por perfil)
+
+| Sensor | Magnitudes | METEO | IRRIGATION | AGROMETEO |
+|--------|-----------|:-----:|:----------:|:---------:|
+| **MCP9808** | Temperatura exterior | ✓ | — | — |
+| **HTU2x** | Temperatura + humedad | ✓ | — | — |
+| **DHT11** | Temperatura + humedad (secundario) | ✓ | — | — |
+| **HDC1080** | Temperatura + humedad | — | — | ✓ |
+| **MicroPressure** | Presión atmosférica (principal) | ✓ | — | ✓ |
+| **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | — | ✓ |
+| **TSL2584 / APDS-9930** | Iluminancia | ✓ | — | — |
+| **BH1750** | Iluminancia | — | — | ✓ |
+| **YL-69** (ADC) | Humedad suelo | ✓ | — | — |
+| **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ (sync) | ✓ (sync) | ✓ (sync) |
+| **Caudalímetro** (pulsos) | Caudal L/min | ✓ (sync) | ✓ (sync) | — |
+
+> El XDB401 y el caudalímetro se leen **también cada 500 ms** (ciclo rápido) cuando `pipeline_mode = real`. En el ciclo de 20 s se sincronizan sus valores al snapshot de telemetría.
+
+### Fallback y simulación
+
+Si un sensor no responde al arrancar (o acumula 5 errores consecutivos), el firmware sustituye su lectura por un valor simulado que deriva suavemente. El sensor vuelve a intentar reinicializarse en el siguiente ciclo de 20 s (o cada 30 s en el caso del XDB401). El campo `*_source` del payload indica si el valor es real o simulado (`"SIM"`).
 
 ---
 

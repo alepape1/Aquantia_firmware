@@ -486,7 +486,12 @@ static bool xdb401_read(float& pressureBar, float& temperatureC) {
   float pb = data.pressure_kpa / 100.0f;  // kPa → bar
   float tc = data.temperature_c;
 
-  DLOGF("[XDB401] Presion=%.3f bar  Temp=%.1f C\n", pb, tc);
+  static unsigned long _lastXdbPrint = 0;
+  unsigned long _now = millis();
+  if (_now - _lastXdbPrint >= DEBUG_INTERVAL_MS) {
+    _lastXdbPrint = _now;
+    DLOGF("[XDB401] Presion=%.3f bar  Temp=%.1f C\n", pb, tc);
+  }
 
   float fs_bar = PRESSURE_SENSOR_FULLSCALE / 100.0f;
   bool ok = (pb >= -0.5f && pb <= fs_bar * 1.05f
