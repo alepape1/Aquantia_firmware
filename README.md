@@ -35,9 +35,9 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 
 | Perfil | `DEVICE_PROFILE` | Hardware | Relays | Pantalla | Sensores meteo |
 |--------|:----------------:|----------|:------:|:--------:|:--------------:|
-| **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí |
+| **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
 | **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | No |
-| **AGROMETEO** | 3 | Wemos D1 Mini ESP32 / CJMCU-14 | Sin relays | No | Sí (BH1750+HDC1080+BMP280) |
+| **AGROMETEO** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | Sin relays | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
 
 Pinout completo de cada perfil: [PINOUT.md](PINOUT.md)
 
@@ -150,6 +150,8 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | `DHTesp` | beegee-tokyo | METEO | DHT11 |
 | `BH1750` | claws | AGROMETEO | Iluminancia |
 | `SparkFun Qwiic Power Switch Library` | SparkFun | AGROMETEO | PCA9536 — alimenta el bus I2C |
+
+> **Nota:** El perfil AGROMETEO no incluye relays ni pantalla. Los parámetros `dew_point`, `heat_index` y `abs_humidity` se calculan en firmware y se publican en telemetría MQTT cuando `DEVICE_PROFILE = PROFILE_AGROMETEO`.
 | `ArduinoJson` | Benoit Blanchon | Todos | Payloads JSON |
 | `PubSubClient` | knolleary | Todos (MQTT) | Cliente MQTT |
 
@@ -225,23 +227,27 @@ El motivo es que en PROD el broker identifica cada dispositivo **por su MAC** y 
 
 ```
 Core 1 — loop()
- ├─ Cada 100ms  → Leer ADC anemómetro/veleta (METEO)
- │               Acumular vector de viento para promedio vectorial
- ├─ Cada 20s    → Leer I2C: MCP9808, HTU2x, barómetro, luz (METEO)
- │               Leer ADC YL-69 humedad suelo (METEO)
- │               Construir TelemetrySnapshot → xQueueOverwrite (sin bloqueo)
- │               Actualizar pantalla TFT (METEO)
- └─ Siempre     → Gestionar botones y timeout de pantalla (METEO)
+ ├─ Cada 100ms   → Leer ADC anemómetro/veleta (METEO)
+ │                Acumular vector de viento para promedio vectorial
+ ├─ Cada 500ms   → [solo pipeline_mode=real] Leer XDB401 + caudalímetro
+ │                Actualizar display y LeakDetector sin enviar a backend
+ ├─ Cada 20s*    → Leer I2C: sensores meteo según perfil
+ │                Calcular parámetros agrometeorológicos (AGROMETEO)
+ │                Construir TelemetrySnapshot → xQueueOverwrite (sin bloqueo)
+ │                Actualizar pantalla TFT (METEO)
+ └─ Siempre      → Gestionar botones y timeout de pantalla (METEO)
 
 Core 0 — networkTask()  [prioridad 2, watchdog 30s]
- ├─ Cada ~10ms  → ArduinoOTA.handle()  ← nunca bloqueado
- ├─ Al arrancar → [HTTP] POST /api/device_info
- │                [MQTT] mqttConnect() + publish register
- ├─ Continuo    → [MQTT] mqttClient.loop()  ← recibe comandos relay
- ├─ Cada 2s     → [HTTP] GET /api/relay/command → actuar relays + ack
- └─ Cada 20s    → xQueuePeek (sin bloqueo) → envío telemetría
-                  [HTTP] CSV → POST /send_message
-                  [MQTT] JSON → publish aquantia/<finca_id>/telemetry
+ ├─ Cada ~10ms   → ArduinoOTA.handle()  ← nunca bloqueado
+ ├─ Al arrancar  → [HTTP] POST /api/device_info
+ │                 [MQTT] mqttConnect() + publish register
+ ├─ Continuo     → [MQTT] mqttClient.loop()  ← recibe comandos relay
+ ├─ Cada 2s      → [HTTP] GET /api/relay/command → actuar relays + ack
+ └─ Cada 20s*    → xQueuePeek (sin bloqueo) → envío telemetría
+                   [HTTP] CSV → POST /send_message
+                   [MQTT] JSON → publish aquantia/<finca_id>/telemetry
+
+* telemetryIntervalMs ajustable en runtime vía MQTT / HTTP /api/pipeline/config
 ```
 
 Sincronización entre cores:
@@ -646,12 +652,49 @@ La beta.2 deja preparada la transición al caudalímetro real:
 
 ---
 
+## Detector automático de fugas (LeakDetector)
+
+Clase `LeakDetector` en `LeakDetector.h`. Recibe muestras de presión y caudal cada 500 ms y clasifica el estado de la tubería en tiempo real.
+
+### Algoritmo
+
+1. **Warm-up** (20 muestras con válvula abierta): aprende el baseline de presión y caudal mediante EMA sin disparar alertas. Telemetría muestra `leak_detect_trained: false` hasta completar el entrenamiento.
+2. **Detección activa** una vez entrenado:
+   - **Válvula cerrada**: cualquier caudal > `leak_idle_threshold_lpm` durante 3 muestras consecutivas → `"leak"`
+   - **Válvula abierta**: caída de presión ≥ `burst_pressure_drop_pct` → `"burst"` / exceso de caudal ≥ `leak_on_deviation_pct` → `"leak"` / caída de caudal ≥ `obstruction_flow_drop_pct` → `"obstruction"`
+3. **Normal** en el resto de casos: actualiza EMA con la muestra nueva.
+
+### Perfiles de riego predefinidos
+
+| Perfil | `irrigation_type` | Presión nominal | Caudal nominal |
+|--------|:-----------------:|:---------------:|:--------------:|
+| Aspersión (defecto) | `sprinkler` | 2.80 bar | 5.00 L/min |
+| Goteo | `drip` | 1.50 bar | 2.00 L/min |
+| Cinta de goteo | `drip_tape` | 0.80 bar | 0.80 L/min |
+| Microaspersión | `micro_sprinkler` | 2.20 bar | 3.50 L/min |
+
+El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`. El detector reinicia su baseline al cambiar de perfil.
+
+### Campos de telemetría del detector
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `pipeline_scenario` | string | `normal` / `leak` / `burst` / `obstruction` |
+| `leak_detect_trained` | bool | `true` cuando el baseline EMA está entrenado |
+| `pipeline_pressure_ok` | bool | Sensor de presión real activo |
+| `pipeline_flow_ok` | bool | Caudalímetro real activo |
+| `pipeline_source` | string | `real` / `sim` / `fallback` |
+
+---
+
 ## Problemas conocidos
 
 | Problema | Estado |
-|----------|---------|
+|----------|--------|
 | DHT11 lecturas inestables ocasionalmente | Conocido — valorar reemplazar por DHT22 o SHT31 |
 | Temperatura agua XDB401 puede reflejar T ambiente si la tubería está seca | Esperado — documentar en dashboard |
+| `pipelineMode` / `pipelineScenario` leídos en Core 1 sin mutex (eventual-consistent) | Pendiente fix en rama `fix/stability-low-cost` |
+| LeakDetector dispara burst/obstruction con 1 sola muestra (sin ventana de confirmación) | Pendiente fix en rama `fix/stability-low-cost` |
 
 ---
 
