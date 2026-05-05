@@ -11,7 +11,22 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased] — feat/firmware-stability-phase1
 
+### Herramientas
+- **Flash Tool (`flasher_gui.py`) — compilación incremental real:**
+  - Añadida constante `BUILD_CACHE_DIR` (`%TEMP%/aquantia_cache`) separada de `BUILD_DIR`.
+  - `--build-cache-path BUILD_CACHE_DIR` pasado a `arduino-cli compile`: arduino-cli cachea los `.o` de librerías entre compilaciones; sólo recompila los archivos que cambiaron.
+  - Eliminado el `shutil.rmtree(BUILD_DIR)` que se ejecutaba antes de cada compilación y destruía todos los objetos intermedios, forzando una compilación completa (~3-5 min) cada vez.
+  - El botón "Limpiar build" limpia ahora ambas carpetas (`BUILD_DIR` y `BUILD_CACHE_DIR`).
+  - La primera compilación sigue siendo completa; las siguientes (mismo perfil, misma placa) son incrementales y solo recompilan los archivos modificados (~20-40 s típico).
+
+
+
 ### Añadido
+- **Muestreo rápido de caudalímetro y sensor de presión XDB401** (`PIPELINE_FAST_MS = 500 ms`):
+  - Nuevo bloque en `loop()` (paso 2b) que llama a `readRealPipelineSensors()` cada 500 ms cuando `pipelineMode == "real"`, independiente del intervalo de telemetría (`telemetryIntervalMs`).
+  - Actualiza `sim_pipeline_pressure` y `sim_pipeline_flow` para que la pantalla TFT refleje el estado real en cada ciclo de 1 s, en vez de esperar el ciclo de telemetría completo (que puede ser 20-30 s).
+  - Permite detectar fugas y roturas de tubería con tiempo de reacción visual de ≤ 1 s sin incrementar la carga de envío al servidor.
+  - `readRealPipelineSensors()` ya tiene debounce interno de 500 ms: si el bloque rápido cumple el intervalo antes que la telemetría normal, la telemetría devolverá el último valor cacheado, sin solapamiento ni doble conteo de pulsos.
 - **Watchdog de aplicación en `networkTask`** (`esp_task_wdt`, timeout 30s, reset en pánico):
   - Si `networkTask` se bloquea (handshake TLS colgado, broker con TCP half-open, etc.) el ESP32 hace reset automático sin intervención humana.
   - `esp_task_wdt_reset()` se llama al inicio de cada iteración del bucle.
