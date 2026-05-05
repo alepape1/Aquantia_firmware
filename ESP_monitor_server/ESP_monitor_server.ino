@@ -34,38 +34,38 @@
   #define DLOG(msg)        do {} while(0)
 #endif
 
-// ── Detección de plataforma ───────────────────────────────────────────────────
-  #include "WiFi.h"
-  #include <HTTPClient.h>
-  #include <WiFiClientSecure.h>
-  #include <ArduinoOTA.h>
-  #include "driver/rtc_io.h"
-  #include "esp_task_wdt.h"
-  #define I2C_SDA        21
-  #define I2C_SCL        22
-  #define DHTPIN           15
-  #define ADC_VOLTAGE_REF  3.41f
-  #define ADC_RANGE        4096.0f
-  #define ANEMOMETER_PIN   36
-  #define VANE_PIN         37
-  #if DEVICE_PROFILE == PROFILE_METEO
-    #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
-    #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
-    #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
-    #define FLOW_PIN         32   // Caudalímetro — pulsos digitales vía BC547 NPN (señal invertida, activo LOW)
-    // K factor según modelo:
-    //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
-    //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
-    //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
-    #define FLOW_K_FACTOR   288   // YF-B9 — ajustar con medición real si es necesario
-  #endif
-  #if DEVICE_PROFILE == PROFILE_METEO
-    #define HAS_DISPLAY
-  #endif
-  #define RELAY_PIN        26   // GPIO libre para relay electroválvula
+// ── Plataforma: ESP32 ─────────────────────────────────────────────────────────
+#include "WiFi.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoOTA.h>
+#include "driver/rtc_io.h"
+#include "esp_task_wdt.h"
+#define I2C_SDA        21
+#define I2C_SCL        22
+#define DHTPIN           15
+#define ADC_VOLTAGE_REF  3.41f
+#define ADC_RANGE        4096.0f
+#define ANEMOMETER_PIN   36
+#define VANE_PIN         37
+#if DEVICE_PROFILE == PROFILE_METEO
+  #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
+  #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
+  #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
+  #define FLOW_PIN         32   // Caudalímetro — pulsos digitales vía BC547 NPN (señal invertida, activo LOW)
+  // K factor según modelo:
+  //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
+  //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
+  //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
+  #define FLOW_K_FACTOR   240   // YF-B4 — ajustar con medición real si es necesario
+#endif
+#if DEVICE_PROFILE == PROFILE_METEO
+  #define HAS_DISPLAY
+#endif
+#define RELAY_PIN        26   // GPIO libre para relay electroválvula
 
-  // Sensor presión tubería I2C (familia XGZP6847D / XDB401 digital)
-  // Configuración en pressure_sensor_i2c.h: PRESSURE_SENSOR_I2C_ADDR y PRESSURE_SENSOR_FULLSCALE
+// Sensor presión tubería I2C (familia XGZP6847D / XDB401 digital)
+// Configuración en pressure_sensor_i2c.h: PRESSURE_SENSOR_I2C_ADDR y PRESSURE_SENSOR_FULLSCALE
 
 // ── Pipeline — constantes físicas del simulador ───────────────────────────────
 #define PIPELINE_STATIC_P   3.50f  // bar — presión estática (válvula cerrada)
@@ -101,19 +101,20 @@
 #include <math.h>
 #include "secrets.h"
 
-// Certificado TLS reutilizado por HTTPS y MQTT en ESP32.
-  #include "mqtt_cert.h"
+// Certificado TLS reutilizado por HTTPS y MQTT.
+#include "mqtt_cert.h"
 
-// PubSubClient — solo ESP32 y solo cuando USE_MQTT está definido
+// PubSubClient — solo cuando USE_MQTT está definido
 // IMPORTANTE: este include debe ir DESPUÉS de secrets.h para que USE_MQTT esté definido
-  #include <time.h>
+#include <time.h>
 
 #if defined(USE_MQTT)
   #include <PubSubClient.h>
 #endif
 
-// Provisioning: SoftAP captive portal + NVS (solo ESP32)
-  #include "provisioning.h"
+// Provisioning: SoftAP captive portal + NVS
+#include "provisioning.h"
+#include "LeakDetector.h"
 
 // ── Perfiles de dispositivo (ver definiciones al inicio del archivo) ───────────
 #if DEVICE_PROFILE == PROFILE_IRRIGATION
@@ -596,6 +597,8 @@ bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
 float  xdb401Temperature     = NAN;  // temperatura interna del sensor de presión (XDB401)
+IrrigationType irrigationType = IRRIG_SPRINKLER;  // perfil de riego activo (configurable vía MQTT/HTTP)
+LeakDetector   leakDetector;                       // detector automático de fugas (solo modo real)
 unsigned long telemetryIntervalMs  = 20000UL;
 unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
 #ifdef HAS_DISPLAY
@@ -782,6 +785,9 @@ void updatePipelineValues() {
         sim_pipeline_flow  = savedFlow;  // restaurar caudal real
         pipelinePressureOk = false;
       }
+      // Detección automática de fugas (EMA baseline; reemplaza pipelineScenario en modo real)
+      leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
+      pipelineScenario = leakDetector.scenario();
       return;
     }
 
@@ -1236,6 +1242,14 @@ void syncPipelineScenario() {
           DLOGF("[PIPE] Modo → %s\n", nextMode.c_str());
         }
         pipelineMode = nextMode;
+      }
+      // Tipo de riego (afecta umbrales del LeakDetector)
+      const char* nextIrrigStr = doc["irrigation_type"] | irrigTypeToStr(irrigationType);
+      IrrigationType nextIrrig = irrigStrToType(nextIrrigStr);
+      if (nextIrrig != irrigationType) {
+        irrigationType = nextIrrig;
+        leakDetector.begin(irrigationType);
+        DLOGF("[PIPE] Tipo riego → %s\n", irrigTypeToStr(irrigationType));
       }
       if (dataMutex) xSemaphoreGive(dataMutex);
       if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
@@ -1706,6 +1720,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       updatedPipe = true;
     }
   }
+  // Tipo de riego (afecta umbrales del LeakDetector)
+  const char* nextIrrigStr = doc["irrigation_type"] | irrigTypeToStr(irrigationType);
+  IrrigationType nextIrrig = irrigStrToType(nextIrrigStr);
+  if (nextIrrig != irrigationType) {
+    irrigationType = nextIrrig;
+    leakDetector.begin(irrigationType);
+    DLOGF("[MQTT] Tipo riego → %s\n", irrigTypeToStr(irrigationType));
+  }
   if (dataMutex) xSemaphoreGive(dataMutex);
   if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
     telemetryIntervalMs = (unsigned long)nextTelemetry * 1000UL;
@@ -1934,6 +1956,8 @@ void networkTask(void* pvParameters) {
       doc["pipeline_scenario"]     = pipelineScenario;
       doc["pipeline_mode"]         = pipelineMode;
       doc["pipeline_source"]       = pipelineSource;
+      doc["irrigation_type"]       = irrigTypeToStr(irrigationType);
+      doc["leak_detect_trained"]   = leakDetector.hasBaseline();
       doc["pipeline_pressure_ok"]  = pipelinePressureOk;
       doc["pipeline_flow_ok"]      = pipelineFlowOk;
       doc["xdb401_ok"]             = xdb401_ok;
@@ -2396,6 +2420,7 @@ void setup() {
   } else {
     DLOGLN("XDB401 no detectado — presion tuberia en modo simulacion");
   }
+  leakDetector.begin(irrigationType);
 
 #ifdef HAS_DISPLAY
   drawBootScreen("Conectando WiFi...");
@@ -2416,7 +2441,7 @@ void setup() {
     setLedState(LED_MQTT_CONNECTING);
     DLOGLN("WiFi OK: " + WiFi.localIP().toString());
 
-#if !defined(ESP8266) && defined(USE_MQTT)
+#if defined(USE_MQTT)
   #ifndef DEV_MODE
     // PROD: mqtt_user = MAC del dispositivo (lookup en mosquitto-go-auth)
     static char _mac_buf[20];
@@ -2444,11 +2469,7 @@ void setup() {
 #endif
 
     // ── OTA (Over-The-Air) ──────────────────────────────────────────────────
-#ifdef ESP8266
-    ArduinoOTA.setHostname("meteostation-esp8266");
-#else
     ArduinoOTA.setHostname("meteostation-esp32");
-#endif
     // Contraseña OTA opcional — definir OTA_PASSWORD en secrets.h para activarla
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -2480,7 +2501,7 @@ void setup() {
     });
     ArduinoOTA.begin();
 
-#if !defined(ESP8266) && defined(USE_MQTT)
+#if defined(USE_MQTT)
     // Sincronizar reloj via NTP — necesario para validar cert TLS de MQTT
     configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
     DLOG("[NTP] Sincronizando hora");
@@ -2501,7 +2522,6 @@ void setup() {
     }
 #endif
 
-#ifndef ESP8266
     // FreeRTOS: crear tarea de red en Core 0
     dataMutex      = xSemaphoreCreateMutex();
     telemetryQueue = xQueueCreate(1, sizeof(TelemetrySnapshot));
@@ -2519,15 +2539,8 @@ void setup() {
       0                   // Core 0
     );
     DLOGLN("NetworkTask creada en Core 0");
-#endif
     WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
-    DLOGLN("OTA listo — hostname: " +
-#ifdef ESP8266
-      String("meteostation-esp8266")
-#else
-      String("meteostation-esp32")
-#endif
-    );
+    DLOGLN("OTA listo — hostname: meteostation-esp32");
     // ── Fin OTA ─────────────────────────────────────────────────────────────
 
     printHardwareInfo();
@@ -2536,7 +2549,7 @@ void setup() {
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
   } else {
-#if !defined(ESP8266) && !defined(DEV_MODE)
+#if !defined(DEV_MODE)
     // Si las credenciales vinieron de NVS y WiFi falló → volver al portal
     // para que el usuario corrija la red (p.ej. contraseña cambiada).
     if (prov_ssid[0] != '\0') {
@@ -2586,13 +2599,8 @@ void setup() {
 
 // =============================================================================
 // LOOP — Core 1: sensores + display (sin red)
-// En ESP8266 incluye también la red (sin FreeRTOS).
 // =============================================================================
 void loop() {
-#ifdef ESP8266
-  ArduinoOTA.handle();
-#endif
-
   ledTick();  // actualizar LED de estado (no bloqueante)
 
   unsigned long now = millis();
@@ -2641,7 +2649,7 @@ void loop() {
     int rawVane       = analogRead(VANE_PIN);
     currentWindDirDeg = adcToWindDeg(rawVane);
 #else
-    // ESP8266 sin veleta: anemómetro y veleta simulados
+    // Sin pantalla (no METEO): sensores de viento simulados
     windSpeed         = sim_windSpeed;
     windSpeedFiltered = sim_windSpeed;
     currentWindDirDeg = sim_windDir;
@@ -2888,7 +2896,6 @@ void loop() {
     updateSimulatedValues();
     updatePipelineValues();
 
-#ifndef ESP8266
     // Construir snapshot y publicar en la queue para Core 0 — sin mutex, sin bloqueo
     if (telemetryQueue) {
       TelemetrySnapshot snap = {};
@@ -2923,7 +2930,6 @@ void loop() {
 #endif
       xQueueOverwrite(telemetryQueue, &snap);
     }
-#endif
 
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
     DLOGF("[sensor] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
@@ -2957,46 +2963,6 @@ void loop() {
     if (displayView == 1) drawPipelineScreen();
     else                  drawScreen();
     lastScreenTime = now;
-  }
-#endif
-
-#ifdef ESP8266
-  // ── ESP8266: red en el loop() (sin FreeRTOS) ─────────────────────────────────
-  static unsigned long lastRelayCheck8266 = 0;
-  if (now - lastRelayCheck8266 >= RELAY_MS && WiFi.status() == WL_CONNECTED) {
-    checkRelayCommand();
-    lastRelayCheck8266 = now;
-  }
-
-  static bool deviceInfoSent8266 = false;
-  if (!deviceInfoSent8266 && WiFi.status() == WL_CONNECTED) {
-    postDeviceInfo();
-    deviceInfoSent8266 = true;
-  }
-
-  static unsigned long lastSendTime8266 = 0;
-  if (now - lastSendTime8266 >= SEND_MS) {
-    finalAvgWindDir = calcAndResetWindVector();
-    bool ok = false;
-    if (WiFi.status() == WL_CONNECTED) {
-      String url = serverBaseUrl() + "/send_message";
-      char msg[320];
-      int relayMask = 0;
-      for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) relayMask |= (1 << i);
-      snprintf(msg, sizeof(msg),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
-        temperatureMCP, (float)pressure, temperatureDHT, humidity,
-        windSpeed, currentWindDirDeg, windSpeedFiltered, finalAvgWindDir,
-        lightLevel, temperatureDHT11, humidityDHT11,
-        WiFi.RSSI(), (long)ESP.getFreeHeap(), (long)(millis()/1000),
-        relayMask, sim_pipeline_pressure, sim_pipeline_flow, soilMoisture
-      );
-      ok = httpPost(url, String(msg));
-    } else {
-      WiFi.reconnect();
-    }
-    lastServerOK = ok;
-    lastSendTime8266 = now;
   }
 #endif
 
@@ -3041,7 +3007,7 @@ void loop() {
       DLOGLN("[WIFI  ] DESCONECTADO");
     }
 
-#if !defined(ESP8266) && defined(USE_MQTT)
+#if defined(USE_MQTT)
     DLOGF("[MQTT  ] %s\n",
       mqttClient.connected() ? "CONECTADO" : "DESCONECTADO");
 #endif
