@@ -62,6 +62,7 @@ REPO_ROOT    = os.path.dirname(SCRIPT_DIR)
 SKETCH_NAME  = "ESP_monitor_server"
 SKETCH_DIR   = os.path.join(REPO_ROOT, SKETCH_NAME)
 BUILD_DIR    = os.path.join(os.environ.get("TEMP", "/tmp"), "aquantia_build")
+BUILD_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "aquantia_cache")
 METADATA_FILE = os.path.join(BUILD_DIR, "build_meta.json")
 
 ARDUINO_CLI_CANDIDATES = [
@@ -865,7 +866,7 @@ class FlasherApp(tk.Tk):
         self._bin_status_lbl = tk.Label(bin_frame, textvariable=self._bin_status_var,
                                         font=("Segoe UI", 9), anchor="w")
         self._bin_status_lbl.pack(side="left", fill="x", expand=True)
-        ttk.Button(bin_frame, text="🗑", width=3,
+        ttk.Button(bin_frame, text="🗑 Build", width=8,
                    command=self._clean_build).pack(side="right")
 
         # ── Puerto COM ──
@@ -1358,13 +1359,18 @@ class FlasherApp(tk.Tk):
             self._bin_status_lbl.config(fg="#f0a000")
 
     def _clean_build(self):
-        try:
-            if os.path.isdir(BUILD_DIR):
-                shutil.rmtree(BUILD_DIR)
-            self._log_line("🗑  Build limpiado.", "#888")
-        except Exception as e:
-            self._log_line(f"Error limpiando build: {e}", "#f44747")
+        errors = []
+        for label, path in [("build", BUILD_DIR), ("caché de objetos", BUILD_CACHE_DIR)]:
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                    self._log_line(f"🗑  {label.capitalize()} limpiado.", "#888")
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+        if errors:
+            self._log_line(f"Error limpiando: {'; '.join(errors)}", "#f44747")
         self._refresh_binary_status()
+
 
     def _update_commit_info(self, git_ref):
         """Actualiza el panel de info del commit seleccionado."""
@@ -1503,6 +1509,7 @@ class FlasherApp(tk.Tk):
         _, ver_desc, dirty = get_current_version()
         self._log_line(f"✓  Repositorio: {ver_desc}" + (" [modificado]" if dirty else ""), "#4ec9b0")
         self._log_line(f"✓  Build dir:   {BUILD_DIR}", "#4ec9b0")
+        self._log_line(f"✓  Cache dir:   {BUILD_CACHE_DIR}", "#4ec9b0")
         self._log_line("")
 
     # ── Subprocesos ───────────────────────────────────────────────────────────
@@ -1662,8 +1669,13 @@ class FlasherApp(tk.Tk):
                 self._log_line(f"   Secrets: {short_digest(secrets_digest)}", "#888")
                 return True, bin_path
 
-        if os.path.isdir(BUILD_DIR):
-            shutil.rmtree(BUILD_DIR, ignore_errors=True)
+        # No borramos BUILD_DIR para preservar los .o intermedios de arduino-cli
+        # (compilación incremental). Solo limpiamos el .bin anterior si existe.
+        if os.path.exists(bin_path):
+            try:
+                os.remove(bin_path)
+            except OSError:
+                pass
 
         # Preparar directorio de sketch
         sketch_path = self._get_sketch_for_ref(git_ref)
@@ -1699,6 +1711,7 @@ class FlasherApp(tk.Tk):
             "--build-property", f"compiler.c.extra_flags=-DDEVICE_PROFILE={profile}{debug_flag}",
             "--build-property", "build.partitions=min_spiffs",
             "--build-path", BUILD_DIR,
+            "--jobs", str(os.cpu_count() or 4),
             sketch_path,
         ]
         ok, _ = self._run_cmd(cmd, cwd=sketch_path)

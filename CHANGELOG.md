@@ -9,67 +9,77 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
-## [Unreleased] — feature/agrometeo-profile
+## [Unreleased]
+
+---
+
+## [0.2.0-beta.1] — 2026-05-05
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/firmware-stability-phase1`
+
+Beta de la versión 0.2.0. Introduce el perfil AGROMETEO, reescritura completa del driver XDB401, detector de fugas con aprendizaje EMA, arquitectura lock-free dual-core y la herramienta de flash con compilación incremental.
+
+### Herramientas
+- **Flash Tool (`flasher_gui.py`) — compilación incremental real:**
+  - Añadida constante `BUILD_CACHE_DIR` (`%TEMP%/aquantia_cache`) separada de `BUILD_DIR`.
+  - `--build-cache-path BUILD_CACHE_DIR` pasado a `arduino-cli compile`: arduino-cli cachea los `.o` de librerías entre compilaciones; sólo recompila los archivos que cambiaron.
+  - Eliminado el `shutil.rmtree(BUILD_DIR)` que se ejecutaba antes de cada compilación y destruía todos los objetos intermedios, forzando una compilación completa (~3-5 min) cada vez.
+  - El botón "Limpiar build" limpia ahora ambas carpetas (`BUILD_DIR` y `BUILD_CACHE_DIR`).
+  - La primera compilación sigue siendo completa; las siguientes (mismo perfil, misma placa) son incrementales y solo recompilan los archivos modificados (~20-40 s típico).
+
+
+
+### Añadido
+- **Muestreo rápido de caudalímetro y sensor de presión XDB401** (`PIPELINE_FAST_MS = 500 ms`):
+  - Nuevo bloque en `loop()` (paso 2b) que llama a `readRealPipelineSensors()` cada 500 ms cuando `pipelineMode == "real"`, independiente del intervalo de telemetría (`telemetryIntervalMs`).
+  - Actualiza `sim_pipeline_pressure` y `sim_pipeline_flow` para que la pantalla TFT refleje el estado real en cada ciclo de 1 s, en vez de esperar el ciclo de telemetría completo (que puede ser 20-30 s).
+  - Permite detectar fugas y roturas de tubería con tiempo de reacción visual de ≤ 1 s sin incrementar la carga de envío al servidor.
+  - `readRealPipelineSensors()` ya tiene debounce interno de 500 ms: si el bloque rápido cumple el intervalo antes que la telemetría normal, la telemetría devolverá el último valor cacheado, sin solapamiento ni doble conteo de pulsos.
+- **Watchdog de aplicación en `networkTask`** (`esp_task_wdt`, timeout 30s, reset en pánico):
+  - Si `networkTask` se bloquea (handshake TLS colgado, broker con TCP half-open, etc.) el ESP32 hace reset automático sin intervención humana.
+  - `esp_task_wdt_reset()` se llama al inicio de cada iteración del bucle.
+- **`telemetryQueue`** (FreeRTOS Queue, tamaño 1): arquitectura lock-free para la telemetría entre cores.
+  - Core 1 construye el `TelemetrySnapshot` completo (incluyendo `calcAndResetWindVector()`) y publica con `xQueueOverwrite` — nunca bloquea.
+  - Core 0 lee con `xQueuePeek` — nunca bloquea.
+  - `dataMutex` queda reservado exclusivamente para proteger escrituras de config desde Core 0 (`pipelineScenario`, `telemetryIntervalMs`, `relayActive[]`) y la lectura brevísima (5ms max) de `relayActive[]` al construir el snapshot.
+  - Elimina la latencia de hasta 50ms del antiguo `xSemaphoreTake(dataMutex, 50ms)` en `takeSnapshot()`.
+- **Retry controlado para XDB401**: tras 5 fallos consecutivos de lectura el sensor se suspende 30s y reintenta `xdb401_begin()` automáticamente, en lugar de caer en modo simulación permanente sin aviso.
 
 ### Cambiado
+- `takeSnapshot()` simplificada: solo hace `xQueuePeek` + actualización de `heap`/`rssi`/`uptime`. Toda la construcción del snapshot se mueve a Core 1 (loop) al finalizar la lectura de sensores.
+- Lectura de sensores I2C en `loop()` ya no adquiere `dataMutex` (los sensores solo los escribe Core 1).
+- Comentario obsoleto en `updatePipelineValues()` sobre `dataMutex` actualizado.
+
+### Cambiado (driver XDB401 y alertas de presión)
 - **Driver XDB401 reemplazado por librería `pressure_sensor_i2c`** (`pressure_sensor_i2c.h` / `.cpp`):
   - Corregido el trigger I2C invertido: el sketch escribía `0x0A` en registro `0x30`; el protocolo correcto (datasheet) es escribir `0x30` en registro `0x0A`. Éste era el origen de las lecturas incorrectas de presión.
   - El polling activo del bit Sco (reg `0x30`, bit 3) reemplaza el delay fijo de 100ms — más robusto ante variaciones en el tiempo de conversión.
-  - La conversión de temperatura usa la fórmula pura del datasheet (`raw/256`) sin offset empírico; verificar en hardware si el offset de +10°C sigue siendo necesario.
-  - Las constantes `XDB401_ADDR_PRIMARY`, `XDB401_ADDR_ALT` y `XDB401_FULLSCALE_KPA` eliminadas del sketch; toda la configuración queda centralizada en `pressure_sensor_i2c.h` (`PRESSURE_SENSOR_I2C_ADDR = 0x6D`, `PRESSURE_SENSOR_FULLSCALE = 400.0f`).
-  - La API interna del sketch (`xdb401_begin`, `xdb401_read`, `xdb401_readPressureBar`) se mantiene como wrappers finos sobre la librería — sin cambios en el resto del sketch.
-
-### Añadido
-- **Umbrales de alerta de presión** como `#define` en la sección de constantes pipeline:
-  - `PRESSURE_MIN_NORMAL 1.5 bar` — umbral bajo (ajustado para red pública de Lanzarote que puede bajar a ~2 bar en verano)
-  - `PRESSURE_MAX_NORMAL 7.0 bar` — umbral de sobrepresión
-  - `PRESSURE_DROP_ALERT 1.0 bar` — caída rápida (fuga activa)
-  - `PRESSURE_HYDRO_TARGET 3.5 bar` y `PRESSURE_HYDRO_MARGIN 0.5 bar` — control del hidropresor
-- **Temperatura del agua via XDB401**: el sensor de presión reporta temperatura interna del fluido.
-  - Variable global `xdb401Temperature` (NAN si sensor no disponible).
-  - `readRealPipelineSensors()` actualiza `xdb401Temperature` en cada lectura real (usa `xdb401_read()` en lugar de `xdb401_readPressureBar()`).
-  - Campo `xdb401_temperature` añadido al payload MQTT de telemetría (solo si el sensor está presente y la lectura es válida).
-  - Pantalla TFT pipeline view: muestra `Taq: XX.X °C` en la franja inferior cuando XDB401 está activo.
-
-### Corregido
-- Driver inicial basado en protocolo incorrecto (requestFrom directo sin trigger, fórmula 14-bit) sustituido por el protocolo real del datasheet XGZP6847D.
-
----
-
-## [Unreleased] — feature/agrometeo-profile
-
-### Añadido
-- **Modo debug configurable** desde el Flash Tool GUI: nueva casilla "🐛 Debug (serie)" que inyecta `-DDEBUG_MODE=1` al compilar. Sin la casilla, toda la salida serie queda silenciada en producción.
-- Macros `DLOGF` / `DLOGLN` / `DLOG` que mapean a `Serial.printf/println/print` cuando `DEBUG_MODE` está definido y son no-ops en caso contrario. Todos los `Serial.printf/println/print` del sketch sustituidos por las macros.
-- El Flash Tool GUI invalida la caché del binario automáticamente al cambiar la casilla de debug, y registra en `build_meta.json` si el binario fue compilado en modo debug o release.
-- **Vista pipeline en pantalla TFT (`PROFILE_METEO`)**: pulsando BTN_LEFT o BTN_RIGHT con la pantalla ya encendida se alterna entre la vista meteorológica y una nueva vista de agua que muestra `pipeline_pressure` (bar) y `pipeline_flow` (L/min). Si el modo pipeline es `"sim"`, los valores se muestran en naranja (`C_SIM`) con badge `[SIM]`, igual que el resto de sensores sin hardware real. Puntos de paginación en la cabecera indican la vista activa.
-
-### Cambiado
+  - La conversión de temperatura usa la fórmula pura del datasheet (`raw/256`); las constantes `XDB401_ADDR_PRIMARY`, `XDB401_ADDR_ALT` y `XDB401_FULLSCALE_KPA` centralizadas en `pressure_sensor_i2c.h`.
+  - La API interna del sketch (`xdb401_begin`, `xdb401_read`, `xdb401_readPressureBar`) se mantiene como wrappers finos sobre la librería.
 - `Serial.begin(115200)` siempre activo (necesario para OTA y monitor de arranque); el resto de salida serie queda gateado por `DEBUG_MODE`.
 - Lógica de botones en `loop()` reescrita con detección de flanco (rising/falling edge) para evitar cambios de vista repetidos por bounce.
 
----
+### Añadido (XDB401, alertas y pantalla)
+- **Umbrales de alerta de presión** como `#define` en la sección de constantes pipeline:
+  - `PRESSURE_MIN_NORMAL 1.5 bar` — umbral bajo (ajustado para red pública de Lanzarote)
+  - `PRESSURE_MAX_NORMAL 7.0 bar` — umbral de sobrepresión
+  - `PRESSURE_DROP_ALERT 1.0 bar` — caída rápida (fuga activa)
+  - `PRESSURE_HYDRO_TARGET 3.5 bar` y `PRESSURE_HYDRO_MARGIN 0.5 bar` — control del hidropresor
+- **Temperatura del agua via XDB401**: campo `xdb401_temperature` en payload MQTT; pantalla TFT muestra `Taq: XX.X °C`.
+- **Vista pipeline en pantalla TFT (`PROFILE_METEO`)**: pulsando cualquier botón se alterna entre vista meteorológica y vista de agua (presión/caudal). Badges `[SIM]` / `[OK]` por cada canal. Puntos de paginación en cabecera.
+- **Modo debug configurable** desde Flash Tool GUI: casilla "🐛 Debug (serie)" inyecta `-DDEBUG_MODE=1`. Sin la casilla, toda la salida serie queda silenciada en producción. Flash Tool invalida la caché del binario al cambiar el flag y registra el modo en `build_meta.json`.
 
-## [feature/agrometeo-profile] — en desarrollo
-
-### Añadido
+### Añadido (perfil AGROMETEO)
 - **Nuevo perfil `PROFILE_AGROMETEO` (valor 3)** para placa CJMCU-14 (ESP32 + BH1750 + HDC1080 + BMP280).
-- Soporte inline para **HDC1080** (temperatura y humedad, I2C 0x40) con protocolo propio, sin librería externa, guarded para no interferir con HTU2x en METEO/IRRIGATION.
-- Soporte para **BH1750** (iluminancia, librería `claws/BH1750`) como sensor de luz en AGROMETEO.
-- BMP280 reutilizado en AGROMETEO (existente en METEO) para temperatura secundaria y presión atmosférica (kPa).
-- **Parámetros agrometeorológicos calculados** publicados en telemetría MQTT: `dew_point` (punto de rocío, Magnus), `heat_index` (índice de calor, solo si T>27°C y HR>40%), `abs_humidity` (humedad absoluta g/m³).
-- `RELAY_COUNT=0` en AGROMETEO: sin relays ni control de válvulas; pipeline pressure/flow preparado para futuros sensores (stub `readRealPipelineSensors`).
-- Log serie `[1s]` específico para AGROMETEO con todos los parámetros derivados.
-- Reporte DEBUG_MODE actualizado para mostrar estado de HDC1080 y BH1750 en AGROMETEO.
-- **Estado LED `LED_PROVISIONING`**: triple parpadeo lento (300/300 ms × 3, pausa 1,8 s) que se activa al entrar al portal captivo SoftAP. Distingue visualmente "esperando configuración WiFi del usuario" del parpadeo rápido de búsqueda de red (`LED_WIFI_CONNECTING`).
+- Soporte inline para **HDC1080** (temperatura y humedad, I2C 0x40) con protocolo propio, sin librería externa.
+- Soporte para **BH1750** (iluminancia, librería `claws/BH1750`) en AGROMETEO.
+- **Parámetros agrometeorológicos calculados** publicados en telemetría MQTT: `dew_point` (Magnus), `heat_index` (solo si T>27 °C y HR>40 %), `abs_humidity` (g/m³).
+- `RELAY_COUNT=0` en AGROMETEO: sin relays; array dummy para que el código compile sin cambios.
+- Reporte `DEBUG_MODE` actualizado para mostrar estado de HDC1080 y BH1750 en AGROMETEO.
+- **LED_PROVISIONING**: triple parpadeo lento (300/300 ms × 3 + pausa 1,8 s) al entrar al portal SoftAP.
 
-### Cambiado
-- `RELAY_PINS` usa array dummy de tamaño 1 en AGROMETEO para evitar array de longitud cero.
-- `relayActive` usa `RELAY_COUNT > 0 ? RELAY_COUNT : 1` como tamaño para el mismo motivo.
-- `temperatureSourceName()` y `pressureSourceName()` extendidas con rama `PROFILE_AGROMETEO`.
-- Bloque de init HTU2x en `setup()` y loop guarded con `#if DEVICE_PROFILE != PROFILE_AGROMETEO`.
-- Bloque de init TSL2584/APDS-9930 guarded igual; en AGROMETEO `tsl_ok=false` siempre.
-- Cadenas de nombre de perfil en DEBUG_MODE actualizadas para incluir "AGROMETEO".
+### Corregido
+- Driver inicial XDB401 basado en protocolo incorrecto sustituido por el protocolo real del datasheet XGZP6847D.
 
 ---
 
