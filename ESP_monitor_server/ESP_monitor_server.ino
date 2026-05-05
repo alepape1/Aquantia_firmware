@@ -1289,10 +1289,10 @@ void syncPipelineScenario() {
     body.trim();
     if (body == "normal" || body == "leak" ||
         body == "burst"  || body == "obstruction") {
-      if (body != pipelineScenario) {
+      if (strcmp(body.c_str(), pipelineScenario) != 0) {
         DLOGF("[PIPE] Escenario → %s\n", body.c_str());
       }
-      pipelineScenario = body;
+      strlcpy(pipelineScenario, body.c_str(), sizeof(pipelineScenario));
     }
   }
 }
