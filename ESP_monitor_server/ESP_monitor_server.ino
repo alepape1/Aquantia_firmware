@@ -794,13 +794,8 @@ void updatePipelineValues() {
       }
       // Detección automática de fugas (EMA baseline; reemplaza pipelineScenario en modo real)
       leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
-      // Escritura desde Core 1 protegida con mutex (Core 0 también escribe esta variable)
-      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5))) {
-        strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
-        xSemaphoreGive(dataMutex);
-      } else {
-        strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
-      }
+      // char[16]: strlcpy es suficiente — Core 0 escribe bajo mutex; lectura eventual-consistent.
+      strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
       return;
     }
 
@@ -3062,7 +3057,7 @@ void loop() {
     DLOGF("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
       agroDewPoint, agroHeatIndex, agroAbsHum);
     DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
-      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario.c_str());
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
 #else
     DLOGF("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
       temperatureMCP, temperatureDHT, humidity, lightLevel);
@@ -3071,7 +3066,7 @@ void loop() {
       (float)pressure, temperatureDHT11, humidityDHT11, soilMoisture);
 #endif
     DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
-      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario.c_str());
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
 #if defined(FLOW_PIN)
     DLOGF("[FLOW  ] Pulsos/intervalo:%lu  Total:%lu  Intervalo:%lu ms  K:%d p/L\n",
       (unsigned long)_flowLastPulses, (unsigned long)_flowPulseTotal,
