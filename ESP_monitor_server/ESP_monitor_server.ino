@@ -588,13 +588,15 @@ void IRAM_ATTR flowPulseISR() {
 #endif
 
 // ── Pipeline simulado / hardware-ready ───────────────────────────────────────
-String pipelineScenario      = "normal";    // normal | leak | burst | obstruction
+// char[16] en lugar de String evita races de heap entre Core 0 y Core 1.
+// Escrituras protegidas con dataMutex; lecturas eventual-consistent (máx 1 ciclo).
+char pipelineScenario[16]    = "normal";    // normal | leak | burst | obstruction
 // Si FLOW_PIN está definido arrancamos en "real" directamente; de lo contrario "sim".
 // El backend puede cambiar este valor en runtime via MQTT pipeline_config o HTTP /api/pipeline/config.
 #if defined(FLOW_PIN)
-String pipelineMode          = "real";      // sim | real
+char pipelineMode[16]        = "real";      // sim | real
 #else
-String pipelineMode          = "sim";       // sim | real
+char pipelineMode[16]        = "sim";       // sim | real
 #endif
 String pipelineSource        = "sim";       // sim | real | fallback
 bool   pipelinePressureOk    = false;
@@ -650,13 +652,13 @@ void updatePipelineSimValues() {
   float p_noise = pipelineNoise(t, 0) * PIPELINE_NOISE_P;
   float q_noise = pipelineNoise(t, 1) * PIPELINE_NOISE_Q;
 
-  if (pipelineScenario == "burst") {
+  if (strcmp(pipelineScenario, "burst") == 0) {
     sim_pipeline_pressure = max(0.0f, 0.25f + p_noise * 0.4f);
     sim_pipeline_flow     = valveOpen
       ? max(0.0f, PIPELINE_NOMINAL_Q * 0.08f + fabsf(q_noise) * 0.3f)
       : 0.0f;
 
-  } else if (pipelineScenario == "obstruction") {
+  } else if (strcmp(pipelineScenario, "obstruction") == 0) {
     if (valveOpen) {
       // Tubería bloqueada: presión no cae (queda cerca de la estática), caudal ~0
       sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P + p_noise * 0.5f);
@@ -667,7 +669,7 @@ void updatePipelineSimValues() {
       sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.05f);
     }
 
-  } else if (pipelineScenario == "leak") {
+  } else if (strcmp(pipelineScenario, "leak") == 0) {
     if (valveOpen) {
       sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P - 0.18f + p_noise);
       sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q - 0.45f + q_noise);
@@ -767,9 +769,9 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
 }
 
 void updatePipelineValues() {
-  // pipelineMode/pipelineScenario son escritos por Core 0 (MQTT callback) con dataMutex.
-  // La lectura aquí (Core 1) es eventual-consistent: como máximo un ciclo de 20s desfasado.
-  if (pipelineMode == "real") {
+  // pipelineMode/pipelineScenario son char[16]: sin heap, seguro como eventual-consistent.
+  // Escrituras desde Core 0 y Core 1 protegidas con dataMutex; lecturas aquí sin mutex.
+  if (strcmp(pipelineMode, "real") == 0) {
     float realPressure = 0.0f;
     float realFlow = 0.0f;
     if (readRealPipelineSensors(realPressure, realFlow)) {
@@ -792,7 +794,13 @@ void updatePipelineValues() {
       }
       // Detección automática de fugas (EMA baseline; reemplaza pipelineScenario en modo real)
       leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
-      pipelineScenario = leakDetector.scenario();
+      // Escritura desde Core 1 protegida con mutex (Core 0 también escribe esta variable)
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5))) {
+        strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
+        xSemaphoreGive(dataMutex);
+      } else {
+        strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
+      }
       return;
     }
 
@@ -1225,8 +1233,8 @@ void syncPipelineScenario() {
   if (body.length() > 0) {
     StaticJsonDocument<320> doc;
     if (!deserializeJson(doc, body)) {
-      String nextScenario = doc["scenario"] | pipelineScenario;
-      String nextMode     = doc["mode"] | pipelineMode;
+      const char* nextScenario = doc["scenario"] | (const char*)pipelineScenario;
+      const char* nextMode     = doc["mode"] | (const char*)pipelineMode;
       long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
       long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
 #ifdef HAS_DISPLAY
@@ -1235,18 +1243,18 @@ void syncPipelineScenario() {
 
       // Proteger escrituras de config con mutex (leídas desde Core 1)
       if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-      if (nextScenario == "normal" || nextScenario == "leak" ||
-          nextScenario == "burst"  || nextScenario == "obstruction") {
-        if (nextScenario != pipelineScenario) {
-          DLOGF("[PIPE] Escenario → %s\n", nextScenario.c_str());
+      if (strcmp(nextScenario, "normal") == 0 || strcmp(nextScenario, "leak") == 0 ||
+          strcmp(nextScenario, "burst")  == 0 || strcmp(nextScenario, "obstruction") == 0) {
+        if (strcmp(nextScenario, pipelineScenario) != 0) {
+          DLOGF("[PIPE] Escenario → %s\n", nextScenario);
         }
-        pipelineScenario = nextScenario;
+        strlcpy(pipelineScenario, nextScenario, sizeof(pipelineScenario));
       }
-      if (nextMode == "sim" || nextMode == "real") {
-        if (nextMode != pipelineMode) {
-          DLOGF("[PIPE] Modo → %s\n", nextMode.c_str());
+      if (strcmp(nextMode, "sim") == 0 || strcmp(nextMode, "real") == 0) {
+        if (strcmp(nextMode, pipelineMode) != 0) {
+          DLOGF("[PIPE] Modo → %s\n", nextMode);
         }
-        pipelineMode = nextMode;
+        strlcpy(pipelineMode, nextMode, sizeof(pipelineMode));
       }
       // Tipo de riego (afecta umbrales del LeakDetector)
       const char* nextIrrigStr = doc["irrigation_type"] | irrigTypeToStr(irrigationType);
@@ -1533,7 +1541,7 @@ void drawPipelineScreen() {
   spr.drawCircle(230, 9, 5, C_TEXT);
 
   // Determinar si los valores son simulados
-  bool pipeSim = (pipelineMode == "sim");
+  bool pipeSim = (strcmp(pipelineMode, "sim") == 0);
   uint16_t pCol = (pipeSim || !pipelinePressureOk) ? C_SIM : C_REAL;
   uint16_t fCol = (pipeSim || !pipelineFlowOk)     ? C_SIM : C_REAL;
 
@@ -1595,7 +1603,7 @@ void drawPipelineScreen() {
   spr.setTextColor(C_LABEL, C_CARD);
   spr.drawString("Escenario:", 6, bY + 14, 1);
   spr.setTextColor(C_TEXT, C_CARD);
-  spr.drawString(pipelineScenario.c_str(), 68, bY + 14, 1);
+  spr.drawString(pipelineScenario, 68, bY + 14, 1);
 
   // Temperatura interna del sensor de presión (temperatura del agua)
   if (xdb401_ok && !isnan(xdb401Temperature)) {
@@ -1702,26 +1710,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   bool updatedPipe = false;
-  String nextScenario = doc["pipeline_scenario"] | pipelineScenario;
-  String nextMode     = doc["pipeline_mode"] | pipelineMode;
+  const char* nextScenario = doc["pipeline_scenario"] | (const char*)pipelineScenario;
+  const char* nextMode     = doc["pipeline_mode"] | (const char*)pipelineMode;
   long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
   long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
 #ifdef HAS_DISPLAY
   long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
 #endif
 
-  // Proteger escrituras de Strings con mutex (leídas desde Core 1)
+  // Proteger escrituras con mutex (leídas desde Core 1 eventual-consistent)
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-  if (nextScenario == "normal" || nextScenario == "leak" ||
-      nextScenario == "burst"  || nextScenario == "obstruction") {
-    if (nextScenario != pipelineScenario) {
-      pipelineScenario = nextScenario;
+  if (strcmp(nextScenario, "normal") == 0 || strcmp(nextScenario, "leak") == 0 ||
+      strcmp(nextScenario, "burst")  == 0 || strcmp(nextScenario, "obstruction") == 0) {
+    if (strcmp(nextScenario, pipelineScenario) != 0) {
+      strlcpy(pipelineScenario, nextScenario, sizeof(pipelineScenario));
       updatedPipe = true;
     }
   }
-  if (nextMode == "sim" || nextMode == "real") {
-    if (nextMode != pipelineMode) {
-      pipelineMode = nextMode;
+  if (strcmp(nextMode, "sim") == 0 || strcmp(nextMode, "real") == 0) {
+    if (strcmp(nextMode, pipelineMode) != 0) {
+      strlcpy(pipelineMode, nextMode, sizeof(pipelineMode));
       updatedPipe = true;
     }
   }
@@ -1748,7 +1756,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (updatedPipe) {
     updatePipelineValues();
-    DLOGF("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode.c_str(), pipelineScenario.c_str());
+    DLOGF("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode, pipelineScenario);
   }
 }
 
@@ -1965,6 +1973,9 @@ void networkTask(void* pvParameters) {
       doc["leak_detect_trained"]   = leakDetector.hasBaseline();
       doc["pipeline_pressure_ok"]  = pipelinePressureOk;
       doc["pipeline_flow_ok"]      = pipelineFlowOk;
+      doc["leak_baseline_pressure"] = r2(leakDetector.baselinePressure());
+      doc["leak_baseline_flow"]     = r2(leakDetector.baselineFlow());
+      doc["leak_warmup_progress"]   = leakDetector.warmupProgress();
       doc["xdb401_ok"]             = xdb401_ok;
       if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
       doc["mac_address"]           = WiFi.macAddress();
@@ -2221,6 +2232,11 @@ void setup() {
 
   bmp_ok = beginBMP280();
   if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                       Adafruit_BMP280::SAMPLING_X2,
+                       Adafruit_BMP280::SAMPLING_X16,
+                       Adafruit_BMP280::FILTER_X16,
+                       Adafruit_BMP280::STANDBY_MS_500);
     float tBmp = NAN;
     float pBmp = NAN;
     bmp_temp_ok = readBMP280Temperature(tBmp);
@@ -2421,7 +2437,7 @@ void setup() {
   if (xdb401_ok) {
     DLOGLN("XDB401 OK — sensor presion tuberia detectado");
     // Si no hay caudalímetro, activar modo real para aprovechar la presión real
-    if (pipelineMode == "sim") pipelineMode = "real";
+    if (strcmp(pipelineMode, "sim") == 0) strlcpy(pipelineMode, "real", sizeof(pipelineMode));
   } else {
     DLOGLN("XDB401 no detectado — presion tuberia en modo simulacion");
   }
@@ -2953,7 +2969,7 @@ void loop() {
   // ── 2b. Muestreo rápido pipeline (cada PIPELINE_FAST_MS) — solo actualiza ────────
   //        variables de display; la telemetría sigue al ritmo de telemetryIntervalMs.
   //        Permite detectar fugas/roturas sin esperar el intervalo completo.
-  if (pipelineMode == "real" && (now - lastPipelineFastRead >= PIPELINE_FAST_MS)) {
+  if (strcmp(pipelineMode, "real") == 0 && (now - lastPipelineFastRead >= PIPELINE_FAST_MS)) {
     float fp = 0.0f, ff = 0.0f;
     if (readRealPipelineSensors(fp, ff)) {
       sim_pipeline_flow = max(0.0f, ff);

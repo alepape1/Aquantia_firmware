@@ -77,6 +77,8 @@ public:
     static constexpr float    EMA_ALPHA       = 0.05f;  ///< 1/EMA_ALPHA ≈ muestras para converger
     static constexpr uint16_t WARMUP_SAMPLES  = 20;     ///< Muestras con válvula ON antes de activar detección
     static constexpr uint8_t  IDLE_CONFIRM    = 3;      ///< Muestras consecutivas con caudal OFF para confirmar fuga
+    static constexpr uint8_t  BURST_CONFIRM   = 2;      ///< Muestras consecutivas para confirmar burst (evita falso positivo)
+    static constexpr uint8_t  OBSTR_CONFIRM   = 2;      ///< Muestras consecutivas para confirmar obstrucción
 
     // ── API pública ──────────────────────────────────────────────────────────
 
@@ -93,6 +95,8 @@ public:
         _trained        = false;
         _warmup         = 0;
         _idle_leak_hits = 0;
+        _burst_hits     = 0;
+        _obstr_hits     = 0;
         _scenario       = "normal";
     }
 
@@ -155,16 +159,21 @@ public:
                 ? ((_ema_pressure - pressure_bar) / _ema_pressure) * 100.0f
                 : 0.0f;
             if (drop_pct >= p.burst_pressure_drop_pct) {
-                _scenario = "burst";
+                if (++_burst_hits >= BURST_CONFIRM) {
+                    _scenario = "burst";
+                }
+                _obstr_hits = 0;
                 // No actualizar EMA en burst — el baseline debe preservarse
                 return;
             }
         }
+        _burst_hits = 0;
 
         // Leak (válvula abierta): caudal excede baseline significativamente
         if (_ema_flow > p.zero_flow_tolerance_lpm) {
             float excess_pct = ((flow_lpm - _ema_flow) / _ema_flow) * 100.0f;
             if (excess_pct >= p.leak_on_deviation_pct) {
+                _obstr_hits = 0;
                 _scenario = "leak";
                 return;
             }
@@ -174,10 +183,13 @@ public:
         if (_ema_flow > p.zero_flow_tolerance_lpm) {
             float drop_pct = ((_ema_flow - flow_lpm) / _ema_flow) * 100.0f;
             if (drop_pct >= p.obstruction_flow_drop_pct) {
-                _scenario = "obstruction";
+                if (++_obstr_hits >= OBSTR_CONFIRM) {
+                    _scenario = "obstruction";
+                }
                 return;
             }
         }
+        _obstr_hits = 0;
 
         // Normal: actualizar EMA y resetear escenario
         if (pressure_valid)
@@ -205,13 +217,15 @@ public:
     const IrrigationProfile& profile() const { return _profile; }
 
 private:
-    IrrigationProfile _profile     = IRRIG_PROFILES[IRRIG_SPRINKLER];
-    float             _ema_pressure = 2.80f;
-    float             _ema_flow     = 5.00f;
-    bool              _trained      = false;
-    uint16_t          _warmup       = 0;
+    IrrigationProfile _profile       = IRRIG_PROFILES[IRRIG_SPRINKLER];
+    float             _ema_pressure  = 2.80f;
+    float             _ema_flow      = 5.00f;
+    bool              _trained       = false;
+    uint16_t          _warmup        = 0;
     uint8_t           _idle_leak_hits = 0;
-    const char*       _scenario     = "normal";
+    uint8_t           _burst_hits    = 0;
+    uint8_t           _obstr_hits    = 0;
+    const char*       _scenario      = "normal";
 
     static constexpr const char* _S_LEAK = "leak";
 };
