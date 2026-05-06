@@ -1,56 +1,71 @@
-// MeteoStation — Firmware v3
-// Compatible con ESP32 (con pantalla ST7789 240×135) y ESP8266 (sin pantalla)
-// Sensores: MCP9808, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
+﻿// MeteoStation — Firmware v3
+// ESP32 (con pantalla ST7789 240×135)
+// Sensores: MCP9808, BMP280, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
+
+// ── Versión del firmware ───────────────────────────────────────────────────────
+// Incrementar según SemVer al crear un release. El backend almacena este valor
+// en device_info.firmware_version para mostrar en el dashboard y detectar
+// dispositivos desactualizados (comparado con app_settings.min_firmware_version).
+#define FIRMWARE_VERSION "0.2.0-beta.2"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
+#define PROFILE_AGROMETEO   3   // ECU agrometeorológica — sin relays, sensores CJMCU-14 (BH1750+HDC1080+BMP280)
 
 #ifndef DEVICE_PROFILE
   #define DEVICE_PROFILE PROFILE_METEO
 #endif
 
-// ── Modo debug — activo en rama test, quitar en producción ───────────────────
-//#define DEBUG_MODE 1
+// ── Modo debug — pasar -DDEBUG_MODE=1 al compilador para activarlo ───────────
+// En producción NO definir: elimina toda la salida serie y reduce consumo.
+// El Flash Tool GUI tiene la casilla "Debug" que inyecta el flag automáticamente.
 #define DEBUG_INTERVAL_MS 5000UL   // reporte completo cada 5 s
 
-// ── Detección de plataforma ───────────────────────────────────────────────────
-#ifdef ESP8266
-  #include <ESP8266WiFi.h>
-  #include <ESP8266HTTPClient.h>
-  #include <WiFiClient.h>
-  #include <ArduinoOTA.h>
-  #define I2C_SDA          4
-  #define I2C_SCL          5
-  #define DHTPIN          14   // D5
-  #define ADC_VOLTAGE_REF  3.2f
-  #define ADC_RANGE        1024.0f
-  #define ANEMOMETER_PIN   A0
-  #define RELAY_PIN       12   // D6 — GPIO libre para relay electroválvula
-#else  // ESP32
-  #include "WiFi.h"
-  #include <HTTPClient.h>
-  #include <WiFiClientSecure.h>
-  #include <ArduinoOTA.h>
-  #include "driver/rtc_io.h" // Añade esto al principio del archivo
-  #define I2C_SDA          21
-  #define I2C_SCL          22
-  #define DHTPIN           15
-  #define ADC_VOLTAGE_REF  3.41f
-  #define ADC_RANGE        4096.0f
-  #define ANEMOMETER_PIN   37
-  #define VANE_PIN         36
-  #if DEVICE_PROFILE == PROFILE_METEO
-    #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
-    #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
-    #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
-  #endif
-  #if DEVICE_PROFILE == PROFILE_METEO
-    #define HAS_DISPLAY
-  #endif
-  #define RELAY_PIN        26   // GPIO libre para relay electroválvula
+// Macros de log — mapeadas a Serial cuando DEBUG_MODE está activo, no-op en prod
+#ifdef DEBUG_MODE
+  #define DLOGF(fmt, ...)  Serial.printf(fmt, ##__VA_ARGS__)
+  #define DLOGLN(msg)      Serial.println(msg)
+  #define DLOG(msg)        Serial.print(msg)
+#else
+  #define DLOGF(fmt, ...)  do {} while(0)
+  #define DLOGLN(msg)      do {} while(0)
+  #define DLOG(msg)        do {} while(0)
 #endif
+
+// ── Plataforma: ESP32 ─────────────────────────────────────────────────────────
+#include "WiFi.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoOTA.h>
+#include "driver/rtc_io.h"
+#include "esp_task_wdt.h"
+#define I2C_SDA        21
+#define I2C_SCL        22
+#define DHTPIN           15
+#define ADC_VOLTAGE_REF  3.41f
+#define ADC_RANGE        4096.0f
+#define ANEMOMETER_PIN   36
+#define VANE_PIN         37
+#if DEVICE_PROFILE == PROFILE_METEO
+  #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
+  #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
+  #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
+  #define FLOW_PIN         32   // Caudalímetro — pulsos digitales vía BC547 NPN (señal invertida, activo LOW)
+  // K factor según modelo:
+  //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
+  //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
+  //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
+  #define FLOW_K_FACTOR   240   // YF-B4 — ajustar con medición real si es necesario
+#endif
+#if DEVICE_PROFILE == PROFILE_METEO
+  #define HAS_DISPLAY
+#endif
+#define RELAY_PIN        26   // GPIO libre para relay electroválvula
+
+// Sensor presión tubería I2C (familia XGZP6847D / XDB401 digital)
+// Configuración en pressure_sensor_i2c.h: PRESSURE_SENSOR_I2C_ADDR y PRESSURE_SENSOR_FULLSCALE
 
 // ── Pipeline — constantes físicas del simulador ───────────────────────────────
 #define PIPELINE_STATIC_P   3.50f  // bar — presión estática (válvula cerrada)
@@ -59,7 +74,7 @@
 #define PIPELINE_NOISE_Q    0.12f  // L/min — dispersión caudalímetro
 #define PIPELINE_NOMINAL_Q  5.00f  // L/min — caudal nominal del sistema
 
-// Librerías de sensores meteorológicos — solo perfil METEO
+// Librerías de sensores meteorológicos — según perfil
 #if DEVICE_PROFILE == PROFILE_METEO
   #include <SPI.h>
   #include <Wire.h>
@@ -68,8 +83,16 @@
     typedef uint8_t BitOrder;
   #endif
   #include <Adafruit_MCP9808.h>
+  #include <Adafruit_BMP280.h>
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
+  #include <Wire.h>
+  #include <Adafruit_BMP280.h>
+  #include <BH1750.h>
+  #include <SparkFun_Qwiic_Power_Switch_Arduino_Library.h>
+  #include <SparkFun_MicroPressure.h>
 #else
   // IRRIGATION: solo I2C básico (sin sensores meteo)
   #include <Wire.h>
@@ -78,18 +101,20 @@
 #include <math.h>
 #include "secrets.h"
 
-// PubSubClient y certificado TLS — solo ESP32 y solo cuando USE_MQTT está definido
+// Certificado TLS reutilizado por HTTPS y MQTT.
+#include "mqtt_cert.h"
+
+// PubSubClient — solo cuando USE_MQTT está definido
 // IMPORTANTE: este include debe ir DESPUÉS de secrets.h para que USE_MQTT esté definido
-#if !defined(ESP8266) && defined(USE_MQTT)
+#include <time.h>
+
+#if defined(USE_MQTT)
   #include <PubSubClient.h>
-  #include "mqtt_cert.h"
-  #include <time.h>
 #endif
 
-// Provisioning: SoftAP captive portal + NVS (solo ESP32)
-#ifndef ESP8266
-  #include "provisioning.h"
-#endif
+// Provisioning: SoftAP captive portal + NVS
+#include "provisioning.h"
+#include "LeakDetector.h"
 
 // ── Perfiles de dispositivo (ver definiciones al inicio del archivo) ───────────
 #if DEVICE_PROFILE == PROFILE_IRRIGATION
@@ -103,6 +128,10 @@
   #endif
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN_1, RELAY_PIN_2,
                                                    RELAY_PIN_3, RELAY_PIN_4};
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  // AGROMETEO: sin relays — array dummy para que el código compile sin cambios
+  #define RELAY_COUNT 0
+  static const uint8_t RELAY_PINS[1] = {0};
 #else
   #define RELAY_COUNT 1
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN};
@@ -110,6 +139,9 @@
 
 #ifdef HAS_DISPLAY
   #include <TFT_eSPI.h>
+  #ifndef TFT_BL
+    #define TFT_BL 4   // LilyGo TTGO T-Display backlight
+  #endif
 #endif
 
 // ── Credenciales (definidas en secrets.h) ─────────────────────────────────────
@@ -128,15 +160,117 @@ const char* mqtt_pass   = MQTT_PASS;
 #endif
 
 // ── Pines ─────────────────────────────────────────────────────────────────────
-const int ledPin = 2;
-#define LED_ON  LOW
-#define LED_OFF HIGH
+// LED onboard por perfil de hardware (activo-HIGH):
+//   METEO      — LilyGo T-Display      : sin LED de usuario → -1 (desactivado)
+//   AGROMETEO  — Wemos D1 Mini ESP32   : GPIO 2
+//   IRRIGATION — ESP32 4-Relay Board   : GPIO 23
+#if DEVICE_PROFILE == PROFILE_METEO
+  const int ledPin = -1;   // LilyGo T-Display no tiene LED onboard
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  const int ledPin = 23;
+#else
+  const int ledPin = 2;
+#endif
+#define LED_ON  HIGH
+#define LED_OFF LOW
+
+// ── LED status no-bloqueante ──────────────────────────────────────────────────
+// Código visual del estado del dispositivo mediante el LED onboard.
+//
+//  LED_PROVISIONING   — triple parpadeo lento cada 3 s → portal AP activo, esperando config
+//  LED_WIFI_CONNECTING — parpadeo rápido 100/100 ms    → buscando red WiFi
+//  LED_MQTT_CONNECTING — doble parpadeo cada ~2 s      → WiFi OK, MQTT pendiente
+//  LED_IDLE            — latido 50 ms / 2950 ms        → conectado, en espera
+//  LED_TX_OK           — triple parpadeo (one-shot)    → telemetría enviada OK
+//  LED_TX_ERROR        — 1 s ON / 1 s OFF              → error de red persistente
+//  LED_RELAY_ON        — encendido fijo                → relay activo (IRRIGATION)
+enum LedStateCode : uint8_t {
+  LED_PROVISIONING = 0,
+  LED_WIFI_CONNECTING,
+  LED_MQTT_CONNECTING,
+  LED_IDLE,
+  LED_TX_OK,      // one-shot: vuelve automáticamente al estado anterior
+  LED_TX_ERROR,
+  LED_RELAY_ON,
+  _LED_STATE_COUNT
+};
+
+struct LedStep { uint16_t onMs; uint16_t offMs; };
+static const LedStep _ledPat[_LED_STATE_COUNT][4] = {
+  /* PROVISIONING    */ {{300, 300}, {300,1800},{300,1800},{0, 0}},  // triple blink lento
+  /* WIFI_CONNECTING */ {{100, 100}, {0, 0},    {0, 0},   {0, 0}},
+  /* MQTT_CONNECTING */ {{50,  50 }, {50, 1800},{0, 0},   {0, 0}},  // doble blink + pausa
+  /* IDLE            */ {{50, 2950}, {0, 0},    {0, 0},   {0, 0}},  // latido lento
+  /* TX_OK           */ {{50,  50 }, {50,   50},{50, 800},{0, 0}},  // triple blink
+  /* TX_ERROR        */ {{1000,1000},{0, 0},    {0, 0},   {0, 0}},
+  /* RELAY_ON        */ {{0,   0  }, {0, 0},    {0, 0},   {0, 0}},  // sin timer (fijo ON)
+};
+static const uint8_t _ledPatLen[]  = { 3, 1, 2, 1, 3, 1, 0 };
+static const bool    _ledOneShot[] = { false, false, false, false, true, false, false };
+
+static volatile LedStateCode _ledState     = LED_PROVISIONING;
+static LedStateCode          _ledPrevState = LED_IDLE;
+static uint8_t               _ledStep      = 0;
+static bool                  _ledPhaseOn   = true;
+static volatile bool         _ledNeedsInit = true;
+static unsigned long         _ledPhaseMs   = 0;
+
+// Cambiar estado del LED (seguro desde cualquier tarea — solo escribe variables).
+void setLedState(LedStateCode s) {
+  if ((LedStateCode)_ledState == s) return;
+  if (_ledOneShot[s]) _ledPrevState = (LedStateCode)_ledState;
+  _ledState     = s;
+  _ledStep      = 0;
+  _ledPhaseOn   = true;
+  _ledNeedsInit = true;  // ledTick() aplicará ON en el próximo ciclo
+}
+
+// Llamar únicamente desde loop() (Core 1). Es la única función que escribe el GPIO.
+void ledTick() {
+  if (ledPin < 0) return;  // placa sin LED onboard (p.ej. LilyGo T-Display)
+  LedStateCode state = (LedStateCode)_ledState;
+  if (state == LED_RELAY_ON) { digitalWrite(ledPin, LED_ON); return; }
+
+  if (_ledNeedsInit) {
+    _ledNeedsInit = false;
+    _ledStep    = 0;
+    _ledPhaseOn = true;
+    _ledPhaseMs = millis();
+    digitalWrite(ledPin, LED_ON);
+    return;
+  }
+
+  const LedStep* pat = _ledPat[state];
+  uint8_t len = _ledPatLen[state];
+  unsigned long now = millis();
+  uint16_t dur = _ledPhaseOn ? pat[_ledStep].onMs : pat[_ledStep].offMs;
+  if (now - _ledPhaseMs < dur) return;
+  _ledPhaseMs = now;
+  if (_ledPhaseOn) {
+    digitalWrite(ledPin, LED_OFF);
+    _ledPhaseOn = false;
+  } else {
+    _ledStep++;
+    if (_ledStep >= len) {
+      if (_ledOneShot[state]) {
+        _ledState     = _ledPrevState;
+        _ledNeedsInit = true;
+        return;
+      }
+      _ledStep = 0;
+    }
+    _ledPhaseOn = true;
+    digitalWrite(ledPin, LED_ON);
+  }
+}
 
 // ── Intervalos ─────────────────────────────────────────────────────────────────
-#define WIND_MS       100
-#define SCREEN_MS    1000
-#define SEND_MS      2000
-#define RELAY_MS     2000   // Consulta estado relay cada 2s para respuesta casi inmediata
+#define WIND_MS          100
+#define SCREEN_MS       1000
+#define SEND_MS         2000
+#define RELAY_MS        2000   // Consulta estado relay cada 2s para respuesta casi inmediata
+#define PIPELINE_SYNC_MS 20000UL
+#define PIPELINE_FAST_MS  500UL  // Muestreo rápido caudalímetro/presión para display y detección de fugas
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 60000UL  // Apagar pantalla tras 60s sin actividad
@@ -148,7 +282,13 @@ const int ledPin = 2;
 #if DEVICE_PROFILE == PROFILE_METEO
   SparkFun_MicroPressure barometer;
   Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
+  Adafruit_BMP280        bmp280;
   DHTesp                 dht;
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  Adafruit_BMP280        bmp280;
+  BH1750                 bh1750;
+  QWIIC_POWER            qwiic_ps;
+  SparkFun_MicroPressure barometer;
 #endif
 
 #ifdef HAS_DISPLAY
@@ -156,26 +296,244 @@ const int ledPin = 2;
   TFT_eSprite spr = TFT_eSprite(&tft);
   unsigned long lastActivityTime = 0;
   bool          displayOn        = true;
+  uint8_t       displayView      = 0;   // 0 = meteo, 1 = pipeline
 #endif
 
 // ── Relay electroválvula(s) ────────────────────────────────────────────────────
 // JQC-3FF-S-Z activo-LOW: LOW = relay ON (válvula abierta), HIGH = relay OFF
 // relayActive[i] — estado actual de cada relay (índice = bit en bitmask)
-bool relayActive[RELAY_COUNT] = {};
+// RELAY_COUNT puede ser 0 en AGROMETEO — usamos max(1,…) para evitar array de tamaño 0
+bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 
 #ifdef USE_MQTT
+static WiFiClient       mqttTCPClient;
 static WiFiClientSecure mqttTLSClient;
-static PubSubClient     mqttClient(mqttTLSClient);
+static PubSubClient     mqttClient;
 #endif
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
 bool mcp_ok = false;
+bool bmp_ok = false;
+bool bmp_temp_ok = false;
+bool bmp_pressure_ok = false;
+bool micropressure_ok = false;
+bool temp_ok = false;
 bool bar_ok = false;
 bool htu_ok = false;
 #if DEVICE_PROFILE == PROFILE_METEO
 bool dht_ok = false;
+static uint8_t bmp280_addr = 0x00;
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+bool hdc_ok        = false;   // HDC1080 — temperatura y humedad primaria
+bool bh1750_ok     = false;   // BH1750  — iluminancia
+bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
+static uint8_t bmp280_addr = 0x00;
 #endif
-bool tsl_ok = false;
+bool tsl_ok   = false;
+bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
+static uint8_t       xdb401_failures  = 0;       // fallos consecutivos de lectura
+static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar reinit
+static constexpr uint8_t  XDB401_MAX_FAILURES  = 5;
+static constexpr uint32_t XDB401_RETRY_INTERVAL = 30000UL;  // ms entre reintentos
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
+static bool beginBMP280() {
+  if (bmp280.begin(0x76)) {
+    bmp280_addr = 0x76;
+    return true;
+  }
+  if (bmp280.begin(0x77)) {
+    bmp280_addr = 0x77;
+    return true;
+  }
+  bmp280_addr = 0x00;
+  return false;
+}
+
+static bool readBMP280Temperature(float& outTemp) {
+  outTemp = bmp280.readTemperature();
+  return !isnan(outTemp) && outTemp > -40.0f && outTemp < 85.0f;
+}
+
+static bool readBMP280PressureKPa(float& outPressure) {
+  outPressure = bmp280.readPressure() / 1000.0f;
+  return !isnan(outPressure) && outPressure > 30.0f && outPressure < 120.0f;
+}
+#endif  // PROFILE_METEO || PROFILE_AGROMETEO
+
+// =============================================================================
+// HDC1080 — temperatura y humedad I2C (solo PROFILE_AGROMETEO)
+// Dirección 0x40. Se accede directamente via Wire, sin librería externa.
+// NOTA: comparte dirección con HTU2x pero protocolo diferente.
+// =============================================================================
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#define HDC1080_ADDR 0x40
+
+static bool hdc1080_init() {
+  Wire.beginTransmission(HDC1080_ADDR);
+  Wire.write(0x02);  // registro de configuración
+  Wire.write(0x00);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  delay(15);
+  return true;
+}
+
+static float hdc1080_readTemp() {
+  Wire.beginTransmission(HDC1080_ADDR);
+  Wire.write(0x00);  // registro temperatura
+  if (Wire.endTransmission() != 0) return NAN;
+  delay(35);  // datasheet: 6.5ms; 35ms para cubrir bus ocupado
+  Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2, (uint8_t)1);
+  if (Wire.available() < 2) return NAN;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  float t = (raw / 65536.0f) * 165.0f - 40.0f;
+  return (t > -40.0f && t < 85.0f) ? t : NAN;
+}
+
+static float hdc1080_readHum() {
+  Wire.beginTransmission(HDC1080_ADDR);
+  Wire.write(0x01);  // registro humedad
+  if (Wire.endTransmission() != 0) return NAN;
+  delay(35);  // datasheet: 6.5ms; 35ms para cubrir bus ocupado
+  Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)2, (uint8_t)1);
+  if (Wire.available() < 2) return NAN;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  float h = (raw / 65536.0f) * 100.0f;
+  return (h >= 0.0f && h <= 100.0f) ? h : NAN;
+}
+
+// Parámetros derivados agrometeorologícos
+// Temperatura: HDC1080 primaria, BMP280 secundaria; Tavg = media si ambas disponibles
+static float agro_calcDewPoint(float tempC, float hum) {
+  const float a = 17.271f, b = 237.7f;
+  float g = (a * tempC / (b + tempC)) + logf(hum / 100.0f);
+  return (b * g) / (a - g);
+}
+
+static float agro_calcHeatIndex(float tempC, float hum) {
+  float t = tempC * 9.0f / 5.0f + 32.0f;
+  float hi = -42.379f
+    + 2.04901523f  * t
+    + 10.14333127f * hum
+    - 0.22475541f  * t * hum
+    - 0.00683783f  * t * t
+    - 0.05481717f  * hum * hum
+    + 0.00122874f  * t * t * hum
+    + 0.00085282f  * t * hum * hum
+    - 0.00000199f  * t * t * hum * hum;
+  return (hi - 32.0f) * 5.0f / 9.0f;
+}
+
+static float agro_calcAbsHumidity(float tempC, float hum) {
+  float es = 6.112f * expf((17.67f * tempC) / (tempC + 243.5f));
+  return (es * hum * 2.1674f) / (273.15f + tempC);
+}
+
+// =============================================================================
+// Qwiic Power Switch — solo PROFILE_AGROMETEO
+// El objeto qwiic_ps (QWIIC_POWER) gestiona el PCA9536 en 0x41.
+// Se enciende una vez en setup() y permanece ON durante toda la ejecución.
+// powerOn/powerOff siguen disponibles si en el futuro se necesita deep-sleep.
+// =============================================================================
+#endif  // PROFILE_AGROMETEO
+
+// =============================================================================
+// Sensor presión tubería I2C — familia XGZP6847D / XDB401 digital
+// Driver: pressure_sensor_i2c (pressure_sensor_i2c.h / .cpp)
+//
+// Protocolo verificado desde datasheet físico (XGZP6847D):
+//   1. Trigger: escribir 0x0A en registro 0x30 → inicia adquisición P+T
+//   2. Polling registro 0x30 hasta bit 3 (Sco) = 0 (conversión completa)
+//   3. Delay adicional ~50ms (datasheet)
+//   4. Leer presión: 3 bytes desde reg 0x06 (24-bit big-endian, complemento a 2 en bit 23)
+//   5. Leer temperatura: 2 bytes desde reg 0x09 (16-bit big-endian, complemento a 2 en bit 15)
+//
+// Dirección I2C: PRESSURE_SENSOR_I2C_ADDR — 0x7F (lote alternativo, confirmado en hardware Aquantia).
+// Frecuencia I2C: 100 kHz. Stop-start entre escritura y lectura (no repeated-start).
+// =============================================================================
+
+#include "pressure_sensor_i2c.h"
+
+// Detecta el sensor en el bus I2C ya inicializado por setup().
+// Wire.begin(I2C_SDA, I2C_SCL) se llama antes — aquí solo forzamos 100 kHz
+// y verificamos ACK en PRESSURE_SENSOR_I2C_ADDR.
+static bool xdb401_begin() {
+  Wire.setClock(100000);  // forzar 100 kHz — algunos ejemplares fallan a 400 kHz
+  // Tres intentos con pausa: el bus puede estar inestable tras otros inits I2C
+  for (int i = 0; i < 3; i++) {
+    if (i > 0) delay(50);
+    if (pressureSensor_isPresent()) {
+      DLOGF("[XDB401] Detectado en 0x%02X (intento %d)\n", PRESSURE_SENSOR_I2C_ADDR, i + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Lee presión (bar) y temperatura (°C) usando el driver pressure_sensor_i2c.
+// Devuelve true si la lectura es válida; pressureBar y temperatureC = NAN si falla.
+static bool xdb401_read(float& pressureBar, float& temperatureC) {
+  pressureBar  = NAN;
+  temperatureC = NAN;
+
+  PressureSensorData_t data;
+  if (!pressureSensor_read(&data) || !data.valid) {
+    DLOGLN("[XDB401] Read FAIL");
+    return false;
+  }
+
+  float pb = data.pressure_kpa / 100.0f;  // kPa → bar
+  float tc = data.temperature_c;
+
+  static unsigned long _lastXdbPrint = 0;
+  unsigned long _now = millis();
+  if (_now - _lastXdbPrint >= DEBUG_INTERVAL_MS) {
+    _lastXdbPrint = _now;
+    DLOGF("[XDB401] Presion=%.3f bar  Temp=%.1f C\n", pb, tc);
+  }
+
+  float fs_bar = PRESSURE_SENSOR_FULLSCALE / 100.0f;
+  bool ok = (pb >= -0.5f && pb <= fs_bar * 1.05f
+             && tc > -10.0f && tc < 125.0f);
+  if (!ok) {
+    DLOGF("[XDB401] Validacion FAIL — pb=%.3f bar (max=%.1f) tc=%.1f C\n", pb, fs_bar, tc);
+    return false;
+  }
+
+  pressureBar  = pb;
+  temperatureC = tc;
+  return true;
+}
+
+// Wrapper conveniente: solo presión en bar (NAN si falla).
+static float xdb401_readPressureBar() {
+  float pb, tc;
+  return xdb401_read(pb, tc) ? pb : NAN;
+}
+
+static const char* temperatureSourceName() {
+#if DEVICE_PROFILE == PROFILE_METEO
+  if (mcp_ok) return "MCP9808";
+  if (bmp_temp_ok) return "BMP280";
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  if (hdc_ok) return "HDC1080";
+  if (bmp_temp_ok) return "BMP280";
+#endif
+  return "SIM";
+}
+
+static const char* pressureSourceName() {
+  if (xdb401_ok) return "XDB401";
+#if DEVICE_PROFILE == PROFILE_METEO
+  if (micropressure_ok) return "MicroPressure";
+  if (bmp_pressure_ok) return "BMP280";
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  if (micropressure_ok) return "MicroPressure";
+  if (bmp_pressure_ok)  return "BMP280";
+#endif
+  return "SIM";
+}
 
 // ── Valores medidos ────────────────────────────────────────────────────────────
 float  temperatureMCP    = 0;
@@ -183,12 +541,22 @@ float  temperatureDHT    = 0;   // HTU2x temperatura
 float  humidity          = 0;   // HTU2x humedad
 float  temperatureDHT11  = 0;   // DHT11 temperatura
 float  humidityDHT11     = 0;   // DHT11 humedad
+float  bmpTemperature    = NAN; // BMP280 temperatura directa
+float  bmpPressure       = NAN; // BMP280 presión directa en kPa
 double pressure          = 0;
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
 float  lightLevel        = 0;
 float  soilMoisture      = 0;   // YL-69 — humedad suelo (0=seco, 100=saturado)
+
+// ── Parámetros calculados AGROMETEO ───────────────────────────────────────────
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+float  agroTempAvg   = NAN;  // media HDC1080 + BMP280 si ambos disponibles
+float  agroDewPoint  = NAN;  // punto de rocío (Magnus)
+float  agroHeatIndex = NAN;  // índice de calor (>27°C y >40% HR)
+float  agroAbsHum    = NAN;  // humedad absoluta (g/m³)
+#endif
 
 // ── Valores simulados (drift lento) ───────────────────────────────────────────
 float sim_tempMCP   = 20.5f;
@@ -202,10 +570,54 @@ float sim_windSpeed = 3.5f;
 float sim_windDir        = 180.0f;
 float sim_soilMoisture   = 50.0f;
 
-// ── Pipeline simulado ─────────────────────────────────────────────────────────
-String pipelineScenario      = "normal";  // actualizado desde el servidor cada 20s
+// ── Caudalímetro — conteo de pulsos por ISR ─────────────────────────────────
+// BC547 NPN invierte la señal: pulso del sensor → GPIO LOW → FALLING edge.
+// ISR en IRAM_ATTR para ejecución desde RAM (no se suspende durante cache miss).
+#if defined(FLOW_PIN)
+static volatile uint32_t _flowPulseCount = 0;     // contador crudo (escrito solo por ISR)
+static volatile uint32_t _flowPulseTotal = 0;     // acumulador histórico — nunca se resetea
+static unsigned long     _flowLastCalcMs = 0;     // marca de tiempo última lectura
+static unsigned long     _flowLastDtMs   = 0;     // duración del último intervalo de cálculo (ms)
+static uint32_t          _flowLastPulses = 0;     // pulsos contados en el último intervalo
+static float             _flowLpm        = 0.0f;  // último caudal calculado (L/min)
+
+void IRAM_ATTR flowPulseISR() {
+  _flowPulseCount++;
+  _flowPulseTotal++;
+}
+#endif
+
+// ── Pipeline simulado / hardware-ready ───────────────────────────────────────
+// char[16] en lugar de String evita races de heap entre Core 0 y Core 1.
+// Escrituras protegidas con dataMutex; lecturas eventual-consistent (máx 1 ciclo).
+char pipelineScenario[16]    = "normal";    // normal | leak | burst | obstruction
+// Si FLOW_PIN está definido arrancamos en "real" directamente; de lo contrario "sim".
+// El backend puede cambiar este valor en runtime via MQTT pipeline_config o HTTP /api/pipeline/config.
+#if defined(FLOW_PIN)
+char pipelineMode[16]        = "real";      // sim | real
+#else
+char pipelineMode[16]        = "sim";       // sim | real
+#endif
+String pipelineSource        = "sim";       // sim | real | real_flow | fallback
+bool   pipelinePressureOk    = false;
+bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
+float  xdb401Temperature     = NAN;  // temperatura interna del sensor de presión (XDB401)
+IrrigationType irrigationType = IRRIG_SPRINKLER;  // perfil de riego activo (configurable vía MQTT/HTTP)
+LeakDetector   leakDetector;                       // detector automático de fugas (solo modo real)
+unsigned long telemetryIntervalMs  = 20000UL;
+unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
+#ifdef HAS_DISPLAY
+unsigned long displayTimeoutMs     = DISPLAY_TIMEOUT_MS;
+#endif
+
+static bool anyRelayActive() {
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    if (relayActive[i]) return true;
+  }
+  return false;
+}
 
 static float driftClamp(float v, float mn, float mx, float step) {
   float d = ((float)random(-100, 101) / 100.0f) * step;
@@ -235,18 +647,30 @@ static float pipelineNoise(float t_s, int ch) {
 }
 
 void updatePipelineSimValues() {
+  const bool valveOpen = anyRelayActive();
   float t       = millis() / 1000.0f;
   float p_noise = pipelineNoise(t, 0) * PIPELINE_NOISE_P;
   float q_noise = pipelineNoise(t, 1) * PIPELINE_NOISE_Q;
 
-  if (pipelineScenario == "burst") {
+  if (strcmp(pipelineScenario, "burst") == 0) {
     sim_pipeline_pressure = max(0.0f, 0.25f + p_noise * 0.4f);
-    sim_pipeline_flow     = relayActive[0]
+    sim_pipeline_flow     = valveOpen
       ? max(0.0f, PIPELINE_NOMINAL_Q * 0.08f + fabsf(q_noise) * 0.3f)
       : 0.0f;
 
-  } else if (pipelineScenario == "leak") {
-    if (relayActive) {
+  } else if (strcmp(pipelineScenario, "obstruction") == 0) {
+    if (valveOpen) {
+      // Tubería bloqueada: presión no cae (queda cerca de la estática), caudal ~0
+      sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P + p_noise * 0.5f);
+      sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.04f);
+    } else {
+      // Válvula cerrada: igual que escenario normal
+      sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P + p_noise);
+      sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.05f);
+    }
+
+  } else if (strcmp(pipelineScenario, "leak") == 0) {
+    if (valveOpen) {
       sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P - 0.18f + p_noise);
       sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q - 0.45f + q_noise);
     } else {
@@ -255,7 +679,7 @@ void updatePipelineSimValues() {
     }
 
   } else {  // "normal"
-    if (relayActive) {
+    if (valveOpen) {
       sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P + p_noise);
       sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q + q_noise);
     } else {
@@ -263,6 +687,130 @@ void updatePipelineSimValues() {
       sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.05f);
     }
   }
+}
+
+static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
+#if defined(FLOW_PIN)
+  // Caudalímetro por pulsos (BC547 NPN, señal invertida, FALLING edge).
+  // Devuelve true en cuanto hay datos válidos del caudalímetro.
+  // pressureBar = -1.0f indica "sin sensor de presión real" → el caller
+  // mantiene la estimación simulada para la presión.
+  unsigned long now = millis();
+  unsigned long dt  = now - _flowLastCalcMs;
+
+  if (dt < 500UL) {
+    // Intervalo demasiado corto — reutilizamos el último valor calculado
+    flowLpm     = _flowLpm;
+    pressureBar = -1.0f;
+    return true;
+  }
+
+  noInterrupts();
+  uint32_t pulses  = _flowPulseCount;
+  _flowPulseCount  = 0;
+  interrupts();
+
+  _flowLastCalcMs = now;
+  _flowLastDtMs   = dt;       // guardamos para el debug
+  _flowLastPulses = pulses;   // guardamos para el debug
+
+  // L/min = (pulsos / dt_s) * (60.0 / K_FACTOR)
+  // Equivalente: pulsos * 60.0 / (dt_s * K_FACTOR)
+  float dt_s  = dt / 1000.0f;
+  _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
+  flowLpm     = _flowLpm;
+  // Intentar leer presión real del XDB401; NAN si no disponible (el caller usará sim)
+  // Usar NAN como sentinel permite que lecturas negativas reales (vacío, golpe de ariete) pasen al caller.
+  pressureBar = NAN;
+  if (!xdb401_ok && millis() >= xdb401_retry_at) {
+    xdb401_ok = xdb401_begin();
+    if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
+    else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+  }
+  if (xdb401_ok) {
+    float p, tc;
+    if (xdb401_read(p, tc)) {
+      pressureBar       = p;
+      xdb401Temperature = tc;
+      xdb401_failures   = 0;
+    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
+      xdb401_ok        = false;
+      xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
+      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
+            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
+    }
+  }
+  return true;
+#else
+  // Sin caudalímetro: si hay XDB401 devolvemos presión real con caudal 0
+  if (!xdb401_ok && millis() >= xdb401_retry_at) {
+    xdb401_ok = xdb401_begin();
+    if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
+    else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+  }
+  if (xdb401_ok) {
+    float p, tc;
+    if (xdb401_read(p, tc)) {
+      pressureBar       = p;
+      xdb401Temperature = tc;
+      flowLpm           = 0.0f;
+      xdb401_failures   = 0;
+      return true;
+    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
+      xdb401_ok        = false;
+      xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
+      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
+            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
+    }
+  }
+  (void)pressureBar;
+  (void)flowLpm;
+  return false;
+#endif
+}
+
+void updatePipelineValues() {
+  // pipelineMode/pipelineScenario son char[16]: sin heap, seguro como eventual-consistent.
+  // Escrituras desde Core 0 y Core 1 protegidas con dataMutex; lecturas aquí sin mutex.
+  if (strcmp(pipelineMode, "real") == 0) {
+    float realPressure = 0.0f;
+    float realFlow = 0.0f;
+    if (readRealPipelineSensors(realPressure, realFlow)) {
+      sim_pipeline_flow = max(0.0f, realFlow);
+      pipelineFlowOk    = true;
+
+      if (!isnan(realPressure)) {
+        // Sensor de presión real disponible — se permiten valores negativos (vacío, golpe de ariete)
+        sim_pipeline_pressure = realPressure;
+        pipelinePressureOk    = true;
+        pipelineSource        = "real";
+      } else {
+        // Sin sensor de presión real — estimación por simulador solo para presión.
+        // IMPORTANTE: guardamos el caudal real antes y lo restauramos porque
+        // updatePipelineSimValues() también sobreescribe sim_pipeline_flow.
+        float savedFlow = sim_pipeline_flow;
+        updatePipelineSimValues();
+        sim_pipeline_flow  = savedFlow;  // restaurar caudal real
+        pipelinePressureOk = false;
+        pipelineSource     = "real_flow";  // caudal real, presión simulada
+      }
+      // Detección automática de fugas (EMA baseline; reemplaza pipelineScenario en modo real)
+      leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
+      // char[16]: strlcpy es suficiente — Core 0 escribe bajo mutex; lectura eventual-consistent.
+      strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
+      return;
+    }
+
+    pipelineSource     = "fallback";
+    pipelinePressureOk = false;
+    pipelineFlowOk     = false;
+  } else {
+    pipelineSource     = "sim";
+    pipelinePressureOk = false;
+    pipelineFlowOk     = false;
+  }
+
+  updatePipelineSimValues();
 }
 
 // =============================================================================
@@ -289,14 +837,14 @@ bool htu_begin() {
   return true;
 }
 
-// Lanza una medición y espera. Devuelve NAN si falla.
+// Lanza una medición y espera. Devuelve NAN si falla o si hay timeout.
 static float htu_measure(uint8_t cmd, uint16_t wait_ms) {
   Wire.beginTransmission(HTU2X_ADDR);
   Wire.write(cmd);
   if (Wire.endTransmission() != 0) return NAN;
   delay(wait_ms);
-  Wire.requestFrom((uint8_t)HTU2X_ADDR, (uint8_t)3, (uint8_t)1);
-  if (Wire.available() < 2) return NAN;
+  uint8_t got = Wire.requestFrom((uint8_t)HTU2X_ADDR, (uint8_t)3, (uint8_t)1);
+  if (got < 2) return NAN;  // timeout o NACK — el sensor no respondió
   uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
   if (Wire.available()) Wire.read();  // descarta CRC
   raw &= 0xFFFC;  // limpia los 2 bits de tipo de medición
@@ -326,17 +874,17 @@ static void htu_set_heater(bool on) {
 // Calentamiento de arranque: activa el calefactor ~3 s para evaporar
 // condensación y obtener lecturas de humedad más fiables desde el inicio.
 void htu_heater_warmup() {
-  Serial.println("HTU2x: calentamiento 3s (evaporar condensacion)...");
+  DLOGLN("HTU2x: calentamiento 3s (evaporar condensacion)...");
   htu_set_heater(true);
   for (int i = 3; i > 0; i--) {
     float t = htu_readTemp();
     float h = htu_readHumidity();
-    Serial.printf("  HTU2x heater ON — T:%.1f C  H:%.1f %%  (%ds)\n", t, h, i);
+    DLOGF("  HTU2x heater ON — T:%.1f C  H:%.1f %%  (%ds)\n", t, h, i);
     delay(1000);
   }
   htu_set_heater(false);
   delay(1000);  // estabilización tras apagar calefactor
-  Serial.println("HTU2x: calentamiento completado.");
+  DLOGLN("HTU2x: calentamiento completado.");
 }
 
 // =============================================================================
@@ -371,7 +919,7 @@ static bool light_write(uint8_t reg, uint8_t val) {
   return Wire.endTransmission() == 0;
 }
 
-// Lectura stop-start (más compatible con ESP8266 que repeated-start)
+// Lectura stop-start
 static uint8_t light_read8(uint8_t reg) {
   Wire.beginTransmission(LIGHT_ADDR);
   Wire.write(LIGHT_CMD | reg);
@@ -395,23 +943,23 @@ bool tsl_begin() {
   // Autodetección: leer ambos registros de ID y mostrarlos
   uint8_t apds_id = light_read8(APDS_ID_REG);  // 0x12 → 0x39 o 0x30 para APDS-9930
   uint8_t tsl_id  = light_read8(TSL_ID_REG);   // 0x0A → 0xAx para TSL2584
-  Serial.printf("[LUZ] ID@0x12=0x%02X  ID@0x0A=0x%02X\n", apds_id, tsl_id);
+  DLOGF("[LUZ] ID@0x12=0x%02X  ID@0x0A=0x%02X\n", apds_id, tsl_id);
 
   // APDS-9930: ID puede ser 0x39 (rev1) o 0x30 (rev0); nibble alto = 0x3
   if ((apds_id & 0xF0) == 0x30) {
     light_is_apds = true;
     // ATIME=0xDB → 37 ciclos × 2.73 ms ≈ 101 ms por conversión
     light_write(LIGHT_TIMING, 0xDB);
-    Serial.printf("[LUZ] APDS-9930 detectado (ID=0x%02X)\n", apds_id);
+    DLOGF("[LUZ] APDS-9930 detectado (ID=0x%02X)\n", apds_id);
   } else if ((tsl_id & 0xF0) == 0xA0) {
     light_is_apds = false;
     light_write(LIGHT_TIMING, 0x02);  // 402 ms, ganancia 1×
-    Serial.printf("[LUZ] TSL2584 detectado (ID=0x%02X)\n", tsl_id);
+    DLOGF("[LUZ] TSL2584 detectado (ID=0x%02X)\n", tsl_id);
   } else {
     // ID desconocido — probar APDS-9930 como fallback (más probable en 0x39)
     light_is_apds = true;
     light_write(LIGHT_TIMING, 0xDB);
-    Serial.printf("[LUZ] ID desconocido — usando registros APDS-9930 (fallback)\n");
+    DLOGF("[LUZ] ID desconocido — usando registros APDS-9930 (fallback)\n");
   }
 
   delay(450);  // Esperar primera integración completa (cubre ambos casos)
@@ -498,12 +1046,26 @@ const char* degToCompass(float d) {
 }
 
 // ── FreeRTOS (solo ESP32) — declarado aquí para estar disponible antes de su uso ──
-#ifndef ESP8266
 volatile bool        isUpdatingOTA = false;
 portMUX_TYPE         windMux       = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t    dataMutex     = nullptr;
+QueueHandle_t        telemetryQueue = nullptr;  // Core 1 escribe, Core 0 lee — sin mutex
 TaskHandle_t         networkTaskHandle = nullptr;
+
+// ── Snapshot de telemetría — struct global para evitar auto-prototype de Arduino ──
+struct TelemetrySnapshot {
+  float tempMCP, pressure, tempDHT, humidity;
+  float windSpeed, windDir, windSpeedFilt, avgWindDir;
+  float light, tempDHT11, humDHT11, soil;
+  float bmpTemp, bmpPressure;
+  float pipePressure, pipeFlow;
+  float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
+  long  heap, uptime;
+  int   rssi, relayMask;
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  float dewPoint, heatIndex, absHum;
 #endif
+} _netSnap;
 
 // ── Promedio vectorial de dirección ────────────────────────────────────────────
 float windSumX = 0, windSumY = 0;
@@ -512,114 +1074,147 @@ float finalAvgWindDir = 0;
 
 void accumulateWindVector(float deg) {
   float r = deg * PI / 180.0f;
-#ifndef ESP8266
   portENTER_CRITICAL(&windMux);
-#endif
   windSumX += cos(r);
   windSumY += sin(r);
   windSampleCount++;
-#ifndef ESP8266
   portEXIT_CRITICAL(&windMux);
-#endif
 }
 
 float calcAndResetWindVector() {
-#ifndef ESP8266
   portENTER_CRITICAL(&windMux);
-#endif
   if (windSampleCount == 0) {
-#ifndef ESP8266
     portEXIT_CRITICAL(&windMux);
-#endif
     return 0;
   }
   float deg = atan2(windSumY, windSumX) * 180.0f / PI;
   if (deg < 0) deg += 360.0f;
   windSumX = windSumY = 0;
   windSampleCount = 0;
-#ifndef ESP8266
   portEXIT_CRITICAL(&windMux);
-#endif
   return deg;
 }
 
 // ── Estado ────────────────────────────────────────────────────────────────────
 bool lastServerOK    = false;
-unsigned long lastSendTime   = 0;
-unsigned long lastScreenTime = 0;
+unsigned long lastSendTime        = 0;
+unsigned long lastScreenTime      = 0;
+unsigned long lastSensorRead      = 0;  // lectura I2C sincronizada con el intervalo de telemetría
+unsigned long lastPipelineFastRead = 0; // muestreo rápido caudalímetro/XDB401 — solo para display
 
 
 // ── Info estática del hardware ────────────────────────────────────────────────
 void printHardwareInfo() {
-  Serial.println("\n=== Hardware Info ===");
-#ifdef ESP8266
-  Serial.printf("Chip         : ESP8266 (ID=0x%08X)\n", ESP.getChipId());
-#else
-  Serial.printf("Chip         : %s rev%d\n", ESP.getChipModel(), ESP.getChipRevision());
-#endif
-  Serial.printf("CPU          : %d MHz\n",      ESP.getCpuFreqMHz());
-  Serial.printf("Flash        : %d MB\n",        ESP.getFlashChipSize() / (1024 * 1024));
-  Serial.printf("Free Heap    : %d bytes\n",     ESP.getFreeHeap());
-  Serial.printf("SDK          : %s\n",           ESP.getSdkVersion());
-  Serial.printf("MAC          : %s\n",           WiFi.macAddress().c_str());
-  Serial.printf("IP           : %s\n",           WiFi.localIP().toString().c_str());
-  Serial.println("====================");
+  DLOGLN("\n=== Hardware Info ===");
+  DLOGF("Chip         : %s rev%d\n", ESP.getChipModel(), ESP.getChipRevision());
+  DLOGF("CPU          : %d MHz\n",      ESP.getCpuFreqMHz());
+  DLOGF("Flash        : %d MB\n",        ESP.getFlashChipSize() / (1024 * 1024));
+  DLOGF("Free Heap    : %d bytes\n",     ESP.getFreeHeap());
+  DLOGF("SDK          : %s\n",           ESP.getSdkVersion());
+  DLOGF("MAC          : %s\n",           WiFi.macAddress().c_str());
+  DLOGF("IP           : %s\n",           WiFi.localIP().toString().c_str());
+  DLOGLN("====================");
+}
+
+static bool serverUseTls() {
+  return server_port == 443 || server_port == 8443;
+}
+
+static String serverBaseUrl() {
+  String url = serverUseTls() ? "https://" : "http://";
+  url += String(server_ip);
+  if ((!serverUseTls() && server_port != 80) || (serverUseTls() && server_port != 443)) {
+    url += ":" + String(server_port);
+  }
+  return url;
+}
+
+static bool tlsClockReady(unsigned long waitMs = 5000) {
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+
+  while (now < 1700000000L && millis() - start < waitMs) {
+    delay(250);
+    now = time(nullptr);
+  }
+  return now >= 1700000000L;
+}
+
+static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000) {
+  int handshakeSeconds = timeoutMs / 1000;
+  if (handshakeSeconds < 1) handshakeSeconds = 1;
+
+  client.stop();
+  client.setHandshakeTimeout(handshakeSeconds);
+  client.setCACert(MQTT_CA_CERT_PEM);
+
+  if (!tlsClockReady(5000)) {
+    DLOGLN("[TLS] Advertencia: reloj aun no sincronizado; reintentando handshake con la CA cargada");
+  }
+}
+
+static bool parseRelayBitmask(const String& response, int& bitmaskOut) {
+  String trimmed = response;
+  trimmed.trim();
+  if (trimmed.length() == 0) return false;
+
+  for (size_t i = 0; i < trimmed.length(); i++) {
+    char c = trimmed[i];
+    if (c < '0' || c > '9') return false;
+  }
+
+  long parsed = trimmed.toInt();
+  long maxMask = (1L << RELAY_COUNT) - 1L;
+  if (parsed < 0 || parsed > maxMask) return false;
+
+  bitmaskOut = (int)parsed;
+  return true;
 }
 
 void postDeviceInfo() {
   JsonDocument doc;
-#ifdef ESP8266
-  doc["chip_model"]    = "ESP8266";
-  doc["chip_revision"] = 0;
-#else
   doc["chip_model"]    = ESP.getChipModel();
   doc["chip_revision"] = (int)ESP.getChipRevision();
-#endif
   doc["cpu_freq_mhz"]  = ESP.getCpuFreqMHz();
   doc["flash_size_mb"] = ESP.getFlashChipSize() / (1024 * 1024);
   doc["sdk_version"]   = ESP.getSdkVersion();
-  doc["mac_address"]   = WiFi.macAddress();
-  doc["ip_address"]    = WiFi.localIP().toString();
-  doc["relay_count"]   = RELAY_COUNT;
+  doc["mac_address"]      = WiFi.macAddress();
+  doc["ip_address"]       = WiFi.localIP().toString();
+  doc["relay_count"]      = RELAY_COUNT;
+  doc["firmware_version"] = FIRMWARE_VERSION;
 
   String json;
   serializeJson(doc, json);
 
-  String url = "https://" + String(server_ip) + "/api/device_info";
-#ifdef ESP8266
-  WiFiClient wifiClient;
+  String url = serverBaseUrl() + "/api/device_info";
   HTTPClient http;
   http.setTimeout(10000);
-  http.begin(wifiClient, url);
-#else
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(10);
-  HTTPClient http;
-  http.setTimeout(10000);
-  http.begin(client, url);
-#endif
+  if (serverUseTls()) {
+    WiFiClientSecure client;
+    prepareSecureClient(client, 10000);
+    http.begin(client, url);
+  } else {
+    WiFiClient client;
+    http.begin(client, url);
+  }
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(json);
   http.end();
-  Serial.printf("[DeviceInfo] POST → %d\n", code);
+  DLOGF("[DeviceInfo] POST → %d\n", code);
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 String httpGet(const String& url, int timeoutMs = 10000) {
-#ifdef ESP8266
-  WiFiClient wifiClient;
   HTTPClient http;
   http.setTimeout(timeoutMs);
-  http.begin(wifiClient, url);
-#else
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(timeoutMs / 1000);
-  HTTPClient http;
-  http.setTimeout(timeoutMs);
-  http.begin(client, url);
-#endif
+  if (url.startsWith("https://")) {
+    WiFiClientSecure client;
+    prepareSecureClient(client, timeoutMs);
+    http.begin(client, url);
+  } else {
+    WiFiClient client;
+    http.begin(client, url);
+  }
   int code = http.GET();
   String body = "";
   if (code == 200) body = http.getString();
@@ -628,13 +1223,94 @@ String httpGet(const String& url, int timeoutMs = 10000) {
   return body;
 }
 
+void syncPipelineScenario() {
+  String cfgUrl = serverBaseUrl() + "/api/pipeline/config";
+  String body = httpGet(cfgUrl, 2000);
+
+  if (body.length() > 0) {
+    StaticJsonDocument<320> doc;
+    if (!deserializeJson(doc, body)) {
+      const char* nextScenario = doc["scenario"] | (const char*)pipelineScenario;
+      const char* nextMode     = doc["mode"] | (const char*)pipelineMode;
+      long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
+      long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
+#ifdef HAS_DISPLAY
+      long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
+#endif
+
+      // Proteger escrituras de config con mutex (leídas desde Core 1)
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+      if (strcmp(nextScenario, "normal") == 0 || strcmp(nextScenario, "leak") == 0 ||
+          strcmp(nextScenario, "burst")  == 0 || strcmp(nextScenario, "obstruction") == 0) {
+        if (strcmp(nextScenario, pipelineScenario) != 0) {
+          DLOGF("[PIPE] Escenario → %s\n", nextScenario);
+        }
+        strlcpy(pipelineScenario, nextScenario, sizeof(pipelineScenario));
+      }
+      if (strcmp(nextMode, "sim") == 0 || strcmp(nextMode, "real") == 0) {
+        if (strcmp(nextMode, pipelineMode) != 0) {
+          DLOGF("[PIPE] Modo → %s\n", nextMode);
+        }
+        strlcpy(pipelineMode, nextMode, sizeof(pipelineMode));
+      }
+      // Tipo de riego (afecta umbrales del LeakDetector)
+      const char* nextIrrigStr = doc["irrigation_type"] | irrigTypeToStr(irrigationType);
+      IrrigationType nextIrrig = irrigStrToType(nextIrrigStr);
+      if (nextIrrig != irrigationType) {
+        irrigationType = nextIrrig;
+        leakDetector.begin(irrigationType);
+        DLOGF("[PIPE] Tipo riego → %s\n", irrigTypeToStr(irrigationType));
+      }
+      if (dataMutex) xSemaphoreGive(dataMutex);
+      if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
+        unsigned long nextMs = (unsigned long)nextTelemetry * 1000UL;
+        if (nextMs != telemetryIntervalMs) {
+          telemetryIntervalMs = nextMs;
+          DLOGF("[PIPE] Telemetría → %lds\n", nextTelemetry);
+        }
+      }
+      if (nextSync >= 5 && nextSync <= 3600) {
+        unsigned long nextMs = (unsigned long)nextSync * 1000UL;
+        if (nextMs != configSyncIntervalMs) {
+          configSyncIntervalMs = nextMs;
+          DLOGF("[PIPE] Sync config → %lds\n", nextSync);
+        }
+      }
+#ifdef HAS_DISPLAY
+      if (nextDisplay >= 0 && nextDisplay <= 3600) {
+        unsigned long nextMs = (unsigned long)nextDisplay * 1000UL;
+        if (nextMs != displayTimeoutMs) {
+          displayTimeoutMs = nextMs;
+          DLOGF("[PIPE] Pantalla timeout → %lds\n", nextDisplay);
+        }
+      }
+#endif
+      return;
+    }
+
+    body.trim();
+    if (body == "normal" || body == "leak" ||
+        body == "burst"  || body == "obstruction") {
+      if (strcmp(body.c_str(), pipelineScenario) != 0) {
+        DLOGF("[PIPE] Escenario → %s\n", body.c_str());
+      }
+      strlcpy(pipelineScenario, body.c_str(), sizeof(pipelineScenario));
+    }
+  }
+}
+
 void checkRelayCommand() {
-  String url = "https://" + String(server_ip)
+  String url = serverBaseUrl()
                + "/api/relay/command?mac=" + WiFi.macAddress();
   String response = httpGet(url, 2000);
   if (response.length() == 0) return;
 
-  int bitmask = response.toInt();
+  int bitmask = 0;
+  if (!parseRelayBitmask(response, bitmask)) {
+    DLOGF("[Relay] Respuesta invalida ignorada: %s\n", response.c_str());
+    return;
+  }
+
   bool changed = false;
   for (int i = 0; i < RELAY_COUNT; i++) {
     bool desired = (bitmask >> i) & 1;
@@ -642,7 +1318,7 @@ void checkRelayCommand() {
       relayActive[i] = desired;
       // JQC-3FF-S-Z activo-LOW: LOW = relay ON, HIGH = relay OFF
       digitalWrite(RELAY_PINS[i], desired ? LOW : HIGH);
-      Serial.printf("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
+      DLOGF("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
       changed = true;
     }
   }
@@ -651,24 +1327,22 @@ void checkRelayCommand() {
     for (int i = 0; i < RELAY_COUNT; i++) {
       if (relayActive[i]) actualMask |= (1 << i);
     }
-    httpPost("https://" + String(server_ip) + "/api/relay/ack", String(actualMask));
+    setLedState(anyRelayActive() ? LED_RELAY_ON : LED_IDLE);
+    httpPost(serverBaseUrl() + "/api/relay/ack", String(actualMask));
   }
 }
 
 bool httpPost(const String& url, const String& body) {
-#ifdef ESP8266
-  WiFiClient wifiClient;
   HTTPClient http;
   http.setTimeout(10000);
-  http.begin(wifiClient, url);
-#else
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(10);
-  HTTPClient http;
-  http.setTimeout(10000);
-  http.begin(client, url);
-#endif
+  if (url.startsWith("https://")) {
+    WiFiClientSecure client;
+    prepareSecureClient(client, 10000);
+    http.begin(client, url);
+  } else {
+    WiFiClient client;
+    http.begin(client, url);
+  }
   http.addHeader("Content-Type", "text/plain");
   http.addHeader("X-Device-MAC", WiFi.macAddress());
   int code = http.POST(body);
@@ -805,6 +1479,10 @@ void drawScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("METEOSTATION", 6, 4, 2);
 
+  // Indicadores de vista: ● • (punto 1 activo, punto 2 inactivo)
+  spr.fillCircle(114, 9, 3, C_TEXT);   // vista 1 (meteo) — activa
+  spr.fillCircle(123, 9, 3, C_LABEL);  // vista 2 (pipeline) — inactiva
+
   // Luz en la cabecera (icono + valor lux)
   uint16_t luxCol = tsl_ok ? C_REAL : C_SIM;
   iconSun(118, 9, luxCol);
@@ -825,12 +1503,116 @@ void drawScreen() {
   spr.fillCircle(230, 9, 5, srvCol);
   spr.drawCircle(230, 9, 5, C_TEXT);
 
-  drawCard(0, 0, "T.EXT",   temperatureMCP,     "C",    !mcp_ok);
+  drawCard(0, 0, "T.EXT",   temperatureMCP,     "C",    !temp_ok);
   drawCard(1, 0, "T.INT",   temperatureDHT,     "C",    !htu_ok);
   drawCard(2, 0, "HUMEDAD", humidity,           "%",    !htu_ok);
   drawCard(0, 1, "PRESION", (float)pressure,    "KPa",  !bar_ok);
   drawCard(1, 1, "VIENTO",  windSpeedFiltered,  "m/s",  false);
   drawCard(2, 1, "DIRECC.", currentWindDirDeg,  "deg",  false, true);
+
+  spr.pushSprite(0, 0);
+}
+
+// ── Vista 2: Pipeline (caudal + presión) ─────────────────────────────────────
+void drawPipelineScreen() {
+  spr.fillSprite(C_BG);
+
+  // Cabecera
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
+  spr.setTextColor(C_TEXT, C_HDR);
+  spr.drawString("PIPELINE", 6, 4, 2);
+
+  // Indicadores de vista: • ● (punto 1 inactivo, punto 2 activo)
+  spr.fillCircle(114, 9, 3, C_LABEL);  // vista 1 (meteo) — inactiva
+  spr.fillCircle(123, 9, 3, C_TEXT);   // vista 2 (pipeline) — activa
+
+  if (WiFi.status() == WL_CONNECTED) {
+    spr.setTextColor(C_REAL, C_HDR);
+    spr.drawString("WiFi", 168, 5, 1);
+  } else {
+    spr.setTextColor(C_RED, C_HDR);
+    spr.drawString("NoWiFi", 157, 5, 1);
+  }
+  uint16_t srvCol = lastServerOK ? C_REAL : C_RED;
+  spr.fillCircle(230, 9, 5, srvCol);
+  spr.drawCircle(230, 9, 5, C_TEXT);
+
+  // Determinar si los valores son simulados
+  bool pipeSim = (strcmp(pipelineMode, "sim") == 0);
+  uint16_t pCol = (pipeSim || !pipelinePressureOk) ? C_SIM : C_REAL;
+  uint16_t fCol = (pipeSim || !pipelineFlowOk)     ? C_SIM : C_REAL;
+
+  // Dos tarjetas anchas: presión (izquierda) | caudal (derecha)
+  // 240px - 2px borde - 2px borde - 2px separación = 234px → 117px cada zona
+  int cY = HDR_H + 2;
+  int cH = 88;
+
+  // ── Tarjeta PRESION ────────────────────────────────────────────────────────
+  spr.fillRoundRect(  1, cY, 115, cH, 4, C_CARD);
+  spr.drawRoundRect(  0, cY, 117, cH, 4, C_BORDER);
+  spr.fillRoundRect(  1, cY, 115,  3, 2, pCol);
+
+  iconGauge(14, cY + 14, pCol);
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("PRESION", 28, cY + 6, 1);
+
+  spr.setTextColor(C_TEXT, C_CARD);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.2f", sim_pipeline_pressure);
+  spr.drawString(buf, 6, cY + 22, 4);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("bar", 6, cY + cH - 14, 1);
+  spr.setTextColor(pCol, C_CARD);
+  spr.drawRightString(pipeSim || !pipelinePressureOk ? "[SIM]" : "[OK]",
+                      113, cY + cH - 14, 1);
+
+  // ── Tarjeta CAUDAL ─────────────────────────────────────────────────────────
+  spr.fillRoundRect(122, cY, 116, cH, 4, C_CARD);
+  spr.drawRoundRect(121, cY, 118, cH, 4, C_BORDER);
+  spr.fillRoundRect(122, cY, 116,  3, 2, fCol);
+
+  iconDrop(134, cY + 14, fCol);
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("CAUDAL", 148, cY + 6, 1);
+
+  spr.setTextColor(C_TEXT, C_CARD);
+  snprintf(buf, sizeof(buf), "%.2f", sim_pipeline_flow);
+  spr.drawString(buf, 126, cY + 22, 4);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("L/min", 126, cY + cH - 14, 1);
+  spr.setTextColor(fCol, C_CARD);
+  spr.drawRightString(pipeSim || !pipelineFlowOk ? "[SIM]" : "[OK]",
+                      237, cY + cH - 14, 1);
+
+  // ── Franja inferior: modo + escenario + temperatura agua ──────────────────
+  int bY = cY + cH + 3;
+  int bH = 135 - bY;
+  spr.fillRoundRect(0, bY, 240, bH, 3, C_CARD);
+
+  uint16_t modeCol = pipeSim ? C_SIM : C_REAL;
+  spr.setTextColor(modeCol, C_CARD);
+  spr.drawCentreString(
+    pipeSim ? "MODO: SIMULADO" : "MODO: REAL",
+    120, bY + 2, 1);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("Escenario:", 6, bY + 14, 1);
+  spr.setTextColor(C_TEXT, C_CARD);
+  spr.drawString(pipelineScenario, 68, bY + 14, 1);
+
+  // Temperatura interna del sensor de presión (temperatura del agua)
+  if (xdb401_ok && !isnan(xdb401Temperature)) {
+    char tbuf[10];
+    snprintf(tbuf, sizeof(tbuf), "%.1f", xdb401Temperature);
+    spr.setTextColor(C_LABEL, C_CARD);
+    spr.drawString("Taq:", 148, bY + 14, 1);
+    spr.setTextColor(C_REAL, C_CARD);
+    spr.drawString(tbuf, 170, bY + 14, 1);
+    spr.setTextColor(C_LABEL, C_CARD);
+    spr.drawString("\xB0C", 198, bY + 14, 1);
+  }
 
   spr.pushSprite(0, 0);
 }
@@ -897,31 +1679,105 @@ void drawBootScreen(const char* wifiMsg) {
 // =============================================================================
 // MQTT — Funciones auxiliares (solo ESP32 con USE_MQTT)
 // =============================================================================
-#if !defined(ESP8266) && defined(USE_MQTT)
+#if defined(USE_MQTT)
 
 // Callback para comandos entrantes en aquantia/<finca_id>/cmd
-// Payload esperado: {"relay": 0, "state": true}
+// Payload esperado: {"relay": 0, "state": true} o {"type":"pipeline_config", ...}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;
   if (deserializeJson(doc, payload, length)) return;
-  int  relay = doc["relay"] | 0;
-  bool state = doc["state"] | false;
-  if (relay < 0 || relay >= RELAY_COUNT) return;
-  relayActive[relay] = state;
-  digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
-  Serial.printf("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+
+  String targetMac = doc["mac"] | "";
+  targetMac.trim();
+  targetMac.toUpperCase();
+  String selfMac = WiFi.macAddress();
+  selfMac.trim();
+  selfMac.toUpperCase();
+  if (targetMac.length() > 0 && targetMac != selfMac) return;
+
+  if (doc.containsKey("relay")) {
+    int  relay = doc["relay"] | 0;
+    bool state = doc["state"] | false;
+    if (relay >= 0 && relay < RELAY_COUNT) {
+      relayActive[relay] = state;
+      digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
+      DLOGF("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+      setLedState(anyRelayActive() ? LED_RELAY_ON : LED_IDLE);
+    }
+  }
+
+  bool updatedPipe = false;
+  const char* nextScenario = doc["pipeline_scenario"] | (const char*)pipelineScenario;
+  const char* nextMode     = doc["pipeline_mode"] | (const char*)pipelineMode;
+  long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
+  long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
+#ifdef HAS_DISPLAY
+  long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
+#endif
+
+  // Proteger escrituras con mutex (leídas desde Core 1 eventual-consistent)
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  if (strcmp(nextScenario, "normal") == 0 || strcmp(nextScenario, "leak") == 0 ||
+      strcmp(nextScenario, "burst")  == 0 || strcmp(nextScenario, "obstruction") == 0) {
+    if (strcmp(nextScenario, pipelineScenario) != 0) {
+      strlcpy(pipelineScenario, nextScenario, sizeof(pipelineScenario));
+      updatedPipe = true;
+    }
+  }
+  if (strcmp(nextMode, "sim") == 0 || strcmp(nextMode, "real") == 0) {
+    if (strcmp(nextMode, pipelineMode) != 0) {
+      strlcpy(pipelineMode, nextMode, sizeof(pipelineMode));
+      updatedPipe = true;
+    }
+  }
+  // Tipo de riego (afecta umbrales del LeakDetector)
+  const char* nextIrrigStr = doc["irrigation_type"] | irrigTypeToStr(irrigationType);
+  IrrigationType nextIrrig = irrigStrToType(nextIrrigStr);
+  if (nextIrrig != irrigationType) {
+    irrigationType = nextIrrig;
+    leakDetector.begin(irrigationType);
+    DLOGF("[MQTT] Tipo riego → %s\n", irrigTypeToStr(irrigationType));
+  }
+  if (dataMutex) xSemaphoreGive(dataMutex);
+  if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
+    telemetryIntervalMs = (unsigned long)nextTelemetry * 1000UL;
+  }
+  if (nextSync >= 5 && nextSync <= 3600) {
+    configSyncIntervalMs = (unsigned long)nextSync * 1000UL;
+  }
+#ifdef HAS_DISPLAY
+  if (nextDisplay >= 0 && nextDisplay <= 3600) {
+    displayTimeoutMs = (unsigned long)nextDisplay * 1000UL;
+  }
+#endif
+
+  if (updatedPipe) {
+    updatePipelineValues();
+    DLOGF("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode, pipelineScenario);
+  }
 }
 
 // Conectar al broker y suscribirse al topic de comandos
 bool mqttConnect() {
-  bool ok = mqttClient.connect("aquantia-device", mqtt_user, mqtt_pass);
+  char client_id[48];
+  String mac_no_colon = WiFi.macAddress();
+  mac_no_colon.replace(":", "");
+
+  if (mac_no_colon.length() >= 12) {
+    snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
+  } else {
+    snprintf(client_id, sizeof(client_id), "aquantia-%s", device_serial_get());
+  }
+
+  bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
   if (ok) {
     char cmd_topic[64];
     snprintf(cmd_topic, sizeof(cmd_topic), "aquantia/%s/cmd", finca_id);
     mqttClient.subscribe(cmd_topic, 1);
-    Serial.printf("[MQTT] Conectado — suscrito a %s\n", cmd_topic);
+    DLOGF("[MQTT] Conectado como %s — suscrito a %s\n", client_id, cmd_topic);
   } else {
-    Serial.printf("[MQTT] Error de conexion: rc=%d\n", mqttClient.state());
+    DLOGF("[MQTT] Error de conexion: rc=%d client_id=%s\n",
+                  mqttClient.state(), client_id);
   }
   return ok;
 }
@@ -929,42 +1785,94 @@ bool mqttConnect() {
 // Publicar datos de registro al arranque (una sola vez)
 void mqttPublishRegister() {
   StaticJsonDocument<320> doc;
-  doc["device_serial"] = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
-  doc["mac_address"]   = WiFi.macAddress();
-  doc["ip_address"]    = WiFi.localIP().toString();
-  doc["chip_model"]    = ESP.getChipModel();
-  doc["chip_revision"] = (int)ESP.getChipRevision();
-  doc["cpu_freq_mhz"]  = (int)ESP.getCpuFreqMHz();
-  doc["flash_size_mb"] = (int)(ESP.getFlashChipSize() / 1048576);
-  doc["sdk_version"]   = ESP.getSdkVersion();
-  doc["relay_count"]   = RELAY_COUNT;
-  char topic[64], buf[256];
+  doc["device_serial"]    = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
+  doc["mac_address"]      = WiFi.macAddress();
+  doc["ip_address"]       = WiFi.localIP().toString();
+  doc["chip_model"]       = ESP.getChipModel();
+  doc["chip_revision"]    = (int)ESP.getChipRevision();
+  doc["cpu_freq_mhz"]     = (int)ESP.getCpuFreqMHz();
+  doc["flash_size_mb"]    = (int)(ESP.getFlashChipSize() / 1048576);
+  doc["sdk_version"]      = ESP.getSdkVersion();
+  doc["relay_count"]      = RELAY_COUNT;
+  doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["device_profile"]   =
+    (DEVICE_PROFILE == PROFILE_METEO)      ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_IRRIGATION) ? "IRRIGATION" : "AGROMETEO";
+
+  char topic[64], buf[768];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
-  serializeJson(doc, buf, sizeof(buf));
-  mqttClient.publish(topic, buf, false);
-  Serial.printf("[MQTT] Register publicado: %s\n", buf);
+  size_t payload_len = serializeJson(doc, buf, sizeof(buf));
+  bool ok = mqttClient.publish(topic, buf, false);
+  DLOGF("[MQTT] Register %s (%u B)\n",
+                ok ? "publicado" : "ERROR",
+                (unsigned)payload_len);
 }
 
-#endif  // !ESP8266 && USE_MQTT
+#endif  // USE_MQTT
+
+// =============================================================================
+// Snapshot de datos — captura atómica de sensores para telemetría.
+// Rellena la variable global _netSnap (definida junto a los vars FreeRTOS).
+// Sin parámetros para evitar el problema de auto-prototype del Arduino IDE
+// con tipos personalizados en la firma.
+// =============================================================================
+void takeSnapshot() {
+  // Core 1 construye el snapshot completo y lo publica en telemetryQueue.
+  // Core 0 solo lo lee aquí — sin bloqueo, sin mutex, sin latencia de 50ms.
+  if (telemetryQueue) {
+    xQueuePeek(telemetryQueue, &_netSnap, 0);
+  }
+  // Campos que Core 0 puede leer directamente (thread-safe en ESP32: 32-bit, same-core read)
+  _netSnap.heap   = (long)ESP.getFreeHeap();
+  _netSnap.rssi   = WiFi.RSSI();
+  _netSnap.uptime = (long)(millis() / 1000);
+}
 
 // =============================================================================
 // TAREA DE RED — Core 0 (solo ESP32)
 // Gestiona OTA, relay polling y HTTP POST sin bloquear sensores/display (Core 1)
 // =============================================================================
-#ifndef ESP8266
 void networkTask(void* pvParameters) {
-  static bool          deviceInfoSent = false;
-  static unsigned long lastRelayCheck = 0;
-  static unsigned long lastSendTime   = 0;
+  // Tarea separada de red para no bloquear sensores ni la UI principal.
+  // Mantiene yields periódicos con vTaskDelay() al final del bucle.
+
+  // En IDF 5.x el sistema ya inicia el TWDT para las tareas IDLE.
+  // esp_task_wdt_init() devuelve ESP_ERR_INVALID_STATE si ya está inicializado
+  // y el timeout corto del sistema permanecería activo — usar reconfigure como fallback.
+  {
+    esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+    if (esp_task_wdt_init(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+      esp_task_wdt_reconfigure(&wdt_cfg);
+    }
+  }
+  esp_task_wdt_add(NULL);
+
+  static bool          deviceInfoSent   = false;
+  static unsigned long lastRelayCheck   = 0;
+  static unsigned long lastSendTime     = 0;
+  static unsigned long lastScenarioSync = 0;
+  static unsigned long lastNtpRetry     = 0;
+  static unsigned long wifiRetryDelayMs  = 500;
+  static unsigned long wifiStableSince   = 0;  // millis() al reconectar
 
 #ifdef USE_MQTT
-  mqttTLSClient.setInsecure();  // DEBUG: skip cert verify — revert to setCACert() cuando funcione
+  static unsigned long mqttRetryDelayMs = 2000;
+
+  if (mqtt_port == 8883) {
+    prepareSecureClient(mqttTLSClient, 10000);
+    mqttClient.setClient(mqttTLSClient);
+    DLOGF("[MQTT] Broker TLS verificado: %s:%d\n", mqtt_server, mqtt_port);
+  } else {
+    mqttClient.setClient(mqttTCPClient);
+    DLOGF("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
+  }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(512);
+  mqttClient.setBufferSize(1024);
 #endif
 
   for (;;) {
+    esp_task_wdt_reset();
     ArduinoOTA.handle();  // siempre primero, alta frecuencia
 
     if (isUpdatingOTA) {
@@ -973,20 +1881,44 @@ void networkTask(void* pvParameters) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+      setLedState(LED_WIFI_CONNECTING);
+      wifiStableSince = 0;
       WiFi.reconnect();
-      vTaskDelay(500 / portTICK_PERIOD_MS);
+      vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+      if (wifiRetryDelayMs < 5000) wifiRetryDelayMs *= 2;
       continue;
     }
+    // Resetear backoff solo tras 10s de conexión estable (evita martillear el AP)
+    if (wifiStableSince == 0) wifiStableSince = millis();
+    if (millis() - wifiStableSince > 10000) wifiRetryDelayMs = 500;
 
     unsigned long now = millis();
 
 #ifdef USE_MQTT
+    // Reintentar NTP cada 60s si el reloj no está sincronizado (fallo en boot)
+    if (time(nullptr) < 1000000000L && (now - lastNtpRetry > 60000 || lastNtpRetry == 0)) {
+      DLOGLN("[NTP] Reintentando sincronización...");
+      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+      lastNtpRetry = now;
+    }
+#endif
+
+    if (lastScenarioSync == 0 || now - lastScenarioSync >= configSyncIntervalMs) {
+      syncPipelineScenario();
+      lastScenarioSync = now;
+    }
+
+#ifdef USE_MQTT
     // ── Modo MQTT ────────────────────────────────────────────────────────────
     if (!mqttClient.connected()) {
+      setLedState(LED_MQTT_CONNECTING);
       if (!mqttConnect()) {
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
+        if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
         continue;
       }
+      setLedState(LED_IDLE);
+      mqttRetryDelayMs = 2000;
       if (!deviceInfoSent) {
         mqttPublishRegister();
         deviceInfoSent = true;
@@ -995,58 +1927,64 @@ void networkTask(void* pvParameters) {
     mqttClient.loop();
 
     // Publicar telemetría cada MQTT_SEND_MS
-    if (now - lastSendTime >= MQTT_SEND_MS) {
-      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
-      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
-      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
-      long  snap_heap;
-      int   snap_rssi;
-      long  snap_uptime;
-      int   snap_relayMask = 0;
-
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        snap_tempMCP       = temperatureMCP;
-        snap_pressure      = (float)pressure;
-        snap_tempDHT       = temperatureDHT;
-        snap_humidity      = humidity;
-        snap_windSpeed     = windSpeed;
-        snap_windDir       = currentWindDirDeg;
-        snap_windSpeedFilt = windSpeedFiltered;
-        snap_avgWindDir    = calcAndResetWindVector();
-        snap_light         = lightLevel;
-        snap_tempDHT11     = temperatureDHT11;
-        snap_humDHT11      = humidityDHT11;
-        snap_soil          = soilMoisture;
-        snap_heap          = (long)ESP.getFreeHeap();
-        snap_rssi          = WiFi.RSSI();
-        snap_uptime        = (long)(millis() / 1000);
-        for (int i = 0; i < RELAY_COUNT; i++)
-          if (relayActive[i]) snap_relayMask |= (1 << i);
-        xSemaphoreGive(dataMutex);
-      }
+    if (now - lastSendTime >= telemetryIntervalMs) {
+      takeSnapshot();
+      const TelemetrySnapshot& snap = _netSnap;
 
       // Redondeo para reducir tamaño del payload MQTT
       auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
       auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
 
-      StaticJsonDocument<512> doc;
-      doc["temperature"]           = r2(snap_tempMCP);
-      doc["pressure"]              = r2(snap_pressure);
-      doc["temperature_barometer"] = r2(snap_tempDHT);
-      doc["humidity"]              = r2(snap_humidity);
-      doc["windSpeed"]             = r2(snap_windSpeed);
-      doc["windDirection"]         = r1(snap_windDir);
-      doc["windSpeedFiltered"]     = r2(snap_windSpeedFilt);
-      doc["windDirectionFiltered"] = r1(snap_avgWindDir);
-      doc["light"]                 = r1(snap_light);
-      doc["dht_temperature"]       = r1(snap_tempDHT11);
-      doc["dht_humidity"]          = r1(snap_humDHT11);
-      doc["rssi"]                  = snap_rssi;
-      doc["free_heap"]             = snap_heap;
-      doc["uptime_s"]              = snap_uptime;
-      doc["relay_active"]          = snap_relayMask;
-      doc["soil_moisture"]         = r1(snap_soil);
+      // Payload ampliado con métricas explícitas del BMP280.
+      StaticJsonDocument<1280> doc;
+      doc["temperature"]           = r2(snap.tempMCP);
+      doc["pressure"]              = r2(snap.pressure);
+      doc["temperature_barometer"] = r2(snap.tempDHT);
+      doc["humidity"]              = r2(snap.humidity);
+      doc["temperature_source"]    = temperatureSourceName();
+      doc["pressure_source"]       = pressureSourceName();
+      doc["bmp280_ok"]             = bmp_ok && (bmp_temp_ok || bmp_pressure_ok);
+      if (!isnan(snap.bmpTemp))     doc["bmp280_temperature"] = r2(snap.bmpTemp);
+      if (!isnan(snap.bmpPressure)) doc["bmp280_pressure"] = r2(snap.bmpPressure);
+      // Nuevo: incluir ambas presiones explícitamente
+      doc["pressure_micro"] = r2(snap.pressure);        // MicroPressure (SparkFun)
+      doc["pressure_bmp280"] = r2(snap.bmpPressure);    // BMP280
+      doc["windSpeed"]             = r2(snap.windSpeed);
+      doc["windDirection"]         = r1(snap.windDir);
+      doc["windSpeedFiltered"]     = r2(snap.windSpeedFilt);
+      doc["windDirectionFiltered"] = r1(snap.avgWindDir);
+      doc["light"]                 = r1(snap.light);
+      doc["dht_temperature"]       = r1(snap.tempDHT11);
+      doc["dht_humidity"]          = r1(snap.humDHT11);
+      doc["rssi"]                  = snap.rssi;
+      doc["free_heap"]             = snap.heap;
+      doc["uptime_s"]              = snap.uptime;
+      doc["relay_active"]          = snap.relayMask;
+      doc["soil_moisture"]         = r1(snap.soil);
+      doc["pipeline_pressure"]     = r2(snap.pipePressure);
+      doc["pipeline_flow"]         = r2(snap.pipeFlow);
+      doc["pipeline_scenario"]     = pipelineScenario;
+      doc["pipeline_mode"]         = pipelineMode;
+      doc["pipeline_source"]       = pipelineSource;
+      doc["irrigation_type"]       = irrigTypeToStr(irrigationType);
+      doc["leak_detect_trained"]   = leakDetector.hasBaseline();
+      doc["pipeline_pressure_ok"]  = pipelinePressureOk;
+      doc["pipeline_flow_ok"]      = pipelineFlowOk;
+      doc["leak_baseline_pressure"] = r2(leakDetector.baselinePressure());
+      doc["leak_baseline_flow"]     = r2(leakDetector.baselineFlow());
+      doc["leak_warmup_progress"]   = leakDetector.warmupProgress();
+      doc["xdb401_ok"]             = xdb401_ok;
+      if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
       doc["mac_address"]           = WiFi.macAddress();
+      doc["ip_address"]            = WiFi.localIP().toString();
+      doc["relay_count"]           = RELAY_COUNT;
+      doc["firmware_version"]      = FIRMWARE_VERSION;
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+      // Parámetros calculados agrometeorologícos — solo PROFILE_AGROMETEO
+      if (!isnan(snap.dewPoint))   doc["dew_point"]    = r1(snap.dewPoint);
+      if (!isnan(snap.heatIndex))  doc["heat_index"]   = r1(snap.heatIndex);
+      if (!isnan(snap.absHum))     doc["abs_humidity"] = r2(snap.absHum);
+#endif
       // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
       // El backend lo usa como timestamp real de la medición en lugar de NOW().
       {
@@ -1054,13 +1992,17 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[512];
+      char topic[64], buf[1280];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
-      serializeJson(doc, buf, sizeof(buf));
-      digitalWrite(ledPin, LED_ON);
+      size_t payload_len = serializeJson(doc, buf, sizeof(buf));
+      if (payload_len >= sizeof(buf)) {
+        DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n",
+                      (unsigned)payload_len, (unsigned)sizeof(buf));
+      }
       bool ok = mqttClient.publish(topic, buf, false);
-      digitalWrite(ledPin, LED_OFF);
-      Serial.printf("[MQTT] TX %s: %s\n", ok ? "OK" : "ERROR", buf);
+      setLedState(ok ? LED_TX_OK : LED_TX_ERROR);
+      DLOGF("[MQTT] TX %s (%u B): %s\n", ok ? "OK" : "ERROR",
+                    (unsigned)payload_len, buf);
 
       lastServerOK = ok;
       lastSendTime = now;
@@ -1081,51 +2023,25 @@ void networkTask(void* pvParameters) {
     }
 
     // HTTP POST cada SEND_MS — captura snapshot con mutex
-    if (now - lastSendTime >= SEND_MS) {
-      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
-      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
-      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
-      long  snap_heap;
-      int   snap_rssi;
-      long  snap_uptime;
-      int   snap_relayMask = 0;
+    if (now - lastSendTime >= telemetryIntervalMs) {
+      takeSnapshot();
+      const TelemetrySnapshot& snap = _netSnap;
 
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        snap_tempMCP       = temperatureMCP;
-        snap_pressure      = (float)pressure;
-        snap_tempDHT       = temperatureDHT;
-        snap_humidity      = humidity;
-        snap_windSpeed     = windSpeed;
-        snap_windDir       = currentWindDirDeg;
-        snap_windSpeedFilt = windSpeedFiltered;
-        snap_avgWindDir    = calcAndResetWindVector();
-        snap_light         = lightLevel;
-        snap_tempDHT11     = temperatureDHT11;
-        snap_humDHT11      = humidityDHT11;
-        snap_soil          = soilMoisture;
-        snap_heap          = (long)ESP.getFreeHeap();
-        snap_rssi          = WiFi.RSSI();
-        snap_uptime        = (long)(millis() / 1000);
-        for (int i = 0; i < RELAY_COUNT; i++)
-          if (relayActive[i]) snap_relayMask |= (1 << i);
-        xSemaphoreGive(dataMutex);
-      }
-
-      String url = "https://" + String(server_ip) + "/send_message";
-      char msg[256];
+      String url = serverBaseUrl() + "/send_message";
+      char msg[320];
       snprintf(msg, sizeof(msg),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f",
-        snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity,
-        snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir,
-        snap_light, snap_tempDHT11, snap_humDHT11,
-        snap_rssi, snap_heap, snap_uptime, snap_relayMask, snap_soil
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
+        snap.tempMCP, snap.pressure, snap.tempDHT, snap.humidity,
+        snap.windSpeed, snap.windDir, snap.windSpeedFilt, snap.avgWindDir,
+        snap.light, snap.tempDHT11, snap.humDHT11,
+        snap.rssi, snap.heap, snap.uptime, snap.relayMask,
+        snap.pipePressure, snap.pipeFlow, snap.soil
       );
 
-      Serial.printf("[NET] TX: %s\n", msg);
-      digitalWrite(ledPin, LED_ON);
+      DLOGF("[NET] TX: %s\n", msg);
       bool ok = httpPost(url, String(msg));
-      digitalWrite(ledPin, LED_OFF);
-      Serial.printf("[NET] HTTP %s\n", ok ? "200 OK" : "ERROR");
+      setLedState(ok ? LED_TX_OK : LED_TX_ERROR);
+      DLOGF("[NET] HTTP %s\n", ok ? "200 OK" : "ERROR");
 
       lastServerOK = ok;
       lastSendTime = now;
@@ -1135,7 +2051,6 @@ void networkTask(void* pvParameters) {
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
-#endif
 
 // =============================================================================
 // SETUP
@@ -1144,37 +2059,56 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   setCpuFrequencyMhz(160);
-  Serial.println("\n\n=== MeteoStation BOOT ===");
+  DLOGLN("\n\n=== MeteoStation BOOT ===");
 
 #ifdef DEBUG_MODE
-  Serial.println("=== DEBUG MODE ACTIVO ===");
-  Serial.printf("[TEST] Perfil  : %s (%d)\n",
-    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", DEVICE_PROFILE);
-  Serial.printf("[TEST] Relays  : %d\n", RELAY_COUNT);
-  Serial.printf("[TEST] Display : %s\n",
+  DLOGLN("=== DEBUG MODE ACTIVO ===");
+  DLOGF("[TEST] Perfil  : %s (%d)\n",
+    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", DEVICE_PROFILE);
+  DLOGF("[TEST] Relays  : %d\n", RELAY_COUNT);
+  DLOGF("[TEST] Display : %s\n",
 #ifdef HAS_DISPLAY
     "SI (TFT 240x135)"
 #else
     "NO"
 #endif
   );
-  Serial.printf("[TEST] MQTT    : %s\n",
+  DLOGF("[TEST] MQTT    : %s\n",
 #ifdef USE_MQTT
     "HABILITADO"
 #else
     "DESHABILITADO"
 #endif
   );
-  Serial.printf("[TEST] MAC ROM : %s\n", device_serial_get());
+  DLOGF("[TEST] MAC ROM : %s\n", device_serial_get());
 #endif  // DEBUG_MODE
 
-  // ── TFT init PRIMERO — debe ir antes del provisioning para poder mostrar ──
+  // I2C debe inicializarse antes del TFT para que el periman de ESP32 core 3.x
+  // registre los pines correctamente antes de que SPI los reclame.
+  DLOGLN("Iniciando I2C...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);  // 100 kHz globales — el XDB401 no aguanta 400 kHz
+  Wire.setTimeOut(100);   // timeout 100ms para evitar hang si un sensor no responde
+  DLOGLN("I2C OK");
+
+  // ── TFT init — debe ir antes del provisioning para poder mostrar ──
   // el portal AP si el dispositivo no tiene credenciales WiFi en NVS
 #ifdef HAS_DISPLAY
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  spr.createSprite(240, 135);
+  void* sprPtr = spr.createSprite(240, 135);
+  if (!sprPtr) {
+    DLOGF("[TFT] ERROR: createSprite falló (heap libre: %ld)\n", (long)ESP.getFreeHeap());
+    // Fallback: dibujar directamente en tft sin sprite
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("SPRITE FAIL", 120, 60, 4);
+  } else {
+    DLOGF("[TFT] Sprite creado OK (heap libre: %ld)\n", (long)ESP.getFreeHeap());
+  }
   spr.setSwapBytes(true);
   pinMode(BTN_LEFT,  INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT);
@@ -1183,15 +2117,21 @@ void setup() {
   provisioning_register_ap_display([](const char* ap_ssid, const char* serial) {
     drawAPScreen(ap_ssid, serial);
   });
+  // Diagnóstico TFT — dibujar directamente en el display (sin sprite) para verificar
+  tft.fillScreen(TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.drawCentreString("TFT OK", 120, 50, 4);
+  tft.drawCentreString(String(ESP.getFreeHeap()).c_str(), 120, 85, 2);
+  delay(1500);
   drawBootScreen("Iniciando...");
 #endif
 
   // ── Credenciales: DEV_MODE (directo) vs PROD (NVS + portal) ──────────────
 #ifdef DEV_MODE
   // ── Modo desarrollo: usa secrets.h directamente, sin NVS ni portal ────────
-  Serial.println("[DEV] DEV_MODE activo — saltando provisioning");
+  DLOGLN("[DEV] DEV_MODE activo — saltando provisioning");
   // ssid/password/finca_id/mqtt_pass ya apuntan a los literales de secrets.h
-#elif !defined(ESP8266)
+#else
   // ── Modo producción: factory reset + NVS + portal SoftAP ─────────────────
   provisioning_check_factory_reset();
 
@@ -1210,38 +2150,46 @@ void setup() {
         snprintf(ap_ssid_buf, sizeof(ap_ssid_buf), "Aquantia-%.6s", ser + 9);
       else
         strlcpy(ap_ssid_buf, "Aquantia-??????", sizeof(ap_ssid_buf));
-      Serial.printf("[TFT] Mostrando pantalla AP: %s\n", ap_ssid_buf);
+      DLOGF("[TFT] Mostrando pantalla AP: %s\n", ap_ssid_buf);
       drawAPScreen(ap_ssid_buf, ser);
     }
 #endif
+    setLedState(LED_PROVISIONING);  // portal AP activo — triple blink lento
     provisioning_start_ap();  // bloquea hasta que el usuario configure
   }
 
   ssid     = prov_ssid;
   password = prov_password;
-  Serial.printf("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
+  DLOGF("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
 #endif  // DEV_MODE / producción
 
-  Serial.println("Iniciando I2C...");
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Serial.println("I2C OK");
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  // ── AGROMETEO: Qwiic Power Switch — encender ANTES del escáner ───────────
+  qwiic_ps_ok = qwiic_ps.begin(Wire);   // begin() devuelve false si no detecta el PCA9536 en 0x41
+  if (qwiic_ps_ok) {
+    qwiic_ps.powerOn();
+    delay(50);   // esperar estabilización de alimentación antes de init I2C
+    DLOGLN("Qwiic Power Switch OK — sensores encendidos");
+  } else {
+    DLOGLN("Qwiic Power Switch no detectado — sensores siempre alimentados");
+  }
+#endif
 
   // Escaner I2C — detecta todos los dispositivos en el bus
-  Serial.println("Escaneando bus I2C...");
+  DLOGLN("Escaneando bus I2C...");
   int found = 0;
   for (uint8_t addr = 1; addr < 127; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      Serial.printf("  Dispositivo en 0x%02X\n", addr);
+      DLOGF("  Dispositivo en 0x%02X\n", addr);
       found++;
     }
     delay(2);
   }
-  if (found == 0) Serial.println("  Ningun dispositivo encontrado");
-  else Serial.printf("  Total: %d dispositivos\n", found);
+  if (found == 0) DLOGLN("  Ningun dispositivo encontrado");
+  else DLOGF("  Total: %d dispositivos\n", found);
 
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LED_OFF);
+  if (ledPin >= 0) { pinMode(ledPin, OUTPUT); digitalWrite(ledPin, LED_OFF); }
 
   // Relay(s) — arrancar siempre en OFF (seguro)
   // JQC-3FF-S-Z activo-LOW: HIGH = relay OFF (válvula cerrada)
@@ -1249,15 +2197,24 @@ void setup() {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], HIGH);  // HIGH = OFF para relay activo-LOW
   }
-  Serial.printf("%d relay(s) inicializados en OFF (HIGH)\n", RELAY_COUNT);
+  DLOGF("%d relay(s) inicializados en OFF (HIGH)\n", RELAY_COUNT);
 
-#if defined(ESP32) && !defined(ESP8266)
+#if defined(ESP32)
   analogReadResolution(12);
   #if defined(SOIL_PIN)
   pinMode(SOIL_PIN, ANALOG);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
-  Serial.printf("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
+  DLOGF("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
   #endif
+#endif
+
+#if defined(FLOW_PIN)
+  // Caudalímetro: pull-up interno activo (BC547 NPN invierte señal → FALLING = pulso)
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  _flowLastCalcMs = millis();
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowPulseISR, FALLING);
+  DLOGF("Caudalimetro GPIO%d configurado (ISR FALLING, K=%d pulsos/L)\n",
+        FLOW_PIN, FLOW_K_FACTOR);
 #endif
   // Nota: TFT ya inicializado al principio de setup() para soportar pantalla AP
 
@@ -1265,24 +2222,137 @@ void setup() {
   mcp_ok = tempsensor.begin(0x19);
   if (mcp_ok) {
     tempsensor.setResolution(3);
-    Serial.println("MCP9808 OK");
+    DLOGLN("MCP9808 OK");
   } else {
-    Serial.println("MCP9808 no detectado — modo simulacion");
-    temperatureMCP = sim_tempMCP;
+    DLOGLN("MCP9808 no detectado");
   }
 
-  bar_ok = barometer.begin();
-  if (bar_ok) {
-    Serial.println("Barometro OK");
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                       Adafruit_BMP280::SAMPLING_X2,
+                       Adafruit_BMP280::SAMPLING_X16,
+                       Adafruit_BMP280::FILTER_X16,
+                       Adafruit_BMP280::STANDBY_MS_500);
+    float tBmp = NAN;
+    float pBmp = NAN;
+    bmp_temp_ok = readBMP280Temperature(tBmp);
+    bmp_pressure_ok = readBMP280PressureKPa(pBmp);
+    if (bmp_temp_ok) bmpTemperature = tBmp;
+    if (bmp_pressure_ok) bmpPressure = pBmp;
+    DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
   } else {
-    Serial.println("Barometro no detectado — modo simulacion");
+    bmp_temp_ok = false;
+    bmp_pressure_ok = false;
+    DLOGLN("BMP280 no detectado");
+  }
+
+  temp_ok = mcp_ok || bmp_temp_ok;
+  if (!temp_ok) {
+    DLOGLN("Temperatura externa sin sensor real — modo simulacion");
+    temperatureMCP = sim_tempMCP;
+  } else if (!mcp_ok && bmp_temp_ok) {
+    temperatureMCP = bmpTemperature;
+    DLOGLN("Temperatura externa usara BMP280");
+  }
+
+  micropressure_ok = barometer.begin();
+  bar_ok = micropressure_ok || bmp_pressure_ok;
+  if (micropressure_ok) {
+    DLOGLN("Barometro MicroPressure OK");
+  } else if (bmp_pressure_ok) {
+    pressure = bmpPressure;
+    DLOGLN("MicroPressure no detectado — usando BMP280 como barometro");
+  } else {
+    DLOGLN("Barometro no detectado — modo simulacion");
     pressure = sim_pressure;
   }
+  DLOGF("Sensores activos → TempExt:%s | Presion:%s\n",
+    temperatureSourceName(), pressureSourceName());
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  DLOGLN("MCP9808 — perfil AGROMETEO, sensor omitido");
+  DLOGLN("BMP280 y MicroPressure — inicializados en bloque AGROMETEO");
 #else
-  Serial.println("MCP9808 — perfil IRRIGATION, sensor omitido");
-  Serial.println("Barometro — perfil IRRIGATION, sensor omitido");
+  DLOGLN("MCP9808 — perfil IRRIGATION, sensor omitido");
+  DLOGLN("BMP280 — perfil IRRIGATION, sensor omitido");
+  DLOGLN("Barometro — perfil IRRIGATION, sensor omitido");
 #endif
 
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+  // Nota: Qwiic Power Switch ya inicializado antes del escáner I2C (ver arriba)
+
+  // ── AGROMETEO: MicroPressure + BMP280 + HDC1080 + BH1750 ────────────────
+  // MicroPressure — barómetro principal (0x18); BMP280 como fallback de presión
+  micropressure_ok = barometer.begin();
+  if (micropressure_ok) {
+    double p = barometer.readPressure(KPA);
+    if (p > 50.0 && p < 120.0) { pressure = p; bar_ok = true; }
+    DLOGLN("MicroPressure OK");
+  } else {
+    DLOGLN("MicroPressure no detectado — usando BMP280 como barometro");
+  }
+
+  // BMP280 — temperatura secundaria + presión de respaldo si falta MicroPressure
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                      Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16,
+                      Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_500);
+    float tBmp = NAN, pBmp = NAN;
+    bmp_temp_ok     = readBMP280Temperature(tBmp);
+    bmp_pressure_ok = readBMP280PressureKPa(pBmp);
+    if (bmp_temp_ok)     bmpTemperature = tBmp;
+    if (bmp_pressure_ok) { bmpPressure = pBmp; if (!micropressure_ok) { pressure = pBmp; bar_ok = true; } }
+    DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
+  } else {
+    bmp_temp_ok     = false;
+    bmp_pressure_ok = false;
+    if (!micropressure_ok) { bar_ok = false; pressure = sim_pressure; }
+    DLOGLN("BMP280 no detectado — modo simulacion");
+  }
+
+  // HDC1080 — temperatura y humedad primaria
+  hdc_ok = hdc1080_init();
+  if (hdc_ok) {
+    float t = hdc1080_readTemp();
+    float h = hdc1080_readHum();
+    if (!isnan(t) && !isnan(h)) {
+      temperatureMCP = t;
+      humidity       = h;
+      temp_ok        = true;
+      DLOGF("HDC1080 OK — T:%.1f C  H:%.1f %%\n", t, h);
+    } else {
+      hdc_ok = false;
+    }
+  }
+  if (!hdc_ok) {
+    DLOGLN("HDC1080 no detectado — modo simulacion");
+    temperatureMCP = sim_tempMCP;
+    humidity       = sim_humidity;
+  }
+
+  // BH1750 — iluminancia
+  bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  if (bh1750_ok) {
+    delay(200);  // primera conversión ~120ms
+    lightLevel = bh1750.readLightLevel();
+    DLOGF("BH1750 OK — %.1f lx\n", lightLevel);
+  } else {
+    DLOGLN("BH1750 no detectado — modo simulacion");
+    lightLevel = sim_light;
+  }
+
+  // Sensores quedan encendidos permanentemente — el Qwiic Power Switch NO se apaga entre ciclos.
+  // Esto es necesario para que BMP280 (filtro IIR x16) y BH1750 (modo continuo) acumulen
+  // mediciones estables. Apagarlos entre lecturas reinicia los filtros internos y exige
+  // esperar 120-180 ms de conversión en cada ciclo.
+  DLOGLN("Qwiic Power Switch — sensores alimentados de forma continua");
+#endif  // PROFILE_AGROMETEO
+
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+  // HTU2x — omitido en AGROMETEO (dirección 0x40 ocupada por HDC1080)
   htu_ok = htu_begin();
   if (htu_ok) {
     htu_heater_warmup();
@@ -1291,16 +2361,21 @@ void setup() {
     if (!isnan(t) && !isnan(h)) {
       temperatureDHT = t;
       humidity       = h;
-      Serial.printf("HTU2x OK — T:%.1f C  H:%.1f %%\n", t, h);
+      DLOGF("HTU2x OK — T:%.1f C  H:%.1f %%\n", t, h);
     } else {
       htu_ok = false;
     }
   }
   if (!htu_ok) {
-    Serial.println("HTU2x no detectado — modo simulacion");
+    DLOGLN("HTU2x no detectado — modo simulacion");
     temperatureDHT = sim_tempDHT;
     humidity       = sim_humidity;
   }
+#else
+  // AGROMETEO: sin HTU2x — HDC1080 ya inicializado
+  htu_ok         = false;
+  temperatureDHT = sim_tempDHT;  // campo no usado en AGROMETEO
+#endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
   // DHT11
@@ -1312,26 +2387,32 @@ void setup() {
     if (dht_ok) {
       temperatureDHT11 = th.temperature;
       humidityDHT11    = th.humidity;
-      Serial.println("DHT11 OK");
+      DLOGLN("DHT11 OK");
     } else {
-      Serial.println("DHT11 no detectado — modo simulacion");
+      DLOGLN("DHT11 no detectado — modo simulacion");
       temperatureDHT11 = sim_tempDHT11;
       humidityDHT11    = sim_humDHT11;
     }
   }
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  DLOGLN("DHT11 — perfil AGROMETEO, sensor omitido");
 #else
-  Serial.println("DHT11 — perfil IRRIGATION, sensor omitido");
+  DLOGLN("DHT11 — perfil IRRIGATION, sensor omitido");
 #endif
 
-  // TSL2584 — el begin() ya espera la primera integración (450ms)
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+  // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750 inicializado arriba)
   tsl_ok = tsl_begin();
   if (tsl_ok) {
-    Serial.println("Sensor luz OK");
+    DLOGLN("Sensor luz OK");
     lightLevel = tsl_readLux();
   } else {
-    Serial.println("Sensor luz no detectado — modo simulacion");
+    DLOGLN("Sensor luz no detectado — modo simulacion");
     lightLevel = sim_light;
   }
+#else
+  tsl_ok = false;  // AGROMETEO usa BH1750, no TSL/APDS
+#endif
 
 #if defined(SOIL_PIN)
   {
@@ -1342,37 +2423,43 @@ void setup() {
       (float)(SOIL_RAW_DRY - raw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
       0.0f, 100.0f
     );
-    Serial.printf("YL-69 OK — suelo: %.1f %% (ADC raw=%d)\n", soilMoisture, raw);
+    DLOGF("YL-69 OK — suelo: %.1f %% (ADC raw=%d)\n", soilMoisture, raw);
   }
 #endif
 
-#ifdef ESP8266
-  Serial.println("Plataforma: ESP8266 (sin pantalla, sin veleta)");
-#else
-  Serial.println("Plataforma: ESP32 (con pantalla TFT)");
-#endif
+  DLOGLN("Plataforma: ESP32 (con pantalla TFT)");
+
+  // ── XDB401 — sensor de presión de tubería I2C (todos los perfiles ESP32) ──
+  xdb401_ok = xdb401_begin();
+  if (xdb401_ok) {
+    DLOGLN("XDB401 OK — sensor presion tuberia detectado");
+    // Si no hay caudalímetro, activar modo real para aprovechar la presión real
+    if (strcmp(pipelineMode, "sim") == 0) strlcpy(pipelineMode, "real", sizeof(pipelineMode));
+  } else {
+    DLOGLN("XDB401 no detectado — presion tuberia en modo simulacion");
+  }
+  leakDetector.begin(irrigationType);
 
 #ifdef HAS_DISPLAY
   drawBootScreen("Conectando WiFi...");
 #endif
 
-  Serial.println("Conectando WiFi...");
+  setLedState(LED_WIFI_CONNECTING);
+  DLOGLN("Conectando WiFi...");
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
     delay(500);
-#ifdef ESP8266
-    yield();
-#endif
-    Serial.print(".");
+    DLOG(".");
     tries++;
   }
-  Serial.println();
+  DLOGLN();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi OK: " + WiFi.localIP().toString());
+    setLedState(LED_MQTT_CONNECTING);
+    DLOGLN("WiFi OK: " + WiFi.localIP().toString());
 
-#if !defined(ESP8266) && defined(USE_MQTT)
+#if defined(USE_MQTT)
   #ifndef DEV_MODE
     // PROD: mqtt_user = MAC del dispositivo (lookup en mosquitto-go-auth)
     static char _mac_buf[20];
@@ -1384,7 +2471,7 @@ void setup() {
     if (prov_mqtt_token[0] != '\0') {
       mqtt_pass = prov_mqtt_token;
     } else {
-      Serial.println("[MQTT] ADVERTENCIA: sin token NVS — dispositivo no provisionado de fábrica");
+      DLOGLN("[MQTT] ADVERTENCIA: sin token NVS — dispositivo no provisionado de fábrica");
     }
     // finca_id = MAC hex (identidad del dispositivo; el backend asocia a la finca tras el claim)
     static char _finca_mac[16];
@@ -1395,16 +2482,12 @@ void setup() {
     finca_id = _finca_mac;
   #endif
 
-    Serial.printf("[MQTT] Auth user: %s  |  Serial: %s\n",
+    DLOGF("[MQTT] Auth user: %s  |  Serial: %s\n",
                   mqtt_user, device_serial_get());
 #endif
 
     // ── OTA (Over-The-Air) ──────────────────────────────────────────────────
-#ifdef ESP8266
-    ArduinoOTA.setHostname("meteostation-esp8266");
-#else
     ArduinoOTA.setHostname("meteostation-esp32");
-#endif
     // Contraseña OTA opcional — definir OTA_PASSWORD en secrets.h para activarla
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1412,15 +2495,15 @@ void setup() {
     ArduinoOTA.onStart([]() {
       isUpdatingOTA = true;
       String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
-      Serial.printf("\n[OTA] Inicio de actualización (%s) — relays a OFF por seguridad\n", type.c_str());
+      DLOGF("\n[OTA] Inicio de actualización (%s) — relays a OFF por seguridad\n", type.c_str());
       // Apagar todos los relays por seguridad durante el flash
       for (int i = 0; i < RELAY_COUNT; i++) digitalWrite(RELAY_PINS[i], HIGH);
     });
     ArduinoOTA.onEnd([]() {
-      Serial.println("\n[OTA] Actualización completada — reiniciando");
+      DLOGLN("\n[OTA] Actualización completada — reiniciando");
     });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("[OTA] %u%% (%u/%u bytes)\r", progress * 100 / total, progress, total);
+      DLOGF("[OTA] %u%% (%u/%u bytes)\r", progress * 100 / total, progress, total);
     });
     ArduinoOTA.onError([](ota_error_t error) {
       isUpdatingOTA = false;
@@ -1432,30 +2515,34 @@ void setup() {
         case OTA_RECEIVE_ERROR: msg = "Fallo al recibir datos";  break;
         case OTA_END_ERROR:     msg = "Fallo al finalizar";      break;
       }
-      Serial.printf("[OTA] ERROR %u: %s\n", error, msg);
+      DLOGF("[OTA] ERROR %u: %s\n", error, msg);
     });
     ArduinoOTA.begin();
 
-#if !defined(ESP8266) && defined(USE_MQTT)
+#if defined(USE_MQTT)
     // Sincronizar reloj via NTP — necesario para validar cert TLS de MQTT
     configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-    Serial.print("[NTP] Sincronizando hora");
+    DLOG("[NTP] Sincronizando hora");
     {
       time_t now = time(nullptr);
       int ntpTries = 0;
-      while (now < 1000000000L && ntpTries < 20) {
+      while (now < 1000000000L && ntpTries < 40) {
         delay(500);
-        Serial.print(".");
+        DLOG(".");
         now = time(nullptr);
         ntpTries++;
       }
-      Serial.printf("\n[NTP] Hora: %s", ctime(&now));
+      if (now < 1000000000L) {
+        DLOGLN("\n[NTP] WARN: reloj no sincronizado — timestamps no fiables");
+      } else {
+        DLOGF("\n[NTP] Hora: %s", ctime(&now));
+      }
     }
 #endif
 
-#ifndef ESP8266
     // FreeRTOS: crear tarea de red en Core 0
-    dataMutex = xSemaphoreCreateMutex();
+    dataMutex      = xSemaphoreCreateMutex();
+    telemetryQueue = xQueueCreate(1, sizeof(TelemetrySnapshot));
     xTaskCreatePinnedToCore(
       networkTask,        // función
       "NetworkTask",      // nombre
@@ -1469,16 +2556,9 @@ void setup() {
       &networkTaskHandle, // handle
       0                   // Core 0
     );
-    Serial.println("NetworkTask creada en Core 0");
-#endif
+    DLOGLN("NetworkTask creada en Core 0");
     WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
-    Serial.println("OTA listo — hostname: " +
-#ifdef ESP8266
-      String("meteostation-esp8266")
-#else
-      String("meteostation-esp32")
-#endif
-    );
+    DLOGLN("OTA listo — hostname: meteostation-esp32");
     // ── Fin OTA ─────────────────────────────────────────────────────────────
 
     printHardwareInfo();
@@ -1487,16 +2567,16 @@ void setup() {
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
   } else {
-#ifndef ESP8266
+#if !defined(DEV_MODE)
     // Si las credenciales vinieron de NVS y WiFi falló → volver al portal
     // para que el usuario corrija la red (p.ej. contraseña cambiada).
     if (prov_ssid[0] != '\0') {
-      Serial.println("[PROV] WiFi fallido con credenciales NVS — iniciando portal de reconfiguración...");
+      DLOGLN("[PROV] WiFi fallido con credenciales NVS — iniciando portal de reconfiguración...");
       // drawAPScreen se llama desde dentro de provisioning_start_ap() via callback
       provisioning_start_ap();  // no retorna
     }
 #endif
-    Serial.println("Sin WiFi — continuando sin conexion (OTA no disponible)");
+    DLOGLN("Sin WiFi — continuando sin conexion (OTA no disponible)");
 #ifdef HAS_DISPLAY
     drawBootScreen("Sin WiFi — modo offline");
 #endif
@@ -1507,46 +2587,70 @@ void setup() {
 #endif
 
 #ifdef DEBUG_MODE
-  Serial.println(F("\n====== AQUANTIA BOOT COMPLETO ======"));
-  Serial.printf("[TEST] Perfil   : %s | Relays: %d\n",
-    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", RELAY_COUNT);
-  Serial.printf("[TEST] WiFi     : %s\n",
+  DLOGLN(F("\n====== AQUANTIA BOOT COMPLETO ======"));
+  DLOGF("[TEST] Perfil   : %s | Relays: %d\n",
+    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", RELAY_COUNT);
+  DLOGF("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
-  Serial.printf("[TEST] MCP9808  : %s\n", mcp_ok ? "REAL" : "SIM (sin sensor)");
-  Serial.printf("[TEST] Barometro: %s\n", bar_ok ? "REAL" : "SIM (sin sensor)");
-  Serial.printf("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
-  Serial.printf("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
+  DLOGF("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+  DLOGF("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
+#else
+  DLOGF("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
+#endif
 #if DEVICE_PROFILE == PROFILE_METEO
-  Serial.printf("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
 #endif
-  Serial.printf("[TEST] Heap     : %ld bytes libres\n", (long)ESP.getFreeHeap());
-  Serial.println(F("[TEST] Iniciando loop() — reporte cada 5s"));
-  Serial.println(F("====================================\n"));
+  DLOGF("[TEST] Heap     : %ld bytes libres\n", (long)ESP.getFreeHeap());
+  DLOGLN(F("[TEST] Iniciando loop() — reporte cada 5s"));
+  DLOGLN(F("====================================\n"));
 #endif
+
+  // Forzar primera lectura de sensores en el primer ciclo del loop
+  // (sin este offset, habría que esperar telemetryIntervalMs antes de tener datos)
+  lastSensorRead = millis() - telemetryIntervalMs;
 }
 
 // =============================================================================
 // LOOP — Core 1: sensores + display (sin red)
-// En ESP8266 incluye también la red (sin FreeRTOS).
 // =============================================================================
 void loop() {
-#ifdef ESP8266
-  ArduinoOTA.handle();
-#endif
+  ledTick();  // actualizar LED de estado (no bloqueante)
 
   unsigned long now = millis();
 
 #ifdef HAS_DISPLAY
-  // Botones — cualquiera enciende la pantalla y resetea el timer
-  if (!digitalRead(BTN_LEFT) || !digitalRead(BTN_RIGHT)) {
+  // Botones — detección de flanco para cambiar vista sin rebote
+  static bool prevBtnLeft  = true;
+  static bool prevBtnRight = true;
+  bool curBtnLeft  = digitalRead(BTN_LEFT);
+  bool curBtnRight = digitalRead(BTN_RIGHT);
+
+  // Cualquier botón enciende la pantalla y resetea el timer
+  if (!curBtnLeft || !curBtnRight) {
     if (!displayOn) {
       digitalWrite(TFT_BL, HIGH);
       displayOn = true;
     }
     lastActivityTime = now;
   }
-  // Timeout — apagar pantalla tras DISPLAY_TIMEOUT_MS sin actividad
-  if (displayOn && (now - lastActivityTime >= DISPLAY_TIMEOUT_MS)) {
+
+  // BTN_LEFT o BTN_RIGHT: flanco descendente con pantalla ya encendida → cambiar vista
+  bool leftEdge  = (!curBtnLeft  && prevBtnLeft);
+  bool rightEdge = (!curBtnRight && prevBtnRight);
+  if (displayOn && (leftEdge || rightEdge)) {
+    displayView = (displayView == 0) ? 1 : 0;
+  }
+
+  prevBtnLeft  = curBtnLeft;
+  prevBtnRight = curBtnRight;
+
+  // Timeout — apagar pantalla tras el tiempo configurado sin actividad
+  if (displayTimeoutMs > 0 && displayOn && (now - lastActivityTime >= displayTimeoutMs)) {
     digitalWrite(TFT_BL, LOW);
     displayOn = false;
   }
@@ -1563,7 +2667,7 @@ void loop() {
     int rawVane       = analogRead(VANE_PIN);
     currentWindDirDeg = adcToWindDeg(rawVane);
 #else
-    // ESP8266 sin veleta: anemómetro y veleta simulados
+    // Sin pantalla (no METEO): sensores de viento simulados
     windSpeed         = sim_windSpeed;
     windSpeedFiltered = sim_windSpeed;
     currentWindDirDeg = sim_windDir;
@@ -1573,41 +2677,71 @@ void loop() {
     lastWindRead = now;
   }
 
-  // ── 2. Sensores I2C (MCP9808, HTU2x, barometro, luz) + pantalla (cada 1s) ───
-  if (now - lastScreenTime >= SCREEN_MS) {
-#ifndef ESP8266
-    bool hasMutex = (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE);
-#endif
+  // ── 2. Sensores I2C (cada telemetryIntervalMs, sincronizado con la telemetría) ──
+  if (now - lastSensorRead >= telemetryIntervalMs) {
 
 #if DEVICE_PROFILE == PROFILE_METEO
-    // MCP9808
+    // BMP280 — leer siempre para mandar sus datos explícitos por telemetría
+    bmp_temp_ok = false;
+    bmp_pressure_ok = false;
+    if (bmp_ok) {
+      float tBmp = NAN;
+      float pBmp = NAN;
+      if (readBMP280Temperature(tBmp)) {
+        bmpTemperature = tBmp;
+        bmp_temp_ok = true;
+      }
+      if (readBMP280PressureKPa(pBmp)) {
+        bmpPressure = pBmp;
+        bmp_pressure_ok = true;
+      }
+      if (!bmp_temp_ok && !bmp_pressure_ok) {
+        bmp_ok = false;
+        DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
+      }
+    }
+
+    // Temperatura exterior — prioridad MCP9808, fallback BMP280
+    temp_ok = false;
     if (mcp_ok) {
       tempsensor.wake();
       float t = tempsensor.readTempC();
       tempsensor.shutdown_wake(1);
       if (!isnan(t) && t > -40.0f) {
         temperatureMCP = t;
+        temp_ok = true;
       } else {
         mcp_ok = false;
-        Serial.println("MCP9808 fallo en lectura — cambiando a simulacion");
+        DLOGLN("MCP9808 fallo en lectura — probando BMP280");
       }
     }
-    if (!mcp_ok) temperatureMCP = sim_tempMCP;
+    if (!temp_ok && bmp_temp_ok) {
+      temperatureMCP = bmpTemperature;
+      temp_ok = true;
+    }
+    if (!temp_ok) temperatureMCP = sim_tempMCP;
 
-    // Barómetro
-    if (bar_ok) {
+    // Barómetro — prioridad MicroPressure, fallback BMP280
+    bar_ok = false;
+    if (micropressure_ok) {
       double p = barometer.readPressure(KPA);
-      if (p > 50.0) {
+      if (p > 50.0 && p < 120.0) {
         pressure = p;
+        bar_ok = true;
       } else {
-        bar_ok = false;
-        Serial.println("Barometro fallo en lectura — cambiando a simulacion");
+        micropressure_ok = false;
+        DLOGLN("MicroPressure fallo en lectura — probando BMP280");
       }
+    }
+    if (!bar_ok && bmp_pressure_ok) {
+      pressure = bmpPressure;
+      bar_ok = true;
     }
     if (!bar_ok) pressure = sim_pressure;
 #endif
 
-    // HTU2x
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+    // HTU2x — omitido en AGROMETEO (0x40 = HDC1080)
     if (htu_ok) {
       float t = htu_readTemp();
       float h = htu_readHumidity();
@@ -1616,13 +2750,14 @@ void loop() {
         humidity       = h;
       } else {
         htu_ok = false;
-        Serial.println("HTU2x fallo en lectura — cambiando a simulacion");
+        DLOGLN("HTU2x fallo en lectura — cambiando a simulacion");
       }
     }
     if (!htu_ok) {
       temperatureDHT = sim_tempDHT;
       humidity       = sim_humidity;
     }
+#endif  // PROFILE_AGROMETEO
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // DHT11
@@ -1642,17 +2777,126 @@ void loop() {
     }
 #endif
 
-    // TSL2584
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    // ── AGROMETEO: HDC1080 + BMP280 + BH1750 + parámetros calculados ────────
+    // Sensores siempre alimentados (Qwiic Power Switch ON permanente desde setup).
+    // Solo se reinicializa un sensor concreto si falló en el ciclo anterior.
+    // Esto permite al BMP280 (FILTER_X16) acumular mediciones estables y al BH1750
+    // operar en modo continuo sin necesidad de esperar la conversión inicial cada vez.
+    // Recovery — reinicializar sensores que fallaron en el ciclo anterior
+    if (qwiic_ps_ok) {
+      if (!micropressure_ok) micropressure_ok = barometer.begin();
+      if (!bmp_ok) {
+        bmp_ok = beginBMP280();
+        if (bmp_ok) bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                                       Adafruit_BMP280::SAMPLING_X2,
+                                       Adafruit_BMP280::SAMPLING_X16,
+                                       Adafruit_BMP280::FILTER_X16,
+                                       Adafruit_BMP280::STANDBY_MS_500);
+      }
+      if (!hdc_ok)     hdc_ok     = hdc1080_init();
+      if (!bh1750_ok) {
+        bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+        if (bh1750_ok) delay(180);  // esperar primera conversión solo si se reinicia
+      }
+    }
+
+    // HDC1080 — temperatura y humedad primaria → temperatureMCP + humidity
+    if (hdc_ok) {
+      float t = hdc1080_readTemp();
+      float h = hdc1080_readHum();
+      if (!isnan(t) && !isnan(h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+      } else {
+        hdc_ok  = false;
+        temp_ok = false;
+        DLOGLN("HDC1080 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!hdc_ok) {
+      if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+      else             { temperatureMCP = sim_tempMCP;    temp_ok = false; }
+      humidity = sim_humidity;
+    }
+
+    // MicroPressure — barómetro principal; BMP280 como fallback de presión y temperatura
+    bar_ok = false;
+    if (micropressure_ok) {
+      double p = barometer.readPressure(KPA);
+      if (p > 50.0 && p < 120.0) {
+        pressure = p;
+        bar_ok   = true;
+      } else {
+        micropressure_ok = false;
+        DLOGLN("MicroPressure fallo en lectura — probando BMP280");
+      }
+    }
+
+    // BMP280 — temperatura secundaria + presión de respaldo si MicroPressure falla
+    bmp_temp_ok     = false;
+    bmp_pressure_ok = false;
+    if (bmp_ok) {
+      float tBmp = NAN, pBmp = NAN;
+      if (readBMP280Temperature(tBmp)) { bmpTemperature = tBmp; bmp_temp_ok = true; }
+      if (readBMP280PressureKPa(pBmp)) {
+        bmpPressure = pBmp; bmp_pressure_ok = true;
+        if (!micropressure_ok) { pressure = pBmp; bar_ok = true; }
+      }
+      if (!bmp_temp_ok && !bmp_pressure_ok) {
+        bmp_ok = false;
+        DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!bar_ok) pressure = sim_pressure;
+
+    // BH1750 — iluminancia → lightLevel (con retry si falla la primera lectura)
+    if (bh1750_ok) {
+      float lux = bh1750.readLightLevel();
+      if (lux < 0.0f) {
+        delay(50);
+        lux = bh1750.readLightLevel();  // un reintento tras breve pausa
+      }
+      if (lux >= 0.0f) {
+        lightLevel = lux;
+      } else {
+        bh1750_ok = false;
+        DLOGLN("BH1750 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!bh1750_ok) lightLevel = sim_light;
+
+    // Parámetros derivados agrometeorológicos
+    {
+      float T = temperatureMCP;
+      float H = humidity;
+      // Media HDC1080 + BMP280 si ambos disponibles
+      float Tavg = (hdc_ok && bmp_temp_ok) ? (T + bmpTemperature) / 2.0f : T;
+      agroTempAvg = Tavg;
+      if (!isnan(Tavg) && !isnan(H) && H > 0.0f) {
+        agroDewPoint = agro_calcDewPoint(Tavg, H);
+        agroAbsHum   = agro_calcAbsHumidity(Tavg, H);
+        agroHeatIndex = (Tavg > 27.0f && H > 40.0f)
+                        ? agro_calcHeatIndex(Tavg, H) : NAN;
+      }
+    }
+
+#endif  // PROFILE_AGROMETEO
+
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+    // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750)
     if (tsl_ok) {
       float lux = tsl_readLux();
       if (lux >= 0.0f) {
         lightLevel = lux;
       } else {
         tsl_ok = false;
-        Serial.println("TSL2584 fallo en lectura — cambiando a simulacion");
+        DLOGLN("TSL2584 fallo en lectura — cambiando a simulacion");
       }
     }
     if (!tsl_ok) lightLevel = sim_light;
+#endif  // PROFILE_AGROMETEO (TSL guard)
 
 #if defined(SOIL_PIN)
     {
@@ -1668,60 +2912,75 @@ void loop() {
 #endif
 
     updateSimulatedValues();
+    updatePipelineValues();
 
-#ifndef ESP8266
-    if (hasMutex) xSemaphoreGive(dataMutex);
+    // Construir snapshot y publicar en la queue para Core 0 — sin mutex, sin bloqueo
+    if (telemetryQueue) {
+      TelemetrySnapshot snap = {};
+      snap.tempMCP       = temperatureMCP;
+      snap.pressure      = (float)pressure;
+      snap.tempDHT       = temperatureDHT;
+      snap.humidity      = humidity;
+      snap.windSpeed     = windSpeed;
+      snap.windDir       = currentWindDirDeg;
+      snap.windSpeedFilt = windSpeedFiltered;
+      snap.avgWindDir    = calcAndResetWindVector();
+      snap.light         = lightLevel;
+      snap.tempDHT11     = temperatureDHT11;
+      snap.humDHT11      = humidityDHT11;
+      snap.soil          = soilMoisture;
+      snap.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
+      snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
+      snap.pipePressure  = sim_pipeline_pressure;
+      snap.pipeFlow      = sim_pipeline_flow;
+      snap.xdb401Temp    = xdb401Temperature;
+      snap.relayMask     = 0;
+      // relayActive[] es escrito por Core 0 (MQTT callback) — mutex breve solo aquí
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        for (int i = 0; i < RELAY_COUNT; i++)
+          if (relayActive[i]) snap.relayMask |= (1 << i);
+        xSemaphoreGive(dataMutex);
+      }
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+      snap.dewPoint  = agroDewPoint;
+      snap.heatIndex = agroHeatIndex;
+      snap.absHum    = agroAbsHum;
 #endif
+      xQueueOverwrite(telemetryQueue, &snap);
+    }
 
-#ifdef HAS_DISPLAY
-    drawScreen();
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    DLOGF("[sensor] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
+      temperatureMCP, humidity, bmpTemperature, (float)pressure,
+      lightLevel, agroDewPoint, agroHeatIndex, agroAbsHum);
 #else
-    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
+    DLOGF("[sensor] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
       temperatureMCP, temperatureDHT, humidity,
       temperatureDHT11, humidityDHT11,
       (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel, soilMoisture);
 #endif
 
-    lastScreenTime = now;
+    lastSensorRead = now;
   }
 
-#ifdef ESP8266
-  // ── ESP8266: red en el loop() (sin FreeRTOS) ─────────────────────────────────
-  static unsigned long lastRelayCheck8266 = 0;
-  if (now - lastRelayCheck8266 >= RELAY_MS && WiFi.status() == WL_CONNECTED) {
-    checkRelayCommand();
-    lastRelayCheck8266 = now;
-  }
-
-  static bool deviceInfoSent8266 = false;
-  if (!deviceInfoSent8266 && WiFi.status() == WL_CONNECTED) {
-    postDeviceInfo();
-    deviceInfoSent8266 = true;
-  }
-
-  static unsigned long lastSendTime8266 = 0;
-  if (now - lastSendTime8266 >= SEND_MS) {
-    finalAvgWindDir = calcAndResetWindVector();
-    bool ok = false;
-    if (WiFi.status() == WL_CONNECTED) {
-      String url = "https://" + String(server_ip) + "/send_message";
-      char msg[256];
-      int relayMask = 0;
-      for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) relayMask |= (1 << i);
-      snprintf(msg, sizeof(msg),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f",
-        temperatureMCP, (float)pressure, temperatureDHT, humidity,
-        windSpeed, currentWindDirDeg, windSpeedFiltered, finalAvgWindDir,
-        lightLevel, temperatureDHT11, humidityDHT11,
-        WiFi.RSSI(), (long)ESP.getFreeHeap(), (long)(millis()/1000),
-        relayMask, soilMoisture
-      );
-      ok = httpPost(url, String(msg));
-    } else {
-      WiFi.reconnect();
+  // ── 2b. Muestreo rápido pipeline (cada PIPELINE_FAST_MS) — solo actualiza ────────
+  //        variables de display; la telemetría sigue al ritmo de telemetryIntervalMs.
+  //        Permite detectar fugas/roturas sin esperar el intervalo completo.
+  if (strcmp(pipelineMode, "real") == 0 && (now - lastPipelineFastRead >= PIPELINE_FAST_MS)) {
+    float fp = 0.0f, ff = 0.0f;
+    if (readRealPipelineSensors(fp, ff)) {
+      sim_pipeline_flow = max(0.0f, ff);
+      if (fp >= 0.0f) sim_pipeline_pressure = max(0.0f, fp);
     }
-    lastServerOK = ok;
-    lastSendTime8266 = now;
+    lastPipelineFastRead = now;
+  }
+
+  // ── 3. Refresco de pantalla (cada SCREEN_MS = 1s, solo si hay display) ────────
+#ifdef HAS_DISPLAY
+  if (now - lastScreenTime >= SCREEN_MS) {
+    if (displayView == 1) drawPipelineScreen();
+    else                  drawScreen();
+    lastScreenTime = now;
   }
 #endif
 
@@ -1731,11 +2990,12 @@ void loop() {
   if (now - lastDebugReport >= DEBUG_INTERVAL_MS) {
     lastDebugReport = now;
 
-    Serial.println(F("\n====== AQUANTIA TEST REPORT ======"));
+    DLOGLN(F("\n====== AQUANTIA TEST REPORT ======"));
 
     // Perfil e info de compilacion
-    Serial.printf("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
-      (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION",
+    DLOGF("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
+      (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
+      (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION",
       DEVICE_PROFILE, RELAY_COUNT,
 #ifdef HAS_DISPLAY
       "SI",
@@ -1751,62 +3011,94 @@ void loop() {
 
     // Tiempo y memoria
     unsigned long up = millis() / 1000;
-    Serial.printf("[TIEMPO] Uptime: %luh %02lum %02lus | Heap libre: %ld B\n",
+    DLOGF("[TIEMPO] Uptime: %luh %02lum %02lus | Heap libre: %ld B\n",
       up / 3600, (up % 3600) / 60, up % 60, (long)ESP.getFreeHeap());
 
     // Serial / MAC del dispositivo
-    Serial.printf("[DEVICE] Serial: %s\n", device_serial_get());
+    DLOGF("[DEVICE] Serial: %s\n", device_serial_get());
 
     // WiFi
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("[WIFI  ] CONECTADO | IP: %s | RSSI: %d dBm | SSID: %s\n",
+      DLOGF("[WIFI  ] CONECTADO | IP: %s | RSSI: %d dBm | SSID: %s\n",
         WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.SSID().c_str());
     } else {
-      Serial.println("[WIFI  ] DESCONECTADO");
+      DLOGLN("[WIFI  ] DESCONECTADO");
     }
 
-#if !defined(ESP8266) && defined(USE_MQTT)
-    Serial.printf("[MQTT  ] %s\n",
+#if defined(USE_MQTT)
+    DLOGF("[MQTT  ] %s\n",
       mqttClient.connected() ? "CONECTADO" : "DESCONECTADO");
 #endif
 
     // Estado de sensores
-    Serial.print("[SENSOR]");
+    DLOG("[SENSOR]");
 #if DEVICE_PROFILE == PROFILE_METEO
-    Serial.printf(" MCP9808:%s  Barometro:%s  DHT11:%s",
-      mcp_ok ? "REAL" : "SIM", bar_ok ? "REAL" : "SIM", dht_ok ? "REAL" : "SIM");
+    DLOGF(" TempExt:%s  Barometro:%s  DHT11:%s",
+      temp_ok ? temperatureSourceName() : "SIM",
+      bar_ok ? pressureSourceName() : "SIM",
+      dht_ok ? "REAL" : "SIM");
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+    DLOGF(" HDC1080:%s  BMP280:%s  BH1750:%s",
+      hdc_ok ? "REAL" : "SIM",
+      bmp_ok ? "REAL" : "SIM",
+      bh1750_ok ? "REAL" : "SIM");
 #else
-    Serial.print(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
+    DLOG(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
 #endif
-    Serial.printf("  HTU2x:%s  LuzAmb:%s\n",
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+    DLOGF("  HTU2x:%s  LuzAmb:%s\n",
       htu_ok ? "REAL" : "SIM", tsl_ok ? "REAL" : "SIM");
+#else
+    DLOGLN();  // AGROMETEO: sensores ya listados arriba
+#endif
 
     // Valores medidos / simulados
-    Serial.printf("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+    DLOGF("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
+      temperatureMCP, humidity, bmpTemperature, (float)pressure, lightLevel);
+    DLOGF("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
+      agroDewPoint, agroHeatIndex, agroAbsHum);
+    DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
+#else
+    DLOGF("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
       temperatureMCP, temperatureDHT, humidity, lightLevel);
 #if DEVICE_PROFILE == PROFILE_METEO
-    Serial.printf("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
+    DLOGF("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
       (float)pressure, temperatureDHT11, humidityDHT11, soilMoisture);
 #endif
-    Serial.printf("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
+    DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
+#if defined(FLOW_PIN)
+    DLOGF("[FLOW  ] Pulsos/intervalo:%lu  Total:%lu  Intervalo:%lu ms  K:%d p/L\n",
+      (unsigned long)_flowLastPulses, (unsigned long)_flowPulseTotal,
+      (unsigned long)_flowLastDtMs, FLOW_K_FACTOR);
+#endif
+    DLOGF("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
+#if defined(FLOW_PIN)
+    if (_flowPulseTotal == 0) {
+      DLOGLN("[FLOW  ] WARN — sin pulsos recibidos (verif. cableado GPIO" + String(FLOW_PIN) + " y transistor BC547)");
+    }
+#endif
+#endif  // PROFILE_AGROMETEO / else
 
     // Estado relays
-    Serial.print("[RELAYS]");
+    DLOG("[RELAYS]");
     for (int i = 0; i < RELAY_COUNT; i++) {
-      Serial.printf(" R%d:%s", i, relayActive[i] ? "ON " : "OFF");
+      DLOGF(" R%d:%s", i, relayActive[i] ? "ON " : "OFF");
     }
-    Serial.println();
+    DLOGLN();
 
     // Test assertions
     bool allRelaysOff = true;
     for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) { allRelaysOff = false; break; }
 
-    Serial.println("[TEST  ] " + String(allRelaysOff ? "PASS" : "FAIL") +
+    DLOGLN("[TEST  ] " + String(allRelaysOff ? "PASS" : "FAIL") +
                    " — Todos los relays en OFF (estado seguro)");
-    Serial.println("[TEST  ] PASS — Boot completado sin crash (uptime > 0)");
-    Serial.println("[TEST  ] PASS — Sensores: modo SIM cuando no hay hardware conectado");
-    Serial.println(F("==================================\n"));
+    DLOGLN("[TEST  ] PASS — Boot completado sin crash (uptime > 0)");
+    DLOGLN("[TEST  ] PASS — Sensores: modo SIM cuando no hay hardware conectado");
+    DLOGLN(F("==================================\n"));
   }
 #endif  // DEBUG_MODE
 }

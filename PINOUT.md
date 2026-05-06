@@ -18,10 +18,11 @@ Dos perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo d
 | Anemómetro (ADC) | 37 | 0–3.3 V → 0–30 m/s, ADC1_CH1 |
 | Veleta dirección (ADC) | 36 | 0–3.3 V → 0–360°, ADC1_CH0 (input-only) |
 | Humedad suelo YL-69 (ADC) | 33 | ADC1_CH5, divisor de tensión |
+| Caudalímetro (pulsos ISR) | 32 | INPUT_PULLUP, ISR FALLING (BC547 NPN, señal invertida) |
 | Relay 1 (electroválvula) | 26 | Activo-LOW, JQC-3FF-S-Z |
 | Botón izquierdo (BOOT) | 0 | INPUT_PULLUP, activo LOW |
 | Botón derecho | 35 | INPUT, activo LOW |
-| LED onboard | 2 | LED_ON=LOW, LED_OFF=HIGH |
+| LED onboard | 2 | Activo-LOW. Estados: parpadeo rápido=WiFi buscando, doble parpadeo=MQTT pendiente, latido=idle, triple=TX OK, 1s/1s=error |
 
 ### Pantalla TFT — SPI (ST7789 240×135)
 
@@ -60,6 +61,7 @@ LilyGo TTGO T-Display
 │  GPIO37 ───────────┼──► Anemómetro salida analógica 0–3.3V
 │  GPIO36 ───────────┼──► Veleta salida analógica 0–3.3V
 │  GPIO33 ───────────┼──► YL-69 AO (tras divisor de tensión)
+│  GPIO32 ───────────┼──► Caudalímetro (colector BC547 NPN)
 │  GPIO26 ───────────┼──► IN del relay (JQC-3FF-S-Z)
 │  GPIO0  ───────────┼──► Botón BOOT (ya integrado en placa)
 │  GPIO35 ───────────┼──► Botón derecho externo
@@ -90,7 +92,7 @@ Ajustar en `ESP_monitor_server.ino` según el sensor real:
 | Relay 2 (zona 2) | 33 | Activo-LOW |
 | Relay 3 (zona 3) | 25 | Activo-LOW |
 | Relay 4 (zona 4) | 26 | Activo-LOW |
-| LED estado | 23 | Integrado en placa |
+| LED estado | 23 | Activo-LOW. Mismos estados que METEO + encendido fijo cuando relay activo |
 | I2C SDA | 21 | Sin sensores en v actual |
 | I2C SCL | 22 | Sin sensores en v actual |
 
@@ -126,6 +128,65 @@ Cada relay:
   COM ──► neutro / positivo de la válvula
   NO  ──► electroválvula 24 VAC / 12 VDC
 ```
+
+---
+
+## Caudalímetro de tubería (PROFILE_METEO — LilyGo TTGO T-Display)
+
+El firmware implementa la lectura de caudal mediante **interrupciones hardware** para no perder ningún pulso.
+
+### GPIO y circuito
+
+| Función | GPIO | Notas |
+|---------|:----:|-------|
+| Caudalímetro (pulsos) | **32** | INPUT_PULLUP, ISR FALLING edge |
+
+### Transistor de acondicionamiento BC547 NPN
+
+El sensor de caudal genera pulsos a tensión mayor de 3.3 V. El BC547 la recorta e invierte para que el ESP32 la pueda leer de forma segura:
+
+```
+Sensor (pulso HIGH)
+      │
+     [R_base ~10kΩ]
+      │
+   Base BC547
+   Colector ──────────┬── 3.3V (pull-up interno ESP32)
+                      └── GPIO 32
+   Emisor ────────────── GND
+```
+
+- Sensor pulsa HIGH → BC547 conduce → GPIO 32 baja a LOW → **FALLING edge = 1 pulso**
+- Sensor en reposo LOW → BC547 corta → GPIO 32 sube a HIGH (pull-up)
+
+La señal llega **invertida**: el firmware cuenta flancos `FALLING`.
+
+### Parámetros de calibración (en `ESP_monitor_server.ino`)
+
+| Constante | Valor por defecto | Descripción |
+|-----------|:-----------------:|-------------|
+| `FLOW_K_FACTOR` | `450` | Pulsos por litro — YF-S201; **ajustar según sensor real** con agua calibrada |
+
+Fórmula de cálculo:
+
+$$\text{L/min} = \frac{\text{pulsos} \times 60}{t_{seg} \times K_{factor}}$$
+
+### Modo de operación
+
+El caudal real solo se usa cuando el firmware está en `pipelineMode = "real"` (activable por MQTT o HTTP desde el backend). En ese modo:
+- **Caudal**: medido por ISR (GPIO 32) → `pipeline_flow_ok = true`
+- **Presión**: estimada por el simulador (sin sensor de presión de tubería instalado aún) → `pipeline_pressure_ok = false`
+- **Fuente**: `pipeline_source = "real"`
+
+Cuando el modo es `"sim"` (defecto de fábrica):
+- `pipeline_source = "sim"`, `pipeline_flow_ok = false`, `pipeline_pressure_ok = false`
+
+Cuando el modo es `"real"` pero el caudalímetro no responde:
+- `pipeline_source = "fallback"`, `pipeline_flow_ok = false`, `pipeline_pressure_ok = false`
+
+Estos tres campos se almacenan en la base de datos del backend (`pipeline_source`, `pipeline_pressure_ok`, `pipeline_flow_ok`) y están disponibles en `/api/historico` y endpoint de pipeline.
+
+> Perfil afectado: **solo PROFILE_METEO** (LilyGo TTGO T-Display). `FLOW_PIN` y `FLOW_K_FACTOR` están dentro del guard `#if DEVICE_PROFILE == PROFILE_METEO`.
 
 ---
 

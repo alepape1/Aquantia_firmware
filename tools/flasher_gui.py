@@ -15,12 +15,34 @@ import shutil
 import json
 import datetime
 import tempfile
+import hashlib
 import secrets as _secrets
 import csv
 import urllib.request
+from urllib.parse import urlparse
 import re
 import socket
 import time
+
+if os.name == "nt":
+    _WINDOWS_HIDDEN_SUBPROCESS = {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    if hasattr(subprocess, "STARTUPINFO"):
+        _startupinfo = subprocess.STARTUPINFO()
+        _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        _startupinfo.wShowWindow = 0
+        _WINDOWS_HIDDEN_SUBPROCESS["startupinfo"] = _startupinfo
+else:
+    _WINDOWS_HIDDEN_SUBPROCESS = {}
+try:
+    import serial
+    from serial.tools import list_ports
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    serial = None
+    list_ports = None
+    _SERIAL_AVAILABLE = False
 try:
     import qrcode
     from PIL import ImageTk
@@ -40,6 +62,7 @@ REPO_ROOT    = os.path.dirname(SCRIPT_DIR)
 SKETCH_NAME  = "ESP_monitor_server"
 SKETCH_DIR   = os.path.join(REPO_ROOT, SKETCH_NAME)
 BUILD_DIR    = os.path.join(os.environ.get("TEMP", "/tmp"), "aquantia_build")
+BUILD_CACHE_DIR = os.path.join(os.environ.get("TEMP", "/tmp"), "aquantia_cache")
 METADATA_FILE = os.path.join(BUILD_DIR, "build_meta.json")
 
 ARDUINO_CLI_CANDIDATES = [
@@ -56,9 +79,15 @@ ESPOTA_GLOB_PATTERNS = [
     "/home/*/.arduino15/packages/esp32/hardware/esp32/*/tools/espota.py",
 ]
 
-FQBN = "esp32:esp32:esp32"
+# FQBN por perfil — METEO usa el board LilyGo T-Display para que TFT_eSPI
+# reciba el define ARDUINO_LILYGO_T_DISPLAY y configure los pines del ST7789.
+FQBN_BY_PROFILE = {
+    "1": "esp32:esp32:lilygo_t_display",   # METEO — LilyGo TTGO T-Display
+    "2": "esp32:esp32:esp32",              # IRRIGATION — ESP32 genérico
+    "3": "esp32:esp32:esp32",              # AGROMETEO — ESP32 genérico
+}
 
-BACKEND_URL  = "https://meteo.aquantialab.com"
+BACKEND_URL = "https://meteo.aquantialab.com"
 APP_BASE_URL = "https://meteo.aquantialab.com"   # URL base del QR de claim
 
 REGISTRY_FILE = os.path.join(SCRIPT_DIR, "devices_registry.csv")
@@ -86,6 +115,43 @@ NVS_GEN_GLOB_PATTERNS = [
 PROFILES = {
     "METEO  — 1 relay  (pantalla TFT)": "1",
     "IRRIGATION — 4 relays (sin pantalla)": "2",
+    "AGROMETEO — sin relays (BH1750+HDC1080+BMP280)": "3",
+}
+
+DEFAULT_PROFILE_LABEL = "METEO  — 1 relay  (pantalla TFT)"
+DEFAULT_PROFILE = PROFILES[DEFAULT_PROFILE_LABEL]
+BOARD_LABEL_BY_PROFILE = {
+    "1": "LilyGo T-Display",
+    "2": "ESP32 genérico",
+    "3": "ESP32 genérico",
+}
+
+
+def guess_local_ip():
+    """Intenta obtener la IP LAN del PC para usar el backend local."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return "192.168.1.100"
+
+
+LOCAL_LAN_IP = guess_local_ip()
+
+SERVER_PRESETS = {
+    "Producción": {
+        "backend_url": BACKEND_URL,
+        "app_base_url": APP_BASE_URL,
+        "mqtt_server": "meteo.aquantialab.com",
+        "mqtt_port": 8883,
+    },
+    "Local": {
+        "backend_url": "http://127.0.0.1:7000",
+        "app_base_url": f"http://{LOCAL_LAN_IP}:5173",
+        "mqtt_server": LOCAL_LAN_IP,
+        "mqtt_port": 1883,
+    },
 }
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
@@ -96,7 +162,8 @@ def _git(*args, cwd=None):
         r = subprocess.run(
             ["git"] + list(args),
             cwd=cwd or REPO_ROOT,
-            capture_output=True, text=True, encoding="utf-8", errors="replace"
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            **_WINDOWS_HIDDEN_SUBPROCESS
         )
         return r.stdout.strip() if r.returncode == 0 else ""
     except FileNotFoundError:
@@ -111,27 +178,75 @@ def get_current_version():
     return h, desc, dirty
 
 
-def get_version_list():
-    """Lista de (label_display, git_ref | None) para el selector de versión."""
+def get_current_branch():
+    """Devuelve la rama actual del repositorio."""
+    branch = _git("branch", "--show-current")
+    if branch:
+        return branch
+    return _git("rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+
+
+def branch_has_sketch(branch_ref):
+    """True si la rama contiene el sketch del ESP32."""
+    return bool(_git("ls-tree", "-d", "--name-only", branch_ref, SKETCH_NAME))
+
+
+def get_branch_list():
+    """Lista ramas locales y remotas para el selector."""
+    current = get_current_branch()
+    local = _git(
+        "for-each-ref", "--sort=-committerdate",
+        "--format=%(refname:short)", "refs/heads"
+    ).splitlines()
+    remote = _git(
+        "for-each-ref", "--sort=-committerdate",
+        "--format=%(refname:short)", "refs/remotes"
+    ).splitlines()
+
+    ordered = [current, "main", "master", "origin/main", "origin/master"]
+    ordered.extend(local)
+    ordered.extend(remote)
+
+    branches = []
+    seen = set()
+    for branch in ordered:
+        if not branch or branch.endswith("/HEAD") or branch in seen:
+            continue
+        if not branch_has_sketch(branch):
+            continue
+        branches.append(branch)
+        seen.add(branch)
+    return branches or [current]
+
+
+def get_version_list(branch_ref=None):
+    """Lista de versiones filtrada por la rama seleccionada."""
+    branch_ref = branch_ref or get_current_branch()
+    current_branch = get_current_branch()
     versions = []
 
-    h, desc, dirty = get_current_version()
-    label = f"Actual — {desc}" + (" (cambios sin commit)" if dirty else "")
-    versions.append((label, None))          # None = working copy
+    if branch_ref == current_branch:
+        h, desc, dirty = get_current_version()
+        label = f"Actual — {desc}" + (" (cambios sin commit)" if dirty else "")
+        versions.append((label, None))
 
-    # Últimas 5 etiquetas
-    tags = _git("tag", "--sort=-creatordate").splitlines()
+    tags = _git("tag", "--merged", branch_ref, "--sort=-creatordate").splitlines()
     for tag in tags[:5]:
         if tag:
             versions.append((f"Tag: {tag}", tag))
 
-    # Últimos 10 commits
-    log = _git("log", "--oneline", "-10").splitlines()
-    for line in log:
-        if line:
-            ref  = line[:7]
-            msg  = line[8:50]
-            versions.append((f"{ref}  —  {msg}", ref))
+    log = _git("log", branch_ref, "--oneline", "-12").splitlines()
+    seen_refs = {None}
+    for idx, line in enumerate(log):
+        if not line:
+            continue
+        ref = line[:7]
+        if ref in seen_refs:
+            continue
+        msg = line[8:60]
+        prefix = "HEAD" if idx == 0 else "Commit"
+        versions.append((f"{prefix}: {ref}  —  {msg}", ref))
+        seen_refs.add(ref)
 
     return versions
 
@@ -163,7 +278,8 @@ def export_version_to_temp(git_ref):
     try:
         archive = subprocess.run(
             archive_cmd, cwd=REPO_ROOT,
-            capture_output=True
+            capture_output=True,
+            **_WINDOWS_HIDDEN_SUBPROCESS
         )
         if archive.returncode != 0:
             return None
@@ -233,7 +349,8 @@ def read_partition_table(esptool, port):
                 hex(_PARTITION_TABLE_OFFSET),
                 hex(_PARTITION_TABLE_SIZE),
                 tmp_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         if r.returncode != 0:
             return None
         with open(tmp_path, "rb") as f:
@@ -281,7 +398,8 @@ def fp_read_mac(esptool, port):
     cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
     cmd += ["--port", port, "read_mac"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         for line in r.stdout.splitlines():
             if "MAC:" in line.upper():
                 parts = line.upper().split("MAC:")
@@ -297,7 +415,8 @@ def fp_read_flash_id(esptool, port):
     cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
     cmd += ["--port", port, "flash_id"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         for line in r.stdout.splitlines():
             low = line.lower()
             if "manufacturer" in low or "flash id" in low or "device" in low:
@@ -339,7 +458,7 @@ def fp_register_backend(mac, token_hash, serial_number, backend_url=BACKEND_URL)
         return json.loads(resp.read())
 
 
-def show_qr_window(serial, mac):
+def show_qr_window(serial, mac, app_base_url=APP_BASE_URL):
     """Abre una ventana con el QR del serial del dispositivo."""
     if not _QR_AVAILABLE:
         messagebox.showwarning(
@@ -348,12 +467,14 @@ def show_qr_window(serial, mac):
         )
         return
 
+    claim_url = f"{app_base_url.rstrip('/')}/claim?serial={serial}"
+
     win = tk.Toplevel()
     win.title(f"Etiqueta — {serial}")
     win.resizable(False, False)
     win.configure(bg="#1e1e1e")
 
-    img = qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}")
+    img = qrcode.make(claim_url)
     img = img.resize((220, 220))
     tk_img = ImageTk.PhotoImage(img)
 
@@ -374,14 +495,16 @@ def show_qr_window(serial, mac):
             filetypes=[("PNG", "*.png")],
         )
         if path:
-            qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}").save(path)
+            qrcode.make(claim_url).save(path)
 
     ttk.Button(win, text="Guardar PNG", command=save_png).pack(pady=(0, 16))
 
 
-def fp_save_registry(serial, mac, profile_label, ver_label):
+def fp_save_registry(serial, mac, profile_label, ver_label,
+                     app_base_url=APP_BASE_URL):
     """Añade una fila al CSV de registro y guarda el PNG del QR en devices_qr/."""
     file_exists = os.path.isfile(REGISTRY_FILE)
+    claim_url = f"{app_base_url.rstrip('/')}/claim?serial={serial}"
     with open(REGISTRY_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
@@ -391,7 +514,7 @@ def fp_save_registry(serial, mac, profile_label, ver_label):
             os.makedirs(REGISTRY_QR_DIR, exist_ok=True)
             qr_path = os.path.join(REGISTRY_QR_DIR, f"{serial}.png")
             if not os.path.isfile(qr_path):
-                qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}").save(qr_path)
+                qrcode.make(claim_url).save(qr_path)
         writer.writerow([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             serial,
@@ -402,7 +525,8 @@ def fp_save_registry(serial, mac, profile_label, ver_label):
         ])
 
 
-def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
+def fp_write_nvs(esptool, nvs_gen, port, serial_number, token,
+                 offset=0x9000, size=0x5000):
     """Genera la partición NVS y la flashea en el offset indicado."""
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = os.path.join(tmpdir, "nvs.csv")
@@ -421,8 +545,9 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
         ok = False
         if nvs_gen:
             r = subprocess.run(
-                [sys.executable, nvs_gen, "generate", csv_path, bin_path, "0x6000"],
-                capture_output=True, text=True, timeout=30
+                [sys.executable, nvs_gen, "generate", csv_path, bin_path, hex(size)],
+                capture_output=True, text=True, timeout=30,
+                **_WINDOWS_HIDDEN_SUBPROCESS
             )
             ok = r.returncode == 0
 
@@ -431,8 +556,9 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
             # Sintaxis: generate <input> <output> <size>
             r = subprocess.run(
                 [sys.executable, "-m", "esp_idf_nvs_partition_gen",
-                 "generate", csv_path, bin_path, "0x6000"],
-                capture_output=True, text=True, timeout=30
+                 "generate", csv_path, bin_path, hex(size)],
+                capture_output=True, text=True, timeout=30,
+                **_WINDOWS_HIDDEN_SUBPROCESS
             )
             ok = r.returncode == 0
 
@@ -443,7 +569,8 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
         # Flashear NVS en el offset de la partición NVS (por defecto 0x9000)
         cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
         cmd += ["--port", port, "write_flash", hex(offset), bin_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         if r.returncode != 0:
             raise RuntimeError(f"Error flash NVS: {r.stderr.strip()}")
 
@@ -499,23 +626,38 @@ def discover_ota_devices(timeout=4):
     return found
 
 
-def list_com_ports():
-    try:
-        from serial.tools import list_ports
-        return [p.device for p in list_ports.comports()]
-    except ImportError:
-        pass
-    if sys.platform == "win32":
-        ports = []
+def list_com_ports_detailed():
+    ports = []
+    if _SERIAL_AVAILABLE and list_ports:
+        for p in list_ports.comports():
+            desc = (p.description or "").strip()
+            hwid = (p.hwid or "").strip()
+            label = p.device
+            if desc and desc.lower() != "n/a":
+                label = f"{label} — {desc}"
+            if hwid and hwid.lower() != "n/a":
+                label = f"{label} [{hwid}]"
+            ports.append({"device": p.device, "label": label})
+        return ports
+
+    if sys.platform == "win32" and serial is not None:
         for i in range(1, 21):
+            device = f"COM{i}"
             try:
-                import serial
-                s = serial.Serial(f"COM{i}"); s.close()
-                ports.append(f"COM{i}")
+                s = serial.Serial(device)
+                s.close()
+                ports.append({"device": device, "label": device})
             except Exception:
                 pass
         return ports
-    return glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+
+    for device in glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
+        ports.append({"device": device, "label": device})
+    return ports
+
+
+def list_com_ports():
+    return [item["device"] for item in list_com_ports_detailed()]
 
 
 # ── Estado del binario ────────────────────────────────────────────────────────
@@ -534,6 +676,23 @@ def save_metadata(meta):
         json.dump(meta, f, indent=2)
 
 
+def file_sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def short_digest(value, size=12):
+    if not value:
+        return "?"
+    return str(value)[:size]
+
+
 def source_files_newer_than_binary(bin_path):
     """True si algún archivo fuente es más reciente que el binario."""
     if not os.path.exists(bin_path):
@@ -547,7 +706,11 @@ def source_files_newer_than_binary(bin_path):
     return False
 
 
-def binary_is_valid(profile, git_ref):
+def get_fqbn_for_profile(profile):
+    return FQBN_BY_PROFILE.get(profile, "esp32:esp32:esp32")
+
+
+def binary_is_valid(profile, git_ref, fqbn=None, secrets_digest=None, debug_mode=None):
     """
     Comprueba si el binario compilado coincide con perfil+versión seleccionada
     y los fuentes no han cambiado desde la compilación.
@@ -563,6 +726,17 @@ def binary_is_valid(profile, git_ref):
     if meta.get("profile") != profile:
         return False, f"Perfil diferente (compilado: {meta.get('profile')})"
 
+    expected_fqbn = fqbn or get_fqbn_for_profile(profile)
+    compiled_fqbn = meta.get("fqbn")
+    if compiled_fqbn != expected_fqbn:
+        return False, "Placa/FQBN diferente — recompilar"
+
+    if secrets_digest and meta.get("secrets_digest") != secrets_digest:
+        return False, "Configuración local diferente — recompilar"
+
+    if debug_mode is not None and meta.get("debug_mode", False) != debug_mode:
+        return False, "Modo debug diferente — recompilar"
+
     compiled_ref = meta.get("git_ref")   # None = working copy
     if git_ref != compiled_ref:
         return False, "Versión diferente"
@@ -576,8 +750,8 @@ def binary_is_valid(profile, git_ref):
     return True, f"OK  ·  {size_kb} KB  ·  compilado {built_at}"
 
 
-# ── Aplicación ────────────────────────────────────────────────────────────────
-
+# ── Aplicación 
+ 
 class FlasherApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -588,8 +762,13 @@ class FlasherApp(tk.Tk):
         self._esptool      = find_esptool()
         self._nvs_gen      = find_nvs_gen()
         self._busy         = False
-        self._version_list = get_version_list()
+        self._current_branch = get_current_branch()
+        self._branch_list  = get_branch_list()
+        self._version_list = get_version_list(self._current_branch)
         self._tmp_sketch   = None
+        self._port_choices = []
+        self._serial_stop  = threading.Event()
+        self._serial_running = False
         self._build_ui()
         self._check_tools()
         self._refresh_binary_status()
@@ -615,27 +794,50 @@ class FlasherApp(tk.Tk):
         # ── Perfil ──
         tk.Label(self, text="Perfil:",
                  font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", **PAD)
-        self._profile_var = tk.StringVar(value=list(PROFILES.keys())[1])
+        self._profile_var = tk.StringVar(value=DEFAULT_PROFILE_LABEL)
         profile_cb = ttk.Combobox(self, textvariable=self._profile_var,
                                   values=list(PROFILES.keys()),
                                   state="readonly", width=38)
         profile_cb.grid(row=1, column=1, sticky="ew", **PAD)
         profile_cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_binary_status())
 
-        # ── Versión ──
-        tk.Label(self, text="Versión:",
-                 font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", **PAD)
+        # ── Rama + versión ──
+        tk.Label(self, text="Origen:",
+                 font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="nw", **PAD)
         ver_frame = tk.Frame(self)
         ver_frame.grid(row=2, column=1, sticky="ew", **PAD)
+
+        branch_row = tk.Frame(ver_frame)
+        branch_row.pack(fill="x")
+        tk.Label(branch_row, text="Rama", width=8, anchor="w").pack(side="left")
+        self._branch_var = tk.StringVar(value=self._current_branch)
+        self._branch_cb = ttk.Combobox(
+            branch_row,
+            textvariable=self._branch_var,
+            values=self._branch_list,
+            state="readonly",
+            width=24,
+        )
+        self._branch_cb.pack(side="left")
+        self._branch_cb.bind("<<ComboboxSelected>>", self._on_branch_selected)
+        self._btn_refresh_ver = ttk.Button(
+            branch_row, text="⟳", width=3, command=self._refresh_versions)
+        self._btn_refresh_ver.pack(side="left", padx=4)
+
+        version_row = tk.Frame(ver_frame)
+        version_row.pack(fill="x", pady=(4, 0))
+        tk.Label(version_row, text="Commit", width=8, anchor="w").pack(side="left")
         ver_labels = [v[0] for v in self._version_list]
         self._version_var = tk.StringVar(value=ver_labels[0] if ver_labels else "")
-        self._version_cb  = ttk.Combobox(ver_frame, textvariable=self._version_var,
-                                         values=ver_labels, state="readonly", width=33)
+        self._version_cb = ttk.Combobox(
+            version_row,
+            textvariable=self._version_var,
+            values=ver_labels,
+            state="readonly",
+            width=40,
+        )
         self._version_cb.pack(side="left")
         self._version_cb.bind("<<ComboboxSelected>>", self._on_version_selected)
-        self._btn_refresh_ver = ttk.Button(ver_frame, text="⟳", width=3,
-                                           command=self._refresh_versions)
-        self._btn_refresh_ver.pack(side="left", padx=4)
 
         # ── Info del commit ──
         tk.Label(self, text="Commit:",
@@ -664,7 +866,7 @@ class FlasherApp(tk.Tk):
         self._bin_status_lbl = tk.Label(bin_frame, textvariable=self._bin_status_var,
                                         font=("Segoe UI", 9), anchor="w")
         self._bin_status_lbl.pack(side="left", fill="x", expand=True)
-        ttk.Button(bin_frame, text="🗑", width=3,
+        ttk.Button(bin_frame, text="🗑 Build", width=8,
                    command=self._clean_build).pack(side="right")
 
         # ── Puerto COM ──
@@ -673,11 +875,17 @@ class FlasherApp(tk.Tk):
         port_frame = tk.Frame(self)
         port_frame.grid(row=5, column=1, sticky="ew", **PAD)
         self._port_var = tk.StringVar()
+        self._port_hint_var = tk.StringVar(value="Detectando puertos...")
         self._port_cb  = ttk.Combobox(port_frame, textvariable=self._port_var,
-                                      state="readonly", width=28)
+                                      state="readonly", width=36)
         self._port_cb.pack(side="left")
         ttk.Button(port_frame, text="⟳", width=3,
                    command=self._refresh_ports).pack(side="left", padx=4)
+        self._btn_serial_monitor = ttk.Button(
+            port_frame, text="👀 Serie", width=10, command=self._toggle_serial_monitor)
+        self._btn_serial_monitor.pack(side="left", padx=(0, 4))
+        tk.Label(port_frame, textvariable=self._port_hint_var,
+                 fg="#666", font=("Segoe UI", 8, "italic")).pack(side="left")
         self._refresh_ports()
 
         # ── IP OTA + descubrimiento de dispositivos ──
@@ -726,15 +934,53 @@ class FlasherApp(tk.Tk):
         self._mode_lbl.pack(side="left", padx=8)
         self._update_mode_ui()
 
+        # ── Checkbox Debug ──
+        self._debug_var = tk.BooleanVar(value=False)
+        self._chk_debug = tk.Checkbutton(
+            mode_frame, text="🐛 Debug (serie)",
+            variable=self._debug_var,
+            font=("Segoe UI", 9),
+            command=self._on_debug_toggle,
+        )
+        self._chk_debug.pack(side="left", padx=(16, 0))
+
+        target_frame = tk.Frame(btn_frame)
+        target_frame.grid(row=1, column=0, columnspan=3, pady=(0, 6))
+        tk.Label(target_frame, text="Servidor:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._server_target_var = tk.StringVar(value="Producción")
+        self._server_hint_var = tk.StringVar(value="")
+        self._server_target_cb = ttk.Combobox(
+            target_frame,
+            textvariable=self._server_target_var,
+            values=list(SERVER_PRESETS.keys()),
+            state="readonly",
+            width=14,
+        )
+        self._server_target_cb.pack(side="left", padx=(4, 8))
+        self._server_target_cb.bind("<<ComboboxSelected>>", self._on_server_target_selected)
+
+        tk.Label(target_frame, text="Host/IP ESP:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._mqtt_server_var = tk.StringVar()
+        ttk.Entry(target_frame, textvariable=self._mqtt_server_var, width=18).pack(
+            side="left", padx=(4, 6))
+
+        tk.Label(target_frame, text="MQTT:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._mqtt_port_var = tk.StringVar()
+        ttk.Entry(target_frame, textvariable=self._mqtt_port_var, width=6).pack(
+            side="left", padx=(4, 0))
+
         self._btn_compile = ttk.Button(btn_frame, text="⚙  Compilar",
                                        width=16, command=self._compile)
-        self._btn_compile.grid(row=1, column=0, padx=6)
+        self._btn_compile.grid(row=2, column=0, padx=6)
         self._btn_serial  = ttk.Button(btn_frame, text="🔌  Flash USB",
                                        width=16, command=self._flash_serial)
-        self._btn_serial.grid(row=1, column=1, padx=6)
+        self._btn_serial.grid(row=2, column=1, padx=6)
         self._btn_ota     = ttk.Button(btn_frame, text="📡  Flash OTA",
                                        width=16, command=self._flash_ota)
-        self._btn_ota.grid(row=1, column=2, padx=6)
+        self._btn_ota.grid(row=2, column=2, padx=6)
 
         # ── Factory Provision ──
         sep = tk.Frame(self, height=1, bg="#dde3ea")
@@ -743,17 +989,32 @@ class FlasherApp(tk.Tk):
         fp_frame = tk.Frame(self)
         fp_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
 
-        tk.Label(fp_frame, text="Backend URL:",
+        fp_urls = tk.Frame(fp_frame)
+        fp_urls.pack(fill="x", pady=(0, 4))
+        tk.Label(fp_urls, text="Backend URL:",
                  font=("Segoe UI", 9, "bold")).pack(side="left")
-        self._backend_var = tk.StringVar(value=BACKEND_URL)
-        ttk.Entry(fp_frame, textvariable=self._backend_var, width=28).pack(
+        self._backend_var = tk.StringVar()
+        ttk.Entry(fp_urls, textvariable=self._backend_var, width=28).pack(
             side="left", padx=(4, 10))
-        self._btn_factory = ttk.Button(fp_frame, text="🏷  Provisionar fábrica",
+        tk.Label(fp_urls, text="App / QR:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._app_base_var = tk.StringVar()
+        ttk.Entry(fp_urls, textvariable=self._app_base_var, width=28).pack(
+            side="left", padx=(4, 0))
+
+        fp_actions = tk.Frame(fp_frame)
+        fp_actions.pack(fill="x")
+        self._btn_factory = ttk.Button(fp_actions, text="🏷  Provisionar fábrica",
                                        width=22, command=self._factory_provision)
         self._btn_factory.pack(side="left")
-        self._btn_erase_nvs = ttk.Button(fp_frame, text="🗑 Borrar NVS",
+        self._btn_erase_nvs = ttk.Button(fp_actions, text="🗑 Borrar NVS",
                                          width=14, command=self._erase_nvs)
         self._btn_erase_nvs.pack(side="left", padx=(8, 0))
+        tk.Label(fp_frame, textvariable=self._server_hint_var,
+                 fg="#666", font=("Segoe UI", 8, "italic")).pack(
+            anchor="w", pady=(4, 0))
+
+        self._apply_server_preset()
 
         # ── Estado ──
         self._status_var = tk.StringVar(value="Listo")
@@ -775,20 +1036,125 @@ class FlasherApp(tk.Tk):
     # ── Helpers UI ────────────────────────────────────────────────────────────
 
     def _refresh_ports(self):
-        ports = list_com_ports()
-        self._port_cb["values"] = ports
-        if ports and not self._port_var.get():
-            self._port_var.set(ports[0])
+        ports = list_com_ports_detailed()
+        self._port_choices = ports
+        labels = [item["label"] for item in ports]
+        self._port_cb["values"] = labels
+
+        current = self._port_var.get()
+        if labels:
+            if current not in labels:
+                self._port_var.set(labels[0])
+            summary = ", ".join(item["device"] for item in ports[:3])
+            if len(ports) > 3:
+                summary += ", ..."
+            self._port_hint_var.set(summary)
+        else:
+            self._port_var.set("")
+            self._port_hint_var.set("sin COM")
+
+        if hasattr(self, "_log"):
+            if labels:
+                self._log_line(
+                    "🔎  Puertos COM: " + " | ".join(labels),
+                    "#888",
+                )
+            else:
+                self._log_line("⚠  No se detectaron puertos COM.", "#f0a000")
+
+    def _get_selected_port(self):
+        sel = self._port_var.get().strip()
+        if not sel:
+            return ""
+        for item in self._port_choices:
+            if item["label"] == sel:
+                return item["device"]
+        return sel.split(" — ", 1)[0].split(" [", 1)[0].strip()
+
+    def _toggle_serial_monitor(self):
+        if self._serial_running:
+            self._stop_serial_monitor(manual=True)
+        else:
+            self._start_serial_monitor()
+
+    def _start_serial_monitor(self):
+        port = self._get_selected_port()
+        if not port:
+            messagebox.showwarning("Puerto requerido", "Selecciona un puerto COM.")
+            return
+        if not _SERIAL_AVAILABLE or serial is None:
+            messagebox.showerror(
+                "Monitor serie no disponible",
+                "Falta pyserial. Instala con: pip install pyserial",
+            )
+            return
+
+        self._serial_stop.clear()
+        self._serial_running = True
+        self._btn_serial_monitor.config(text="🛑 Cerrar")
+        self._log_line(f"● Monitor serie abierto en {port} @ 115200 baudios", "#569cd6")
+        if hasattr(self, "_status_var"):
+            self._set_status(f"Monitor serie activo en {port}")
+
+        def run():
+            ser = None
+            try:
+                ser = serial.Serial(port=port, baudrate=115200, timeout=1)
+                try:
+                    ser.dtr = False
+                    ser.rts = False
+                except Exception:
+                    pass
+
+                while not self._serial_stop.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        self.after(0, lambda t=line: self._log_line(f"[SERIAL] {t}", "#9cdcfe"))
+            except Exception as e:
+                self.after(0, lambda p=port, err=e: self._log_line(
+                    f"✗  No se pudo abrir {p}: {err}", "#f44747"))
+                self.after(0, lambda p=port, err=e: messagebox.showerror(
+                    "Monitor serie", f"No se pudo abrir {p}:\n{err}"))
+            finally:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                self.after(0, self._serial_monitor_stopped)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stop_serial_monitor(self, manual=False):
+        if not self._serial_running:
+            return
+        if manual and hasattr(self, "_log"):
+            self._log_line("● Cerrando monitor serie...", "#888")
+        self._serial_stop.set()
+
+    def _serial_monitor_stopped(self):
+        self._serial_running = False
+        self._btn_serial_monitor.config(text="👀 Serie")
+        if hasattr(self, "_status_var") and self._status_var.get().startswith("Monitor serie"):
+            self._set_status("Listo")
 
     def _log_line(self, text, color=None):
-        self._log.config(state="normal")
-        tag = None
-        if color:
-            tag = f"col_{color}"
-            self._log.tag_config(tag, foreground=color)
-        self._log.insert("end", text + "\n", tag or "")
-        self._log.see("end")
-        self._log.config(state="disabled")
+        def _do():
+            self._log.config(state="normal")
+            tag = None
+            if color:
+                tag = f"col_{color}"
+                self._log.tag_config(tag, foreground=color)
+            self._log.insert("end", text + "\n", tag or "")
+            self._log.see("end")
+            self._log.config(state="disabled")
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            self.after(0, _do)
 
     def _clear_log(self):
         self._log.config(state="normal")
@@ -796,41 +1162,179 @@ class FlasherApp(tk.Tk):
         self._log.config(state="disabled")
 
     def _set_status(self, msg):
-        self._status_var.set(msg)
-        self.update_idletasks()
+        if threading.current_thread() is threading.main_thread():
+            self._status_var.set(msg)
+            self.update_idletasks()
+        else:
+            self.after(0, lambda: self._status_var.set(msg))
 
     def _set_busy(self, busy):
         self._busy = busy
+        if busy:
+            self._stop_serial_monitor()
         state = "disabled" if busy else "normal"
         for btn in (self._btn_compile, self._btn_serial, self._btn_ota,
                     self._btn_factory, self._btn_erase_nvs, self._btn_refresh_ver,
-                    self._btn_discover_ota):
+                    self._btn_discover_ota, self._btn_serial_monitor):
             btn.config(state=state)
         if not busy:
             self._refresh_binary_status()
 
+    def _on_server_target_selected(self, _event=None):
+        self._apply_server_preset()
+
+    def _apply_server_preset(self):
+        preset = SERVER_PRESETS.get(
+            self._server_target_var.get(),
+            SERVER_PRESETS["Producción"],
+        )
+        self._backend_var.set(preset["backend_url"])
+        self._app_base_var.set(preset["app_base_url"])
+        self._mqtt_server_var.set(preset["mqtt_server"])
+        self._mqtt_port_var.set(str(preset["mqtt_port"]))
+        if self._server_target_var.get() == "Local":
+            if self._dev_mode_var.get():
+                self._server_hint_var.set(
+                    "Local: arranque directo con secrets.h; el ESP32 debe estar en la misma WiFi que este PC."
+                )
+            else:
+                self._server_hint_var.set(
+                    "Local: backend en este PC, pero el arranque sigue en PROD; pulsa DEV si quieres saltar el portal."
+                )
+        else:
+            self._server_hint_var.set(
+                "Producción: usará el broker y el claim de Aquantia en remoto."
+            )
+        self._sync_server_settings(log_change=False)
+        self._update_mode_ui()
+        self._refresh_binary_status()
+
+    def _get_server_settings(self):
+        backend_url = self._backend_var.get().strip().rstrip("/")
+        app_base_url = self._app_base_var.get().strip().rstrip("/")
+        mqtt_server = self._mqtt_server_var.get().strip()
+        mqtt_port_raw = self._mqtt_port_var.get().strip()
+
+        if not backend_url:
+            raise ValueError("Falta la URL del backend.")
+        if not app_base_url:
+            raise ValueError("Falta la URL base de la app/QR.")
+        if not mqtt_server:
+            raise ValueError("Falta el host/IP del broker para el ESP32.")
+        try:
+            mqtt_port = int(mqtt_port_raw)
+        except ValueError as exc:
+            raise ValueError("El puerto MQTT debe ser numérico.") from exc
+
+        parsed = urlparse(
+            backend_url if "://" in backend_url else f"http://{backend_url}"
+        )
+        if not parsed.hostname:
+            raise ValueError("La URL del backend no es válida.")
+        server_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        return {
+            "backend_url": backend_url,
+            "app_base_url": app_base_url,
+            "mqtt_server": mqtt_server,
+            "mqtt_port": mqtt_port,
+            "server_ip": mqtt_server,
+            "server_port": server_port,
+        }
+
+    def _sync_server_settings(self, log_change=True):
+        try:
+            cfg = self._get_server_settings()
+        except ValueError as e:
+            if log_change:
+                self._log_line(f"⚠  Configuración de servidor inválida: {e}", "#f0a000")
+            return None
+
+        try:
+            with open(self._SECRETS_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            new_content = re.sub(
+                r'#define SERVER_IP\s+"[^"]+"',
+                f'#define SERVER_IP     "{cfg["server_ip"]}"',
+                content,
+            )
+            new_content = re.sub(
+                r"#define SERVER_PORT\s+\d+",
+                f"#define SERVER_PORT   {cfg['server_port']}",
+                new_content,
+            )
+            new_content = re.sub(
+                r'#define MQTT_SERVER\s+"[^"]+"',
+                f'#define MQTT_SERVER  "{cfg["mqtt_server"]}"',
+                new_content,
+            )
+            new_content = re.sub(
+                r"#define MQTT_PORT\s+\d+",
+                f"#define MQTT_PORT    {cfg['mqtt_port']}",
+                new_content,
+            )
+
+            if new_content != content:
+                with open(self._SECRETS_PATH, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                if log_change:
+                    self._log_line(
+                        f"✓  Servidor firmware → {cfg['mqtt_server']}:{cfg['mqtt_port']}",
+                        "#4ec9b0",
+                    )
+            return cfg
+        except Exception as e:
+            self._log_line(f"Error actualizando secrets.h: {e}", "#f44747")
+            return None
+
+    def _reload_versions_for_branch(self, branch=None, keep_selection=False):
+        branch = (branch or self._branch_var.get().strip() or self._current_branch)
+        current_label = self._version_var.get().strip()
+        self._version_list = get_version_list(branch)
+        ver_labels = [v[0] for v in self._version_list]
+        self._version_cb["values"] = ver_labels
+
+        if keep_selection and current_label in ver_labels:
+            self._version_var.set(current_label)
+        else:
+            self._version_var.set(ver_labels[0] if ver_labels else "")
+
+        git_ref, _ = self._get_selected_ref()
+        self._update_commit_info(git_ref)
+        self._refresh_binary_status()
+
     def _refresh_versions(self):
-        """git fetch + recarga el selector de versiones."""
+        """git fetch + recarga ramas, tags y commits del selector."""
         if self._busy:
             return
         self._btn_refresh_ver.config(state="disabled")
-        self._set_status("Buscando versiones nuevas...")
+        self._set_status("Buscando ramas y commits...")
 
         def run():
-            self._log_line("\n● git fetch...", "#569cd6")
-            _git("fetch", "--tags", "--prune")
-            self._version_list = get_version_list()
-            ver_labels = [v[0] for v in self._version_list]
-            current = ver_labels[0] if ver_labels else ""
-            self._version_cb["values"] = ver_labels
-            self._version_var.set(current)
-            _, ver_desc, dirty = get_current_version()
-            ver_text = ver_desc + (" [modificado]" if dirty else "")
-            self._hdr_ver_var.set(f"firmware  {ver_text}")
-            self._log_line(f"✓  Versiones actualizadas — {ver_text}", "#4ec9b0")
-            self._set_status("Versiones actualizadas")
-            self._btn_refresh_ver.config(state="normal")
-            self._refresh_binary_status()
+            self._log_line("\n● git fetch --all --tags...", "#569cd6")
+            _git("fetch", "--all", "--tags", "--prune")
+            self._current_branch = get_current_branch()
+            self._branch_list = get_branch_list()
+
+            def on_done():
+                self._branch_cb["values"] = self._branch_list
+                selected_branch = self._branch_var.get().strip()
+                if not selected_branch or selected_branch not in self._branch_list:
+                    selected_branch = self._current_branch
+                    self._branch_var.set(selected_branch)
+                self._reload_versions_for_branch(selected_branch)
+                _, ver_desc, dirty = get_current_version()
+                ver_text = ver_desc + (" [modificado]" if dirty else "")
+                self._hdr_ver_var.set(f"firmware  {ver_text}")
+                self._log_line(
+                    f"✓  Ramas/commits actualizados — rama {selected_branch}",
+                    "#4ec9b0",
+                )
+                self._set_status(f"Rama activa en selector: {selected_branch}")
+                self._btn_refresh_ver.config(state="normal")
+
+            self.after(0, on_done)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -843,9 +1347,10 @@ class FlasherApp(tk.Tk):
         return None, sel
 
     def _refresh_binary_status(self):
-        profile = PROFILES.get(self._profile_var.get(), "?")
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
         git_ref, _ = self._get_selected_ref()
-        valid, msg = binary_is_valid(profile, git_ref)
+        secrets_digest = file_sha256(self._SECRETS_PATH)
+        valid, msg = binary_is_valid(profile, git_ref, get_fqbn_for_profile(profile), secrets_digest, self._debug_var.get())
         if valid:
             self._bin_status_var.set(f"✓  {msg}")
             self._bin_status_lbl.config(fg="#4ec9b0")
@@ -854,13 +1359,18 @@ class FlasherApp(tk.Tk):
             self._bin_status_lbl.config(fg="#f0a000")
 
     def _clean_build(self):
-        try:
-            if os.path.isdir(BUILD_DIR):
-                shutil.rmtree(BUILD_DIR)
-            self._log_line("🗑  Build limpiado.", "#888")
-        except Exception as e:
-            self._log_line(f"Error limpiando build: {e}", "#f44747")
+        errors = []
+        for label, path in [("build", BUILD_DIR), ("caché de objetos", BUILD_CACHE_DIR)]:
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                    self._log_line(f"🗑  {label.capitalize()} limpiado.", "#888")
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+        if errors:
+            self._log_line(f"Error limpiando: {'; '.join(errors)}", "#f44747")
         self._refresh_binary_status()
+
 
     def _update_commit_info(self, git_ref):
         """Actualiza el panel de info del commit seleccionado."""
@@ -886,6 +1396,13 @@ class FlasherApp(tk.Tk):
             else:
                 self._commit_text.insert("end", "(sin información de commit)", "meta")
         self._commit_text.config(state="disabled")
+
+    def _on_branch_selected(self, _event=None):
+        """Recarga la lista de commits al cambiar de rama."""
+        branch = self._branch_var.get().strip() or self._current_branch
+        self._reload_versions_for_branch(branch)
+        self._log_line(f"✓  Rama seleccionada: {branch}", "#4ec9b0")
+        self._set_status(f"Rama seleccionada: {branch}")
 
     def _on_version_selected(self, _event=None):
         """Maneja la selección de versión: actualiza estado y commit info."""
@@ -978,9 +1495,21 @@ class FlasherApp(tk.Tk):
             self._log_line("⚠  nvs_partition_gen no encontrado (se usará pip fallback).", "#888")
         else:
             self._log_line(f"✓  nvs_gen:    {self._nvs_gen}", "#4ec9b0")
+        if _SERIAL_AVAILABLE:
+            self._log_line("✓  pyserial: monitor serie disponible", "#4ec9b0")
+        else:
+            self._log_line("⚠  pyserial no instalado: el monitor serie no estará disponible.", "#f0a000")
+        if self._port_choices:
+            self._log_line(
+                "✓  Puertos COM detectados: " + ", ".join(item["label"] for item in self._port_choices),
+                "#4ec9b0",
+            )
+        else:
+            self._log_line("⚠  Sin puertos COM detectados ahora mismo.", "#888")
         _, ver_desc, dirty = get_current_version()
         self._log_line(f"✓  Repositorio: {ver_desc}" + (" [modificado]" if dirty else ""), "#4ec9b0")
         self._log_line(f"✓  Build dir:   {BUILD_DIR}", "#4ec9b0")
+        self._log_line(f"✓  Cache dir:   {BUILD_CACHE_DIR}", "#4ec9b0")
         self._log_line("")
 
     # ── Subprocesos ───────────────────────────────────────────────────────────
@@ -998,7 +1527,8 @@ class FlasherApp(tk.Tk):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                cwd=cwd or SKETCH_DIR
+                cwd=cwd or SKETCH_DIR,
+                **_WINDOWS_HIDDEN_SUBPROCESS
             )
             for line in proc.stdout:
                 line = line.rstrip("\n")
@@ -1118,17 +1648,34 @@ class FlasherApp(tk.Tk):
             messagebox.showerror("Error", "arduino-cli no encontrado.")
             return False, None
 
-        profile = PROFILES.get(self._profile_var.get(), "2")
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+        fqbn = get_fqbn_for_profile(profile)
+        board_label = BOARD_LABEL_BY_PROFILE.get(profile, "ESP32 genérico")
         git_ref, ver_label = self._get_selected_ref()
         bin_path = os.path.join(BUILD_DIR, f"{SKETCH_NAME}.ino.bin")
+        secrets_digest = file_sha256(self._SECRETS_PATH)
+        server_cfg = self._sync_server_settings(log_change=True)
+        if not server_cfg:
+            self._set_status("Configuración de servidor inválida")
+            return False, None
 
         # ¿Podemos saltarnos la compilación?
         if not force:
-            valid, reason = binary_is_valid(profile, git_ref)
+            valid, reason = binary_is_valid(profile, git_ref, fqbn, secrets_digest, self._debug_var.get())
             if valid:
-                self._log_line(f"✓  Binario en caché válido — omitiendo compilación", "#4ec9b0")
+                self._log_line(f"✓  Binario en caché válido — flasheando sin recompilar", "#4ec9b0")
                 self._log_line(f"   {reason}", "#888")
+                self._log_line(f"   Binario: {bin_path}", "#888")
+                self._log_line(f"   Secrets: {short_digest(secrets_digest)}", "#888")
                 return True, bin_path
+
+        # No borramos BUILD_DIR para preservar los .o intermedios de arduino-cli
+        # (compilación incremental). Solo limpiamos el .bin anterior si existe.
+        if os.path.exists(bin_path):
+            try:
+                os.remove(bin_path)
+            except OSError:
+                pass
 
         # Preparar directorio de sketch
         sketch_path = self._get_sketch_for_ref(git_ref)
@@ -1139,16 +1686,32 @@ class FlasherApp(tk.Tk):
         os.makedirs(BUILD_DIR, exist_ok=True)
 
         self._log_line(f"\n{'─'*60}", "#444")
-        self._log_line(f"  COMPILANDO  perfil={profile}  versión={ver_label}", "#dcdcaa")
+        self._log_line(f"  COMPILANDO  perfil={profile}  placa={board_label}  versión={ver_label}", "#dcdcaa")
+        self._log_line(f"  FQBN: {fqbn}", "#888")
+        self._log_line(f"  Build dir: {BUILD_DIR}", "#888")
+        self._log_line(f"  Sketch: {sketch_path}", "#888")
+        self._log_line(f"  Secrets: {short_digest(secrets_digest)}", "#888")
+        self._log_line(
+            f"  Servidor: {self._server_target_var.get()} → {server_cfg['mqtt_server']}:{server_cfg['mqtt_port']}",
+            "#888",
+        )
         self._log_line(f"{'─'*60}\n", "#444")
         self._set_status("Compilando...")
 
+        debug_flag = " -DDEBUG_MODE=1" if self._debug_var.get() else ""
+        if self._debug_var.get():
+            self._log_line("  Modo: DEBUG (salida serie activa)", "#ce9178")
+        else:
+            self._log_line("  Modo: RELEASE (salida serie silenciada)", "#888")
+
         cmd = [
             self._arduino_cli, "compile",
-            "--fqbn", FQBN,
-            "--build-property", f"build.extra_flags=-DDEVICE_PROFILE={profile}",
+            "--fqbn", fqbn,
+            "--build-property", f"compiler.cpp.extra_flags=-DDEVICE_PROFILE={profile}{debug_flag}",
+            "--build-property", f"compiler.c.extra_flags=-DDEVICE_PROFILE={profile}{debug_flag}",
             "--build-property", "build.partitions=min_spiffs",
             "--build-path", BUILD_DIR,
+            "--jobs", str(os.cpu_count() or 4),
             sketch_path,
         ]
         ok, _ = self._run_cmd(cmd, cwd=sketch_path)
@@ -1157,13 +1720,18 @@ class FlasherApp(tk.Tk):
             size = os.path.getsize(bin_path)
             now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             save_metadata({
-                "version_label": ver_label,
-                "git_ref":       git_ref,
-                "profile":       profile,
-                "built_at":      now,
+                "version_label":  ver_label,
+                "git_ref":        git_ref,
+                "profile":        profile,
+                "fqbn":           fqbn,
+                "board_label":    board_label,
+                "secrets_digest": secrets_digest,
+                "built_at":       now,
                 "bin_size_bytes": size,
+                "debug_mode":     self._debug_var.get(),
             })
             self._log_line(f"\n✓  Compilación OK — {size // 1024} KB", "#4ec9b0")
+            self._log_line(f"   Binario: {bin_path}", "#888")
             self._set_status(f"Compilado: {ver_label}  ({size // 1024} KB)")
         else:
             self._log_line("\n✗  Compilación fallida.\n", "#f44747")
@@ -1171,6 +1739,13 @@ class FlasherApp(tk.Tk):
             return False, None
 
         return True, bin_path
+
+    def _on_debug_toggle(self):
+        """Invalida la caché cuando cambia el modo debug para forzar recompilación."""
+        if os.path.exists(METADATA_FILE):
+            os.remove(METADATA_FILE)
+        mode = "DEBUG" if self._debug_var.get() else "RELEASE"
+        self._log_line(f"ℹ  Modo compilación: {mode} — caché invalidada", "#dcdcaa")
 
     def _compile(self):
         if self._busy:
@@ -1187,7 +1762,7 @@ class FlasherApp(tk.Tk):
     def _flash_serial(self):
         if self._busy:
             return
-        port = self._port_var.get()
+        port = self._get_selected_port()
         if not port:
             messagebox.showwarning("Puerto requerido", "Selecciona un puerto COM.")
             return
@@ -1195,35 +1770,50 @@ class FlasherApp(tk.Tk):
         self._set_busy(True)
 
         def run():
-            self._start_progress("indeterminate")
-            ok, bin_path = self._do_compile()
-            if not ok:
+            try:
+                self._start_progress("indeterminate")
+                ok, bin_path = self._do_compile()
+                if not ok:
+                    self._stop_progress(False)
+                    return
+
+                profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+                fqbn = FQBN_BY_PROFILE.get(profile, "esp32:esp32:lilygo_t_display")
+                board_label = BOARD_LABEL_BY_PROFILE.get(profile, "ESP32 genérico")
+
+                git_ref, ver_label = self._get_selected_ref()
+                self._log_line(f"\n{'─'*60}", "#444")
+                self._log_line(f"  FLASH USB — {port} — {board_label}", "#dcdcaa")
+                self._log_line(f"{'─'*60}", "#444")
+                self._log_line(f"  Versión: {ver_label}", "#888")
+                self._log_line(f"  Perfil: {profile}", "#888")
+                self._log_line(f"  FQBN: {fqbn}", "#888")
+                self._log_line(f"  Binario: {bin_path}", "#888")
+                self._log_line("  ⚡  Entra en modo bootloader:", "#f0a000")
+                self._log_line("      1. Mantén pulsado GPIO0 (BOOT)", "#f0a000")
+                self._log_line("      2. Pulsa y suelta EN/RST", "#f0a000")
+                self._log_line("      3. Suelta GPIO0\n", "#f0a000")
+                self._set_status(f"Flasheando por USB en {port}...")
+                self._start_progress("determinate")
+
+                cmd = [self._arduino_cli, "upload",
+                       "--fqbn", fqbn, "--port", port,
+                       "--verbose",
+                       "--input-dir", BUILD_DIR, SKETCH_DIR]
+                ok, _ = self._run_cmd(cmd)
+                self._stop_progress(ok)
+                if ok:
+                    self._log_line("\n✓  Flash USB completado.\n", "#4ec9b0")
+                    self._set_status("Flash USB completado")
+                else:
+                    self._log_line("\n✗  Flash USB fallido.\n", "#f44747")
+                    self._set_status("Error en flash USB")
+            except Exception as e:
                 self._stop_progress(False)
-                self._set_busy(False)
-                return
-
-            self._log_line(f"\n{'─'*60}", "#444")
-            self._log_line(f"  FLASH USB — {port}", "#dcdcaa")
-            self._log_line(f"{'─'*60}", "#444")
-            self._log_line("  ⚡  Entra en modo bootloader:", "#f0a000")
-            self._log_line("      1. Mantén pulsado GPIO0 (BOOT)", "#f0a000")
-            self._log_line("      2. Pulsa y suelta EN/RST", "#f0a000")
-            self._log_line("      3. Suelta GPIO0\n", "#f0a000")
-            self._set_status(f"Flasheando por USB en {port}...")
-            self._start_progress("determinate")
-
-            cmd = [self._arduino_cli, "upload",
-                   "--fqbn", FQBN, "--port", port,
-                   "--input-dir", BUILD_DIR, SKETCH_DIR]
-            ok, _ = self._run_cmd(cmd)
-            self._stop_progress(ok)
-            if ok:
-                self._log_line("\n✓  Flash USB completado.\n", "#4ec9b0")
-                self._set_status("Flash USB completado")
-            else:
-                self._log_line("\n✗  Flash USB fallido.\n", "#f44747")
+                self._log_line(f"\n✗  Error inesperado en flash USB: {e}\n", "#f44747")
                 self._set_status("Error en flash USB")
-            self._set_busy(False)
+            finally:
+                self._set_busy(False)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1248,9 +1838,17 @@ class FlasherApp(tk.Tk):
                 self._set_busy(False)
                 return
 
+            profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+            fqbn = get_fqbn_for_profile(profile)
+            board_label = BOARD_LABEL_BY_PROFILE.get(profile, "ESP32 genérico")
+            git_ref, ver_label = self._get_selected_ref()
             self._log_line(f"\n{'─'*60}", "#444")
-            self._log_line(f"  FLASH OTA — {ip}:3232", "#dcdcaa")
+            self._log_line(f"  FLASH OTA — {ip}:3232 — {board_label}", "#dcdcaa")
             self._log_line(f"{'─'*60}\n", "#444")
+            self._log_line(f"  Versión: {ver_label}", "#888")
+            self._log_line(f"  Perfil: {profile}", "#888")
+            self._log_line(f"  FQBN: {fqbn}", "#888")
+            self._log_line(f"  Binario: {bin_path}", "#888")
             self._set_status(f"Flasheando OTA a {ip}...")
             self._start_progress("determinate")
 
@@ -1284,7 +1882,7 @@ class FlasherApp(tk.Tk):
         """
         if self._busy:
             return
-        port = self._port_var.get()
+        port = self._get_selected_port()
         if not port:
             messagebox.showwarning("Puerto requerido",
                                    "Selecciona el puerto COM del dispositivo.")
@@ -1295,6 +1893,14 @@ class FlasherApp(tk.Tk):
                                  "Instala Arduino IDE 2.x o pip install esptool.")
             return
 
+        server_cfg = self._sync_server_settings(log_change=False)
+        if not server_cfg:
+            messagebox.showerror(
+                "Configuración inválida",
+                "Revisa la URL del backend, la URL de la app y el host MQTT.",
+            )
+            return
+
         self._clear_log()
         self._set_busy(True)
 
@@ -1303,12 +1909,17 @@ class FlasherApp(tk.Tk):
 
         def run():
             try:
-                backend_url = self._backend_var.get().strip().rstrip("/")
+                backend_url = server_cfg["backend_url"]
+                app_base_url = server_cfg["app_base_url"]
 
                 self._log_line("─" * 60, "#444")
                 self._log_line("  FACTORY PROVISION", "#dcdcaa")
                 self._log_line(f"  Perfil:   {profile_label}", "#888")
                 self._log_line(f"  Firmware: {ver_label}", "#888")
+                self._log_line(
+                    f"  Servidor: {self._server_target_var.get()} → {server_cfg['mqtt_server']}:{server_cfg['mqtt_port']}",
+                    "#888",
+                )
                 self._log_line("─" * 60, "#444")
 
                 # 1. Leer MAC
@@ -1347,20 +1958,28 @@ class FlasherApp(tk.Tk):
 
                 # 5. Leer offset de la partición NVS antes de escribir
                 nvs_offset = 0x9000
+                nvs_size = 0x5000
                 partitions = read_partition_table(self._esptool, port)
                 if partitions:
                     nvs_part = find_nvs_partition(partitions)
                     if nvs_part:
                         nvs_offset = nvs_part["offset"]
-                        self._log_line(f"  Partición NVS encontrada: nombre={nvs_part['name']} offset=0x{nvs_offset:X}", "#4ec9b0")
+                        nvs_size = nvs_part["size"]
+                        self._log_line(
+                            f"  Partición NVS encontrada: nombre={nvs_part['name']} offset=0x{nvs_offset:X} size=0x{nvs_size:X}",
+                            "#4ec9b0"
+                        )
                     else:
-                        self._log_line("  No se encontró partición NVS; usando 0x9000 por defecto", "#f0a000")
+                        self._log_line("  No se encontró partición NVS; usando 0x9000 / 0x5000 por defecto", "#f0a000")
                 else:
-                    self._log_line("  No se pudo leer la tabla de particiones; usando 0x9000 por defecto", "#f0a000")
+                    self._log_line("  No se pudo leer la tabla de particiones; usando 0x9000 / 0x5000 por defecto", "#f0a000")
 
-                self._log_line(f"\n● Escribiendo NVS en {port} (offset=0x{nvs_offset:X})...", "#569cd6")
+                self._log_line(
+                    f"\n● Escribiendo NVS en {port} (offset=0x{nvs_offset:X}, size=0x{nvs_size:X})...",
+                    "#569cd6"
+                )
                 try:
-                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token, nvs_offset)
+                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token, nvs_offset, nvs_size)
                     self._log_line("✓  NVS escrito correctamente.", "#4ec9b0")
                 except Exception as e:
                     self._log_line(f"✗  Error NVS: {e}", "#f44747")
@@ -1368,7 +1987,10 @@ class FlasherApp(tk.Tk):
 
                 # 6. Guardar en registro local CSV
                 try:
-                    fp_save_registry(serial, mac, profile_label, ver_label)
+                    fp_save_registry(
+                        serial, mac, profile_label, ver_label,
+                        app_base_url=app_base_url,
+                    )
                     self._log_line(f"✓  Registro guardado: {REGISTRY_FILE}", "#4ec9b0")
                 except Exception as e:
                     self._log_line(f"⚠  No se pudo guardar el registro: {e}", "#f0a000")
@@ -1383,7 +2005,10 @@ class FlasherApp(tk.Tk):
                 self._log_line(f"  Registro: {REGISTRY_FILE}", "#888")
                 self._log_line("═" * 60 + "\n", "#444")
                 self._set_status(f"Provisionado: {serial}")
-                self.after(100, lambda s=serial, m=mac: show_qr_window(s, m))
+                self.after(
+                    100,
+                    lambda s=serial, m=mac, a=app_base_url: show_qr_window(s, m, a),
+                )
 
             except Exception as e:
                 self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
@@ -1404,7 +2029,7 @@ class FlasherApp(tk.Tk):
         """
         if self._busy:
             return
-        port = self._port_var.get()
+        port = self._get_selected_port()
         if not port:
             messagebox.showwarning("Puerto requerido",
                                    "Selecciona el puerto COM del dispositivo.")
@@ -1540,7 +2165,7 @@ class FlasherApp(tk.Tk):
             self._set_busy(False)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main 
 
 if __name__ == "__main__":
     app = FlasherApp()

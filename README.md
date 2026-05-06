@@ -14,13 +14,16 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 - [Librerías necesarias](#librerías-necesarias)
 - [secrets.h — modo DEV](#secretsh--modo-dev)
 - [Arquitectura del firmware](#arquitectura-del-firmware)
+- [Timings de lectura de sensores](#timings-de-lectura-de-sensores)
 - [Modo MQTT](#modo-mqtt)
 - [Modo HTTP legacy](#modo-http-legacy)
 - [Relay y electroválvulas](#relay-y-electroválvulas)
 - [Pantalla TFT](#pantalla-tft)
 - [Filtros y estabilización](#filtros-y-estabilización)
 - [Simulación de sensores](#simulación-de-sensores)
-- [Modo debug (rama test)](#modo-debug-rama-test)
+- [Sensor de presión de tubería XDB401](#sensor-de-presión-de-tubería-xdb401)
+- [Umbrales de alerta de presión](#umbrales-de-alerta-de-presión)
+- [Modo debug](#modo-debug)
 - [Ahorro energético](#ahorro-energético)
 - [Problemas conocidos](#problemas-conocidos)
 
@@ -32,8 +35,9 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 
 | Perfil | `DEVICE_PROFILE` | Hardware | Relays | Pantalla | Sensores meteo |
 |--------|:----------------:|----------|:------:|:--------:|:--------------:|
-| **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí |
+| **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
 | **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | No |
+| **AGROMETEO** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | Sin relays | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
 
 Pinout completo de cada perfil: [PINOUT.md](PINOUT.md)
 
@@ -141,12 +145,18 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 |----------|-------|:------:|-----|
 | `TFT_eSPI` | Bodmer | METEO | Pantalla ST7789 |
 | `Adafruit MCP9808 Library` | Adafruit | METEO | Temperatura exterior |
-| `SparkFun MicroPressure Library` | SparkFun | METEO | Barómetro |
+| `Adafruit BMP280 Library` | Adafruit | METEO, AGROMETEO | Temperatura + presión atmosférica |
+| `SparkFun MicroPressure Library` | SparkFun | METEO, AGROMETEO | Barómetro principal |
 | `DHTesp` | beegee-tokyo | METEO | DHT11 |
-| `ArduinoJson` | Benoit Blanchon | Ambos | Payloads JSON |
-| `PubSubClient` | knolleary | Ambos (MQTT) | Cliente MQTT |
+| `BH1750` | claws | AGROMETEO | Iluminancia |
+| `SparkFun Qwiic Power Switch Library` | SparkFun | AGROMETEO | PCA9536 — alimenta el bus I2C |
 
-HTU2x y el sensor de luz se implementan directamente sobre I2C sin librería externa.
+> **Nota:** El perfil AGROMETEO no incluye relays ni pantalla. Los parámetros `dew_point`, `heat_index` y `abs_humidity` se calculan en firmware y se publican en telemetría MQTT cuando `DEVICE_PROFILE = PROFILE_AGROMETEO`.
+| `ArduinoJson` | Benoit Blanchon | Todos | Payloads JSON |
+| `PubSubClient` | knolleary | Todos (MQTT) | Cliente MQTT |
+
+HTU2x, HDC1080 y el sensor de luz TSL2584/APDS-9930 se implementan directamente sobre I2C sin librería externa.
+El driver del sensor de presión de tubería XDB401 (familia XGZP6847D) también es inline, sin librería.
 
 ### Configuración TFT_eSPI (PROFILE_METEO)
 
@@ -217,26 +227,32 @@ El motivo es que en PROD el broker identifica cada dispositivo **por su MAC** y 
 
 ```
 Core 1 — loop()
- ├─ Cada 100ms  → Leer ADC anemómetro/veleta (METEO)
- │               Acumular vector de viento para promedio vectorial
- ├─ Cada 1s     → Leer I2C: MCP9808, HTU2x, barómetro, luz (METEO)
- │               Leer ADC YL-69 humedad suelo (METEO)
- │               Actualizar pantalla TFT (METEO)
- └─ Siempre     → Gestionar botones y timeout de pantalla (METEO)
+ ├─ Cada 100ms   → Leer ADC anemómetro/veleta (METEO)
+ │                Acumular vector de viento para promedio vectorial
+ ├─ Cada 500ms   → [solo pipeline_mode=real] Leer XDB401 + caudalímetro
+ │                Actualizar display y LeakDetector sin enviar a backend
+ ├─ Cada 20s*    → Leer I2C: sensores meteo según perfil
+ │                Calcular parámetros agrometeorológicos (AGROMETEO)
+ │                Construir TelemetrySnapshot → xQueueOverwrite (sin bloqueo)
+ │                Actualizar pantalla TFT (METEO)
+ └─ Siempre      → Gestionar botones y timeout de pantalla (METEO)
 
-Core 0 — networkTask()  [prioridad 2]
- ├─ Cada ~10ms  → ArduinoOTA.handle()  ← nunca bloqueado
- ├─ Al arrancar → [HTTP] POST /api/device_info
- │                [MQTT] mqttConnect() + publish register
- ├─ Continuo    → [MQTT] mqttClient.loop()  ← recibe comandos relay
- ├─ Cada 2s     → [HTTP] GET /api/relay/command → actuar relays + ack
- └─ Cada 20s    → Snapshot bajo dataMutex → envío telemetría
-                  [HTTP] CSV → POST /send_message
-                  [MQTT] JSON → publish aquantia/<finca_id>/telemetry
+Core 0 — networkTask()  [prioridad 2, watchdog 30s]
+ ├─ Cada ~10ms   → ArduinoOTA.handle()  ← nunca bloqueado
+ ├─ Al arrancar  → [HTTP] POST /api/device_info
+ │                 [MQTT] mqttConnect() + publish register
+ ├─ Continuo     → [MQTT] mqttClient.loop()  ← recibe comandos relay
+ ├─ Cada 2s      → [HTTP] GET /api/relay/command → actuar relays + ack
+ └─ Cada 20s*    → xQueuePeek (sin bloqueo) → envío telemetría
+                   [HTTP] CSV → POST /send_message
+                   [MQTT] JSON → publish aquantia/<finca_id>/telemetry
+
+* telemetryIntervalMs ajustable en runtime vía MQTT / HTTP /api/pipeline/config
 ```
 
 Sincronización entre cores:
-- **`dataMutex`** (FreeRTOS Mutex): protege el snapshot de sensores al construir el payload
+- **`telemetryQueue`** (FreeRTOS Queue, tamaño 1): Core 1 publica el snapshot con `xQueueOverwrite`; Core 0 lo consume con `xQueuePeek`. Nunca bloquea ningún core.
+- **`dataMutex`** (FreeRTOS Mutex): protege exclusivamente las escrituras de config desde Core 0 (`pipelineScenario`, `telemetryIntervalMs`, `relayActive[]`) que Core 1 lee.
 - **`windMux`** (sección crítica): protege los acumuladores vectoriales del viento
 
 ### Seguridad OTA
@@ -245,6 +261,50 @@ Al arrancar una actualización OTA:
 - `networkTask` deja de enviar datos
 - Todos los relays pasan a OFF (HIGH)
 - Core 1 (sensores/pantalla) sigue funcionando
+
+---
+
+## Timings de lectura de sensores
+
+Todos los intervalos son constantes de compilación definidas al inicio de `ESP_monitor_server.ino`. `telemetryIntervalMs` es el único ajustable en tiempo de ejecución vía MQTT/HTTP (valor por defecto 20 s).
+
+### Tabla de ciclos
+
+| Intervalo | Constante | Core | Qué ocurre | Perfiles |
+|----------:|-----------|:----:|-----------|:--------:|
+| **100 ms** | `WIND_MS` | 1 | Lee ADC anemómetro (GPIO 36) → `windSpeed`; ADC veleta → `windDirection`; acumula vector para promedio | METEO |
+| **500 ms** | `PIPELINE_FAST_MS` | 1 | Lee XDB401 (presión + temperatura agua) y caudalímetro → actualiza display y detector de fugas. **Solo activo cuando `pipeline_mode = real`** | Todos |
+| **1 s** | `SCREEN_MS` | 1 | Refresca pantalla TFT (doble buffer, sin parpadeo) | METEO |
+| **2 s** | `RELAY_MS` | 0 | `GET /api/relay/command` — solo modo HTTP legacy | Todos |
+| **5 s** | `DEBUG_INTERVAL_MS` | 1 | Imprime reporte completo de estado por Serial — **solo con `DEBUG_MODE` activo** | Todos |
+| **20 s** \* | `telemetryIntervalMs` | 1 → 0 | Lee todos los sensores I2C + ADC suelo → construye `TelemetrySnapshot` → Core 0 envía MQTT o HTTP | Todos |
+| **20 s** | `PIPELINE_SYNC_MS` | 0 | Sincroniza config pipeline (`pipeline_mode`, escenario) desde el servidor | Todos |
+| **30 s** | `XDB401_RETRY_INTERVAL` | 1 | Reintenta `xdb401_begin()` tras 5 fallos consecutivos de lectura | Todos |
+| **60 s** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones | METEO |
+
+\* `telemetryIntervalMs` puede modificarse en tiempo de ejecución mediante MQTT (`telemetry_interval_s`) o HTTP `/api/pipeline/config`. El valor por defecto (y el usado para sincronizar las lecturas I2C) es **20 s**.
+
+### Sensores leídos en el ciclo de 20 s (por perfil)
+
+| Sensor | Magnitudes | METEO | IRRIGATION | AGROMETEO |
+|--------|-----------|:-----:|:----------:|:---------:|
+| **MCP9808** | Temperatura exterior | ✓ | — | — |
+| **HTU2x** | Temperatura + humedad | ✓ | — | — |
+| **DHT11** | Temperatura + humedad (secundario) | ✓ | — | — |
+| **HDC1080** | Temperatura + humedad | — | — | ✓ |
+| **MicroPressure** | Presión atmosférica (principal) | ✓ | — | ✓ |
+| **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | — | ✓ |
+| **TSL2584 / APDS-9930** | Iluminancia | ✓ | — | — |
+| **BH1750** | Iluminancia | — | — | ✓ |
+| **YL-69** (ADC) | Humedad suelo | ✓ | — | — |
+| **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ (sync) | ✓ (sync) | ✓ (sync) |
+| **Caudalímetro** (pulsos) | Caudal L/min | ✓ (sync) | ✓ (sync) | — |
+
+> El XDB401 y el caudalímetro se leen **también cada 500 ms** (ciclo rápido) cuando `pipeline_mode = real`. En el ciclo de 20 s se sincronizan sus valores al snapshot de telemetría.
+
+### Fallback y simulación
+
+Si un sensor no responde al arrancar (o acumula 5 errores consecutivos), el firmware sustituye su lectura por un valor simulado que deriva suavemente. El sensor vuelve a intentar reinicializarse en el siguiente ciclo de 20 s (o cada 30 s en el caso del XDB401). El campo `*_source` del payload indica si el valor es real o simulado (`"SIM"`).
 
 ---
 
@@ -262,27 +322,62 @@ Modo de comunicación principal. Activar definiendo `USE_MQTT` en `secrets.h`.
 
 ### Payload telemetría (JSON)
 
+Campos presentes en todos los perfiles salvo indicación:
+
 ```json
 {
-  "temperature":           22.5,
-  "pressure":              101.3,
-  "temperature_barometer": 21.8,
-  "humidity":              65.2,
-  "windSpeed":             3.5,
-  "windDirection":         180.0,
-  "windSpeedFiltered":     3.3,
-  "windDirectionFiltered": 178.0,
-  "light":                 350.0,
-  "dht_temperature":       21.6,
-  "dht_humidity":          63.0,
-  "rssi":                  -65,
-  "free_heap":             245000,
-  "uptime_s":              12345,
-  "relay_active":          0,
-  "soil_moisture":         50.0,
-  "mac_address":           "FC:B4:67:F3:77:48"
+  "temperature":              22.5,
+  "pressure":                 101.3,
+  "temperature_barometer":    21.8,
+  "humidity":                 65.2,
+  "temperature_source":       "MCP9808",
+  "pressure_source":          "MicroPressure",
+  "windSpeed":                3.5,
+  "windDirection":            180.0,
+  "windSpeedFiltered":        3.3,
+  "windDirectionFiltered":    178.0,
+  "light":                    350.0,
+  "dht_temperature":          21.6,
+  "dht_humidity":             63.0,
+  "rssi":                     -65,
+  "free_heap":                245000,
+  "uptime_s":                 12345,
+  "relay_active":             0,
+  "relay_count":              1,
+  "soil_moisture":            50.0,
+  "bmp280_ok":                true,
+  "bmp280_temperature":       21.5,
+  "bmp280_pressure":          101.2,
+  "pipeline_pressure":        3.50,
+  "pipeline_flow":            5.00,
+  "pipeline_scenario":        "normal",
+  "pipeline_mode":            "real",
+  "pipeline_source":          "real",
+  "pipeline_pressure_ok":     true,
+  "pipeline_flow_ok":         true,
+  "xdb401_ok":                true,
+  "xdb401_temperature":       18.3,
+  "mac_address":              "FC:B4:67:F3:77:48",
+  "ip_address":               "192.168.1.9",
+  "firmware_version":         "0.1.0-beta.5",
+  "ts":                       1746360000
 }
 ```
+
+Campos exclusivos **PROFILE_AGROMETEO** (presentes solo cuando el perfil es 3):
+
+```json
+{
+  "dew_point":     12.4,
+  "heat_index":    24.1,
+  "abs_humidity":   9.85
+}
+```
+
+> `temperature_source` puede ser `"MCP9808"`, `"BMP280"`, `"HDC1080"` o `"SIM"`.
+> `pressure_source` puede ser `"XDB401"`, `"MicroPressure"`, `"BMP280"` o `"SIM"`.
+> `xdb401_temperature` es la temperatura del fluido medida por el sensor de presión — solo cuando `xdb401_ok = true`.
+> El campo `ts` contiene el timestamp NTP en epoch Unix; se omite si el reloj aún no está sincronizado.
 
 ### Autenticación MQTT — flujo completo
 
@@ -359,9 +454,10 @@ Solo `PROFILE_METEO`. Resolución **240×135 px** (ST7789). Doble buffer con `TF
 |----------|------------------|
 | **Boot** | Primeros segundos del arranque |
 | **Setup AP** | Sin credenciales WiFi — muestra SSID y contraseña del AP |
-| **Datos** | Funcionamiento normal — sensores en tiempo real |
+| **Meteo** (vista 1) | Funcionamiento normal — sensores meteorológicos en tiempo real |
+| **Pipeline** (vista 2) | Presión y caudal de tubería — alternar con BTN_LEFT / BTN_RIGHT |
 
-### Pantalla de datos
+### Vista Meteo
 
 ```
 ┌──────────────────────────────────────┐
@@ -377,7 +473,26 @@ Solo `PROFILE_METEO`. Resolución **240×135 px** (ST7789). Doble buffer con `TF
 └──────────────────────────────────────┘
 ```
 
-Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (60s).
+### Vista Pipeline
+
+Accesible pulsando cualquier botón cuando la pantalla está encendida. Dos tarjetas anchas (presión / caudal) más una franja inferior con modo, escenario y temperatura del agua:
+
+```
+┌──────────────────────────────────────┐
+│ PIPELINE            • ●  WiFi  ●      │  ← puntos: vista activa
+├─────────────────────┬────────────────┤
+│ PRESION             │ CAUDAL         │
+│ 3.50 bar            │ 5.00 L/min     │
+│ [OK]                │ [OK]           │
+├─────────────────────┴────────────────┤
+│ MODO: REAL   Escenario: normal        │
+│              Taq: 18.3 °C            │  ← temp. agua XDB401
+└──────────────────────────────────────┘
+```
+
+Cuando el sensor XDB401 no está conectado o `pipeline_mode = sim`, los valores se muestran en naranja con badge `[SIM]` y la línea `Taq` desaparece.
+
+Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (60 s por defecto, configurable vía MQTT `display_timeout_s`).
 
 ---
 
@@ -423,17 +538,81 @@ Si un sensor no responde al arrancar, el firmware continúa con valores simulado
 | HTU2x humedad | 20–95 % | ±0.20 % |
 | DHT11 temperatura | −10 a 45 °C | ±0.05 °C |
 | DHT11 humedad | 20–95 % | ±0.20 % |
+| HDC1080 temperatura | −10 a 45 °C | ±0.05 °C |
+| HDC1080 humedad | 20–95 % | ±0.20 % |
+| BH1750 iluminancia | 0–2000 lux | ±5 lux |
 | Barómetro | 95–110 kPa | ±0.02 kPa |
 | Luz | 0–2000 lux | ±5 lux |
 | Viento | 0–15 m/s | ±0.30 m/s |
 | Dirección | 0–360° | ±2.5° |
 | Humedad suelo | 0–100 % | ±0.5 % |
+| Pipeline presión | 0–`PIPELINE_STATIC_P` bar | ruido sinusoidal |
+| Pipeline caudal | 0–`PIPELINE_NOMINAL_Q` L/min | ruido sinusoidal |
 
 La pantalla TFT muestra `[OK]` o `[SIM]` por cada sensor.
 
 ---
 
-## Modo debug (rama `test`)
+## Sensor de presión de tubería XDB401
+
+Compatible con la familia **XGZP6847D** y sensores chinos equivalentes con el mismo protocolo I2C.
+
+| Parámetro | Valor |
+|-----------|-------|
+| Dirección I2C | `0x6D` (principal) / `0x7F` (algunos lotes — autodetectado) |
+| Alimentación | 3.3 V |
+| Pull-ups | Internos — no añadir externos |
+| Frecuencia I2C | 100 kHz (400 kHz puede fallar en algunos ejemplares) |
+| Salida | Presión (24 bits, ±bit 23) + temperatura (16 bits, ±bit 15) |
+
+### Configurar el fondo de escala
+
+Definir en `secrets.h` o pasar como flag de compilación:
+
+```cpp
+// Ajustar según el modelo físico recibido
+#define XDB401_FULLSCALE_KPA  400.0f   // 0–4 bar
+// #define XDB401_FULLSCALE_KPA  1000.0f  // 0–10 bar (defecto)
+// #define XDB401_FULLSCALE_KPA  4000.0f  // 0–40 bar
+```
+
+### Conexión (cable 4 hilos)
+
+| Pin | Color | Función |
+|-----|-------|---------|
+| 1 | Marrón | VCC (+3.3 V) |
+| 2 | Azul | GND |
+| 3 | Blanco | SDA |
+| 4 | Negro | SCL |
+
+### Comportamiento en firmware
+
+- Si el sensor **responde en I2C** al arrancar (`xdb401_ok = true`): `pipeline_mode` se cambia automáticamente a `"real"` y la presión se obtiene del sensor físico.
+- La **temperatura del agua** (`xdb401_temperature`) se publica en telemetría y se muestra en la pantalla TFT como `Taq`.
+- Si el sensor **no está conectado**: `pipeline_mode = "sim"` y la presión/caudal usan el simulador determinista.
+- El backend puede forzar `pipeline_mode = "sim"` en cualquier momento vía MQTT `pipeline_config` o HTTP `/api/pipeline/config`.
+
+---
+
+## Umbrales de alerta de presión
+
+Definidos en el firmware como constantes de compilación (no requieren reflashear si se ajustan en `secrets.h`):
+
+```cpp
+#define PRESSURE_MIN_NORMAL    1.5f  // bar — por debajo: fuga grande o corte de suministro
+#define PRESSURE_MAX_NORMAL    7.0f  // bar — por encima: sobrepresión, riesgo instalación
+#define PRESSURE_DROP_ALERT    1.0f  // bar — caída en <2 s: fuga activa → corte automático
+#define PRESSURE_HYDRO_TARGET  3.5f  // bar — presión de trabajo del hidropresor
+#define PRESSURE_HYDRO_MARGIN  0.5f  // bar — desviación máxima aceptable del hidro
+```
+
+> **Ajuste para Lanzarote:** la red pública puede bajar de 2 bar en verano/horas punta. El umbral `PRESSURE_MIN_NORMAL = 1.5 bar` evita falsas alarmas en esos periodos.
+
+La lógica de actuación (corte de relay, alerta MQTT) se implementa en el backend a partir del campo `pipeline_pressure` del payload de telemetría.
+
+---
+
+## Modo debug
 
 La rama `test` tiene `#define DEBUG_MODE 1` activo. Cada 5s imprime por Serial:
 
@@ -452,6 +631,15 @@ La rama `test` tiene `#define DEBUG_MODE 1` activo. Cada 5s imprime por Serial:
 
 Útil para verificar el funcionamiento completo sin sensores conectados (modo simulación activo para los sensores ausentes).
 
+### Pipeline: simulación y modo hardware
+
+La beta.2 deja preparada la transición al caudalímetro real:
+
+- `pipeline_mode = sim | real`
+- recepción inmediata de configuración por MQTT dirigida por MAC
+- fallback por lectura HTTP de `/api/pipeline/config`
+- si el sensor real aún no está montado, el firmware mantiene `pipeline_source = fallback` y sigue usando el simulador
+
 ---
 
 ## Ahorro energético
@@ -464,9 +652,128 @@ La rama `test` tiene `#define DEBUG_MODE 1` activo. Cada 5s imprime por Serial:
 
 ---
 
+## Detector automático de fugas (LeakDetector)
+
+Clase `LeakDetector` en `LeakDetector.h`. Recibe muestras de presión y caudal cada 500 ms y clasifica el estado de la tubería en tiempo real.
+
+### Algoritmo
+
+1. **Warm-up** (20 muestras con válvula abierta): aprende el baseline de presión y caudal mediante EMA sin disparar alertas. Telemetría muestra `leak_detect_trained: false` hasta completar el entrenamiento.
+2. **Detección activa** una vez entrenado:
+   - **Válvula cerrada**: cualquier caudal > `leak_idle_threshold_lpm` durante 3 muestras consecutivas → `"leak"`
+   - **Válvula abierta**: caída de presión ≥ `burst_pressure_drop_pct` → `"burst"` / exceso de caudal ≥ `leak_on_deviation_pct` → `"leak"` / caída de caudal ≥ `obstruction_flow_drop_pct` → `"obstruction"`
+3. **Normal** en el resto de casos: actualiza EMA con la muestra nueva.
+
+### Perfiles de riego predefinidos
+
+| Perfil | `irrigation_type` | Presión nominal | Caudal nominal |
+|--------|:-----------------:|:---------------:|:--------------:|
+| Aspersión (defecto) | `sprinkler` | 2.80 bar | 5.00 L/min |
+| Goteo | `drip` | 1.50 bar | 2.00 L/min |
+| Cinta de goteo | `drip_tape` | 0.80 bar | 0.80 L/min |
+| Microaspersión | `micro_sprinkler` | 2.20 bar | 3.50 L/min |
+
+El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`. El detector reinicia su baseline al cambiar de perfil.
+
+### Campos de telemetría del detector
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `pipeline_scenario` | string | `normal` / `leak` / `burst` / `obstruction` |
+| `leak_detect_trained` | bool | `true` cuando el baseline EMA está entrenado |
+| `pipeline_pressure_ok` | bool | Sensor de presión real activo |
+| `pipeline_flow_ok` | bool | Caudalímetro real activo |
+| `pipeline_source` | string | `real` / `sim` / `fallback` |
+
+---
+
 ## Problemas conocidos
 
 | Problema | Estado |
 |----------|--------|
-| Presión en kPa en vez de hPa | Pendiente — cambiar `readPressure(KPA)` → `readPressure(PA) / 100.0` |
 | DHT11 lecturas inestables ocasionalmente | Conocido — valorar reemplazar por DHT22 o SHT31 |
+| Temperatura agua XDB401 puede reflejar T ambiente si la tubería está seca | Esperado — documentar en dashboard |
+| `pipelineMode` / `pipelineScenario` leídos en Core 1 sin mutex (eventual-consistent) | Pendiente fix en rama `fix/stability-low-cost` |
+| LeakDetector dispara burst/obstruction con 1 sola muestra (sin ventana de confirmación) | Pendiente fix en rama `fix/stability-low-cost` |
+
+---
+
+## Versionado y flujo de trabajo
+
+### Estructura de ramas
+
+```
+main              ← producción (solo merges de release/* o hotfix/*)
+develop           ← integración continua
+feature/*         ← nueva funcionalidad (sale de develop, merge a develop)
+release/vX.Y.Z    ← congelado para pruebas (sale de develop)
+hotfix/*          ← parche urgente sobre main
+```
+
+**Regla principal:** nunca se trabaja directamente en `main`. Todo cambio pasa por `develop` y, cuando llega a producción, lo hace a través de una rama `release/`.
+
+### Versionado semántico (SemVer)
+
+El firmware sigue `MAJOR.MINOR.PATCH[-prerelease]`:
+
+| Incremento | Cuándo |
+|------------|--------|
+| `PATCH` | Corrección de bug sin cambio de API/protocolo |
+| `MINOR` | Nueva funcionalidad compatible con backend anterior |
+| `MAJOR` | Cambio de protocolo MQTT o HTTP incompatible |
+
+Ejemplos de ciclo: `v0.1.0-beta.1` → `v0.1.0-rc.1` → `v0.1.0` → `v0.1.1` → `v0.2.0`
+
+### Cómo actualizar la versión del firmware
+
+La versión se define en una sola línea al inicio de `ESP_monitor_server.ino`:
+
+```cpp
+#define FIRMWARE_VERSION "0.1.0-beta.2"
+```
+
+Este valor se envía automáticamente al backend en dos momentos:
+- **Arranque**: mensaje MQTT `aquantia/<finca_id>/register` → campo `firmware_version`
+- **Registro HTTP**: POST `/api/device_info` → campo `firmware_version`
+
+El backend lo almacena en `device_info.firmware_version` y lo muestra como badge en el dashboard.
+
+### Proceso de release
+
+```bash
+# 1. Crear rama de release desde develop
+git checkout develop && git pull
+git checkout -b release/v0.2.0
+
+# 2. Actualizar FIRMWARE_VERSION en el .ino
+#    Editar: #define FIRMWARE_VERSION "0.2.0-rc.1"
+
+# 3. Actualizar CHANGELOG.md con los cambios
+
+# 4. Commit de cierre de release
+git add ESP_monitor_server/ESP_monitor_server.ino CHANGELOG.md
+git commit -m "chore: bump firmware to v0.2.0-rc.1"
+
+# 5. Etiquetar
+git tag -a v0.2.0-rc.1 -m "Release candidate v0.2.0-rc.1"
+git push origin release/v0.2.0 --tags
+
+# 6. Tras validación, merge a main y develop
+git checkout main && git merge --no-ff release/v0.2.0
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin main --tags
+git checkout develop && git merge --no-ff release/v0.2.0
+git push origin develop
+```
+
+### Compatibilidad firmware ↔ backend
+
+Ambos repositorios se versionan de forma independiente pero coordinada.
+El backend mantiene en `app_settings` la clave `min_firmware_version` con la versión mínima aceptada. Cuando se introduce un cambio de protocolo incompatible, se incrementa `MAJOR` en ambos repos y se actualiza ese valor.
+
+| Firmware | Backend app_meteo | Estado |
+|----------|-------------------|--------|
+| `v0.1.x` | `v0.1.x` | Compatible |
+| `v0.2.0` | `v0.1.x` | Puede no funcionar — revisar CHANGELOG |
+
+Ver también: [CHANGELOG.md](CHANGELOG.md) y el [README del backend](../app_meteo/app_meteo/README.md).
