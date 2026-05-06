@@ -11,6 +11,20 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Fixed
+- **Relay lógica invertida (activo-HIGH)**: corregidos los 5 puntos donde se escritura el pin del relay. Antes usaba activo-LOW (`LOW=ON`); ahora activo-HIGH (`HIGH=ON`) para el hardware instalado en Aquantia.
+
+### Added
+- **Alarmas MQTT (`aquantia/{finca_id}/alerts`)**: el dispositivo publica alertas puntuales solo al cambiar de estado (sin spam por ciclo). Alarmas implementadas:
+  - `leak` (warning) — fuga detectada por LeakDetector
+  - `burst` (critical) — reventón
+  - `obstruction` (warning) — obstrucción en tubería
+  - `pipeline_ok` (info) — recuperación a estado normal
+  - `sensor_failure` (warning) — XDB401 deja de responder
+  - `sensor_ok` (info) — XDB401 recuperado
+  - `low_heap` (warning) — heap libre < 30 KB
+  - `mqtt_reconnect` (info) — reconexión al broker
+
 ---
 
 ## [0.2.0-beta.2] — 2026-05-06

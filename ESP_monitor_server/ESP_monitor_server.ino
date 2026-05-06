@@ -300,7 +300,7 @@ void ledTick() {
 #endif
 
 // ── Relay electroválvula(s) ────────────────────────────────────────────────────
-// JQC-3FF-S-Z activo-LOW: LOW = relay ON (válvula abierta), HIGH = relay OFF
+// Relay activo-HIGH: HIGH = relay ON (válvula abierta), LOW = relay OFF
 // relayActive[i] — estado actual de cada relay (índice = bit en bitmask)
 // RELAY_COUNT puede ser 0 en AGROMETEO — usamos max(1,…) para evitar array de tamaño 0
 bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
@@ -1316,8 +1316,8 @@ void checkRelayCommand() {
     bool desired = (bitmask >> i) & 1;
     if (desired != relayActive[i]) {
       relayActive[i] = desired;
-      // JQC-3FF-S-Z activo-LOW: LOW = relay ON, HIGH = relay OFF
-      digitalWrite(RELAY_PINS[i], desired ? LOW : HIGH);
+      // Relay activo-HIGH: HIGH = relay ON, LOW = relay OFF
+      digitalWrite(RELAY_PINS[i], desired ? HIGH : LOW);
       DLOGF("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
       changed = true;
     }
@@ -1700,7 +1700,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     bool state = doc["state"] | false;
     if (relay >= 0 && relay < RELAY_COUNT) {
       relayActive[relay] = state;
-      digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
+      digitalWrite(RELAY_PINS[relay], state ? HIGH : LOW);  // activo-HIGH
       DLOGF("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
       setLedState(anyRelayActive() ? LED_RELAY_ON : LED_IDLE);
     }
@@ -1806,6 +1806,25 @@ void mqttPublishRegister() {
   DLOGF("[MQTT] Register %s (%u B)\n",
                 ok ? "publicado" : "ERROR",
                 (unsigned)payload_len);
+}
+
+// Publica una alerta puntual en aquantia/{finca_id}/alerts.
+// El backend escucha este topic e inserta en la tabla alerts.
+// payload: { "device_mac", "type", "severity", "message" }
+// severity: "info" | "warning" | "critical"
+static void mqttPublishAlert(const char* type, const char* severity, const char* message) {
+  if (!mqttClient.connected()) return;
+  StaticJsonDocument<256> doc;
+  doc["device_mac"] = WiFi.macAddress();
+  doc["type"]       = type;
+  doc["severity"]   = severity;
+  doc["message"]    = message;
+  char topic[64], buf[256];
+  snprintf(topic, sizeof(topic), "aquantia/%s/alerts", finca_id);
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  bool ok = mqttClient.publish(topic, buf, false);
+  DLOGF("[MQTT] Alert %s type=%s sev=%s (%u B)\n",
+        ok ? "OK" : "ERROR", type, severity, (unsigned)len);
 }
 
 #endif  // USE_MQTT
@@ -1922,9 +1941,45 @@ void networkTask(void* pvParameters) {
       if (!deviceInfoSent) {
         mqttPublishRegister();
         deviceInfoSent = true;
+      } else {
+        mqttPublishAlert("mqtt_reconnect", "info", "Dispositivo reconectado al broker MQTT");
       }
     }
     mqttClient.loop();
+
+    // ── Alarmas MQTT — solo al cambio de estado (no spamear cada ciclo) ──────
+    {
+      static char   _lastScenario[16] = "normal";
+      static bool   _lastXdb401Ok     = true;
+      static bool   _lastHeapWarn     = false;
+
+      // Pipeline: leak / burst / obstruction / recuperacion
+      if (strcmp(pipelineScenario, _lastScenario) != 0) {
+        if (strcmp(pipelineScenario, "leak") == 0)
+          mqttPublishAlert("leak",        "warning",  "Fuga detectada: caudal con valvula cerrada");
+        else if (strcmp(pipelineScenario, "burst") == 0)
+          mqttPublishAlert("burst",       "critical", "Reventón: presión y caudal anormalmente altos");
+        else if (strcmp(pipelineScenario, "obstruction") == 0)
+          mqttPublishAlert("obstruction", "warning",  "Obstruccion: presión alta, caudal bajo");
+        else if (strcmp(pipelineScenario, "normal") == 0 &&
+                 strcmp(_lastScenario, "normal") != 0)
+          mqttPublishAlert("pipeline_ok", "info",     "Pipeline recuperado: estado normal");
+        strlcpy(_lastScenario, pipelineScenario, sizeof(_lastScenario));
+      }
+
+      // Sensor XDB401: fallo y recuperación
+      if (!xdb401_ok && _lastXdb401Ok)
+        mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
+      else if (xdb401_ok && !_lastXdb401Ok)
+        mqttPublishAlert("sensor_ok",      "info",    "XDB401 recuperado");
+      _lastXdb401Ok = xdb401_ok;
+
+      // Heap bajo (< 30 KB)
+      bool heapWarn = (ESP.getFreeHeap() < 30000);
+      if (heapWarn && !_lastHeapWarn)
+        mqttPublishAlert("low_heap", "warning", "Heap libre < 30 KB — posible memory leak");
+      _lastHeapWarn = heapWarn;
+    }
 
     // Publicar telemetría cada MQTT_SEND_MS
     if (now - lastSendTime >= telemetryIntervalMs) {
@@ -2195,9 +2250,9 @@ void setup() {
   // JQC-3FF-S-Z activo-LOW: HIGH = relay OFF (válvula cerrada)
   for (int i = 0; i < RELAY_COUNT; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
-    digitalWrite(RELAY_PINS[i], HIGH);  // HIGH = OFF para relay activo-LOW
+    digitalWrite(RELAY_PINS[i], LOW);  // LOW = OFF para relay activo-HIGH
   }
-  DLOGF("%d relay(s) inicializados en OFF (HIGH)\n", RELAY_COUNT);
+  DLOGF("%d relay(s) inicializados en OFF (LOW)\n", RELAY_COUNT);
 
 #if defined(ESP32)
   analogReadResolution(12);
@@ -2497,7 +2552,7 @@ void setup() {
       String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
       DLOGF("\n[OTA] Inicio de actualización (%s) — relays a OFF por seguridad\n", type.c_str());
       // Apagar todos los relays por seguridad durante el flash
-      for (int i = 0; i < RELAY_COUNT; i++) digitalWrite(RELAY_PINS[i], HIGH);
+      for (int i = 0; i < RELAY_COUNT; i++) digitalWrite(RELAY_PINS[i], LOW);
     });
     ArduinoOTA.onEnd([]() {
       DLOGLN("\n[OTA] Actualización completada — reiniciando");
