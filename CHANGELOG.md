@@ -9,12 +9,20 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
-## [Unreleased] — rama `fix/stability-low-cost`
+## [Unreleased]
+
+---
+
+## [0.2.0-beta.2] — 2026-05-06
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `fix/stability-low-cost`
 
 ### Fixed
 - **Race condition heap — `pipelineMode` / `pipelineScenario`**: convertidos de `String` a `char[16]`, eliminando las carreras de heap entre Core 0 y Core 1. Escrituras protegidas con `dataMutex`; la escritura del `LeakDetector` en Core 1 también queda bajo mutex. Lecturas siguen siendo eventual-consistent (máx. 1 ciclo).
 - **LeakDetector falsos positivos burst/obstruction**: añadidos contadores de confirmación `_burst_hits` / `_obstr_hits` con constantes `BURST_CONFIRM = 2` y `OBSTR_CONFIRM = 2`. Ambas condiciones requieren 2 muestras consecutivas antes de disparar (análogo al `IDLE_CONFIRM = 3` ya existente para fuga en válvula cerrada).
 - **BMP280 configuración ruidosa en PROFILE_METEO**: añadida llamada a `setSampling(MODE_NORMAL, SAMPLING_X2, SAMPLING_X16, FILTER_X16, STANDBY_MS_500)` tras `beginBMP280()` en el bloque de setup de METEO, igual que ya hacía PROFILE_AGROMETEO.
+- **`pipeline_source` engañoso cuando presión cae al simulador**: el campo `pipeline_source` ahora reporta `"real_flow"` cuando el caudalímetro lee en modo real pero el XDB401 no entrega presión válida, en lugar de `"real"`. Evita confusión en dashboard y logs.
+- **Presiones negativas del XDB401 rechazadas como inválidas**: el sentinel de "sin sensor" cambiado de `-1.0f` a `NAN`. El umbral de aceptación de `>= 0.0f` sustituido por `!isnan()`, permitiendo lecturas negativas reales (vacío, golpe de ariete, tubería sin presurizar) llegar a pantalla TFT y payload MQTT.
 
 ### Added
 - **Diagnóstico LeakDetector en telemetría**: nuevos campos `leak_baseline_pressure`, `leak_baseline_flow` y `leak_warmup_progress` en el payload MQTT/HTTP para facilitar el ajuste de umbrales y depuración remota.

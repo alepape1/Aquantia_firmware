@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.2.0-beta.1"
+#define FIRMWARE_VERSION "0.2.0-beta.2"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -598,7 +598,7 @@ char pipelineMode[16]        = "real";      // sim | real
 #else
 char pipelineMode[16]        = "sim";       // sim | real
 #endif
-String pipelineSource        = "sim";       // sim | real | fallback
+String pipelineSource        = "sim";       // sim | real | real_flow | fallback
 bool   pipelinePressureOk    = false;
 bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
@@ -719,8 +719,9 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   float dt_s  = dt / 1000.0f;
   _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
   flowLpm     = _flowLpm;
-  // Intentar leer presión real del XDB401; -1.0f si no disponible (el caller usará sim)
-  pressureBar = -1.0f;
+  // Intentar leer presión real del XDB401; NAN si no disponible (el caller usará sim)
+  // Usar NAN como sentinel permite que lecturas negativas reales (vacío, golpe de ariete) pasen al caller.
+  pressureBar = NAN;
   if (!xdb401_ok && millis() >= xdb401_retry_at) {
     xdb401_ok = xdb401_begin();
     if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
@@ -777,12 +778,12 @@ void updatePipelineValues() {
     if (readRealPipelineSensors(realPressure, realFlow)) {
       sim_pipeline_flow = max(0.0f, realFlow);
       pipelineFlowOk    = true;
-      pipelineSource    = "real";
 
-      if (realPressure >= 0.0f) {
-        // Sensor de presión real disponible
-        sim_pipeline_pressure = max(0.0f, realPressure);
+      if (!isnan(realPressure)) {
+        // Sensor de presión real disponible — se permiten valores negativos (vacío, golpe de ariete)
+        sim_pipeline_pressure = realPressure;
         pipelinePressureOk    = true;
+        pipelineSource        = "real";
       } else {
         // Sin sensor de presión real — estimación por simulador solo para presión.
         // IMPORTANTE: guardamos el caudal real antes y lo restauramos porque
@@ -791,6 +792,7 @@ void updatePipelineValues() {
         updatePipelineSimValues();
         sim_pipeline_flow  = savedFlow;  // restaurar caudal real
         pipelinePressureOk = false;
+        pipelineSource     = "real_flow";  // caudal real, presión simulada
       }
       // Detección automática de fugas (EMA baseline; reemplaza pipelineScenario en modo real)
       leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
