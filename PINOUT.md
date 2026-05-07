@@ -131,15 +131,16 @@ Cada relay:
 
 ---
 
-## Caudalímetro de tubería (PROFILE_METEO — LilyGo TTGO T-Display)
+## Caudalímetro de tubería (PROFILE_METEO y PROFILE_AGROMETEO)
 
 El firmware implementa la lectura de caudal mediante **interrupciones hardware** para no perder ningún pulso.
 
 ### GPIO y circuito
 
-| Función | GPIO | Notas |
-|---------|:----:|-------|
-| Caudalímetro (pulsos) | **32** | INPUT_PULLUP, ISR FALLING edge |
+| Perfil | Función | GPIO | Notas |
+|--------|---------|:----:|-------|
+| METEO (LilyGo TTGO T-Display) | Caudalímetro (pulsos) | **32** | INPUT_PULLUP, ISR FALLING edge |
+| AGROMETEO (WEMOS D1 MINI ESP32) | Caudalímetro (pulsos) | **17** | INPUT_PULLUP, ISR FALLING edge — sin función especial, libre en esta placa |
 
 ### Transistor de acondicionamiento BC547 NPN
 

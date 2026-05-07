@@ -58,6 +58,13 @@
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
   #define FLOW_K_FACTOR   456   // YF-S201 — calibrado: 1 L en 38 s → K=456 p/L (F=7.5·Q Hz)
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+  #define FLOW_PIN         17   // Caudalímetro — GPIO17 en WEMOS D1 MINI ESP32 (sin función especial, soporta ISR)
+  // K factor según modelo:
+  //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
+  //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
+  //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
+  #define FLOW_K_FACTOR   456   // YF-S201 — ajustar si se calibra con agua real
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   #define HAS_DISPLAY
