@@ -21,7 +21,7 @@
 // ── Modo debug — pasar -DDEBUG_MODE=1 al compilador para activarlo ───────────
 // En producción NO definir: elimina toda la salida serie y reduce consumo.
 // El Flash Tool GUI tiene la casilla "Debug" que inyecta el flag automáticamente.
-#define DEBUG_INTERVAL_MS 5000UL   // reporte completo cada 5 s
+#define DEBUG_INTERVAL_MS 10000UL   // reporte completo cada 10 s
 
 // Macros de log — mapeadas a Serial cuando DEBUG_MODE está activo, no-op en prod
 #ifdef DEBUG_MODE
@@ -273,7 +273,7 @@ void ledTick() {
 #define PIPELINE_FAST_MS  500UL  // Muestreo rápido caudalímetro/presión para display y detección de fugas
 
 #ifdef HAS_DISPLAY
-#define DISPLAY_TIMEOUT_MS 60000UL  // Apagar pantalla tras 60s sin actividad
+#define DISPLAY_TIMEOUT_MS 600000UL  // Apagar pantalla tras 10 minutos sin actividad
 #define BTN_LEFT   0                // Botón izquierdo (BOOT), INPUT_PULLUP, activo LOW
 #define BTN_RIGHT 35                // Botón derecho, activo LOW
 #endif
@@ -693,7 +693,7 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
 #if defined(FLOW_PIN)
   // Caudalímetro por pulsos (BC547 NPN, señal invertida, FALLING edge).
   // Devuelve true en cuanto hay datos válidos del caudalímetro.
-  // pressureBar = -1.0f indica "sin sensor de presión real" → el caller
+  // pressureBar = NAN indica "sin sensor de presión en este ciclo" → el caller
   // mantiene la estimación simulada para la presión.
   unsigned long now = millis();
   unsigned long dt  = now - _flowLastCalcMs;
@@ -701,7 +701,7 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   if (dt < 500UL) {
     // Intervalo demasiado corto — reutilizamos el último valor calculado
     flowLpm     = _flowLpm;
-    pressureBar = -1.0f;
+    pressureBar = NAN;  // NAN = sin lectura de presión en este ciclo; el caller usará sim
     return true;
   }
 
