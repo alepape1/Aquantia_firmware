@@ -270,7 +270,9 @@ void ledTick() {
 #define SEND_MS         2000
 #define RELAY_MS        2000   // Consulta estado relay cada 2s para respuesta casi inmediata
 #define PIPELINE_SYNC_MS 20000UL
-#define PIPELINE_FAST_MS  500UL  // Muestreo rápido caudalímetro/presión para display y detección de fugas
+#define PIPELINE_FAST_MS_NORMAL  500UL  // intervalo nominal de muestreo pipeline
+#define PIPELINE_FAST_MS_BURST   100UL  // intervalo durante ráfaga post-apertura válvula
+#define PIPELINE_BURST_SAMPLES    50    // ráfaga: 50 × 100 ms = 5 s de muestreo fino
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 600000UL  // Apagar pantalla tras 10 minutos sin actividad
@@ -612,6 +614,44 @@ unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
 unsigned long displayTimeoutMs     = DISPLAY_TIMEOUT_MS;
 #endif
 
+// ── Ring buffer pre-evento — últimos 30 frames de presión/caudal (15 s @ 500 ms) ─
+struct PipelineFrame {
+  float    p;
+  float    f;
+  bool     valveOpen;
+  uint32_t ts;
+};
+static PipelineFrame _pipeRing[30]    = {};
+static uint8_t       _pipeRingHead    = 0;
+static uint8_t       _pipeRingFull    = 0;
+
+static void pipeRingPush(float p, float f, bool valve) {
+  _pipeRing[_pipeRingHead] = { p, f, valve, (uint32_t)millis() };
+  _pipeRingHead = (_pipeRingHead + 1) % 30;
+  if (_pipeRingFull < 30) _pipeRingFull++;
+}
+
+// ── Muestreo adaptativo — ráfaga 100 ms al abrir válvula ────────────────────
+static uint32_t _pipelineFastMs   = PIPELINE_FAST_MS_NORMAL;
+static uint8_t  _burstSamplesLeft = 0;
+static bool     _prevAnyRelay     = false;
+
+// ── Estadísticas por ventana de telemetría (se resetean en cada ciclo) ───────
+static float    _winPSum   = 0.0f, _winFSum   = 0.0f;
+static float    _winP2Sum  = 0.0f, _winF2Sum  = 0.0f;
+static float    _winPMin   =  1e9f, _winPMax  = -1e9f;
+static float    _winFMin   =  1e9f, _winFMax  = -1e9f;
+static uint16_t _winCount  = 0;
+static uint32_t _winValveOpenMs    = 0;
+static uint32_t _winValveOpenSince = 0;   // millis() de la última apertura (0 = cerrada)
+
+// ── Alert ring buffer snapshot (Core 1 → Core 0, protegido por dataMutex) ───
+static PipelineFrame _alertFrames[20]   = {};
+static uint8_t       _alertFrameCount   = 0;
+static volatile bool _alertPending      = false;
+static char          _alertScenario[16] = "normal";
+static char          _prevScenario[16]  = "normal";
+
 static bool anyRelayActive() {
   for (int i = 0; i < RELAY_COUNT; i++) {
     if (relayActive[i]) return true;
@@ -794,10 +834,8 @@ void updatePipelineValues() {
         pipelinePressureOk = false;
         pipelineSource     = "real_flow";  // caudal real, presión simulada
       }
-      // Detección automática de fugas (EMA baseline; reemplaza pipelineScenario en modo real)
-      leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
-      // char[16]: strlcpy es suficiente — Core 0 escribe bajo mutex; lectura eventual-consistent.
-      strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
+      // LeakDetector y pipelineScenario se actualizan en el fast path (cada 500ms/100ms).
+      // Aquí solo actualizamos las fuentes de presión/caudal para la telemetría de 20s.
       return;
     }
 
@@ -1062,6 +1100,11 @@ struct TelemetrySnapshot {
   float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
   long  heap, uptime;
   int   rssi, relayMask;
+  // Estadísticas por ventana de telemetría (acumuladas desde el ciclo anterior)
+  float    winPMean, winPMin, winPMax, winPStd;
+  float    winFMean, winFMin, winFMax, winFStd;
+  uint16_t winSamples;
+  uint32_t winValveOpenMs;
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
   float dewPoint, heatIndex, absHum;
 #endif
@@ -1887,7 +1930,7 @@ void networkTask(void* pvParameters) {
   }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(1024);
+  mqttClient.setBufferSize(1600);   // cubre telemetría (1600B) y alertas con frames
 #endif
 
   for (;;) {
@@ -1949,25 +1992,10 @@ void networkTask(void* pvParameters) {
 
     // ── Alarmas MQTT — solo al cambio de estado (no spamear cada ciclo) ──────
     {
-      static char   _lastScenario[16] = "normal";
-      static bool   _lastXdb401Ok     = true;
-      static bool   _lastHeapWarn     = false;
+      static bool _lastXdb401Ok = true;
+      static bool _lastHeapWarn = false;
 
-      // Pipeline: leak / burst / obstruction / recuperacion
-      if (strcmp(pipelineScenario, _lastScenario) != 0) {
-        if (strcmp(pipelineScenario, "leak") == 0)
-          mqttPublishAlert("leak",        "warning",  "Fuga detectada: caudal con valvula cerrada");
-        else if (strcmp(pipelineScenario, "burst") == 0)
-          mqttPublishAlert("burst",       "critical", "Reventón: presión y caudal anormalmente altos");
-        else if (strcmp(pipelineScenario, "obstruction") == 0)
-          mqttPublishAlert("obstruction", "warning",  "Obstruccion: presión alta, caudal bajo");
-        else if (strcmp(pipelineScenario, "normal") == 0 &&
-                 strcmp(_lastScenario, "normal") != 0)
-          mqttPublishAlert("pipeline_ok", "info",     "Pipeline recuperado: estado normal");
-        strlcpy(_lastScenario, pipelineScenario, sizeof(_lastScenario));
-      }
-
-      // Sensor XDB401: fallo y recuperación
+      // Sensor XDB401: fallo y recuperación (alerta simple, sin frames)
       if (!xdb401_ok && _lastXdb401Ok)
         mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
       else if (xdb401_ok && !_lastXdb401Ok)
@@ -1981,6 +2009,36 @@ void networkTask(void* pvParameters) {
       _lastHeapWarn = heapWarn;
     }
 
+    // Cambios de escenario pipeline: alerta enriquecida con ring buffer de frames pre-evento
+    // (Core 1 detecta el cambio en el fast path y rellena _alertFrames bajo dataMutex)
+    if (_alertPending && mqttClient.connected()) {
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        StaticJsonDocument<1024> alertDoc;
+        alertDoc["device_mac"]    = WiFi.macAddress();
+        alertDoc["type"]          = _alertScenario;
+        const char* sev = (strcmp(_alertScenario, "burst") == 0) ? "critical" : "warning";
+        alertDoc["severity"]      = sev;
+        alertDoc["pipeline_mode"] = pipelineMode;
+        JsonArray frames = alertDoc.createNestedArray("frames");
+        for (uint8_t i = 0; i < _alertFrameCount; i++) {
+          JsonObject fr = frames.createNestedObject();
+          fr["ts"] = _alertFrames[i].ts;
+          fr["p"]  = roundf(_alertFrames[i].p * 100.0f) / 100.0f;
+          fr["f"]  = roundf(_alertFrames[i].f * 100.0f) / 100.0f;
+          fr["v"]  = _alertFrames[i].valveOpen;
+        }
+        _alertPending = false;
+        xSemaphoreGive(dataMutex);
+
+        char alertTopic[64], alertBuf[1024];
+        snprintf(alertTopic, sizeof(alertTopic), "aquantia/%s/alerts", finca_id);
+        serializeJson(alertDoc, alertBuf, sizeof(alertBuf));
+        bool alertOk = mqttClient.publish(alertTopic, alertBuf, false);
+        DLOGF("[MQTT] Alert %s (%d frames) %s\n",
+              _alertScenario, _alertFrameCount, alertOk ? "OK" : "ERROR");
+      }
+    }
+
     // Publicar telemetría cada MQTT_SEND_MS
     if (now - lastSendTime >= telemetryIntervalMs) {
       takeSnapshot();
@@ -1991,7 +2049,7 @@ void networkTask(void* pvParameters) {
       auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
 
       // Payload ampliado con métricas explícitas del BMP280.
-      StaticJsonDocument<1280> doc;
+      StaticJsonDocument<1600> doc;
       doc["temperature"]           = r2(snap.tempMCP);
       doc["pressure"]              = r2(snap.pressure);
       doc["temperature_barometer"] = r2(snap.tempDHT);
@@ -2030,6 +2088,21 @@ void networkTask(void* pvParameters) {
       doc["leak_warmup_progress"]   = leakDetector.warmupProgress();
       doc["xdb401_ok"]             = xdb401_ok;
       if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
+      // Estadísticas de ventana del pipeline — resolución diagnóstica entre telemetrías
+      if (snap.winSamples > 0) {
+        auto r3 = [](float x){ return roundf(x * 1000.0f) / 1000.0f; };
+        JsonObject win = doc.createNestedObject("pipeline_window");
+        win["samples"]       = snap.winSamples;
+        win["valve_open_ms"] = snap.winValveOpenMs;
+        win["p_mean"]        = r2(snap.winPMean);
+        win["p_min"]         = r2(snap.winPMin);
+        win["p_max"]         = r2(snap.winPMax);
+        win["p_std"]         = r3(snap.winPStd);
+        win["f_mean"]        = r2(snap.winFMean);
+        win["f_min"]         = r2(snap.winFMin);
+        win["f_max"]         = r2(snap.winFMax);
+        win["f_std"]         = r3(snap.winFStd);
+      }
       doc["mac_address"]           = WiFi.macAddress();
       doc["ip_address"]            = WiFi.localIP().toString();
       doc["relay_count"]           = RELAY_COUNT;
@@ -2047,7 +2120,7 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[1280];
+      char topic[64], buf[1600];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       size_t payload_len = serializeJson(doc, buf, sizeof(buf));
       if (payload_len >= sizeof(buf)) {
@@ -2972,6 +3045,32 @@ void loop() {
     // Construir snapshot y publicar en la queue para Core 0 — sin mutex, sin bloqueo
     if (telemetryQueue) {
       TelemetrySnapshot snap = {};
+
+      // Finalizar tiempo de válvula abierta antes de cerrar la ventana
+      if (_winValveOpenSince > 0) {
+        _winValveOpenMs   += now - _winValveOpenSince;
+        _winValveOpenSince = now;   // continúa en la ventana siguiente
+      }
+      // Volcar estadísticas de ventana al snapshot
+      snap.winSamples     = _winCount;
+      snap.winValveOpenMs = _winValveOpenMs;
+      if (_winCount > 0) {
+        snap.winPMean = _winPSum  / _winCount;
+        snap.winFMean = _winFSum  / _winCount;
+        float pVar    = _winP2Sum / _winCount - snap.winPMean * snap.winPMean;
+        float fVar    = _winF2Sum / _winCount - snap.winFMean * snap.winFMean;
+        snap.winPStd  = (pVar > 0) ? sqrtf(pVar) : 0.0f;
+        snap.winFStd  = (fVar > 0) ? sqrtf(fVar) : 0.0f;
+        snap.winPMin  = _winPMin;  snap.winPMax = _winPMax;
+        snap.winFMin  = _winFMin;  snap.winFMax = _winFMax;
+      }
+      // Resetear acumuladores para la próxima ventana
+      _winPSum = _winFSum = _winP2Sum = _winF2Sum = 0.0f;
+      _winPMin = _winFMin =  1e9f;
+      _winPMax = _winFMax = -1e9f;
+      _winCount       = 0;
+      _winValveOpenMs = 0;
+
       snap.tempMCP       = temperatureMCP;
       snap.pressure      = (float)pressure;
       snap.tempDHT       = temperatureDHT;
@@ -3018,16 +3117,77 @@ void loop() {
     lastSensorRead = now;
   }
 
-  // ── 2b. Muestreo rápido pipeline (cada PIPELINE_FAST_MS) — solo actualiza ────────
-  //        variables de display; la telemetría sigue al ritmo de telemetryIntervalMs.
-  //        Permite detectar fugas/roturas sin esperar el intervalo completo.
-  if (strcmp(pipelineMode, "real") == 0 && (now - lastPipelineFastRead >= PIPELINE_FAST_MS)) {
-    float fp = 0.0f, ff = 0.0f;
-    if (readRealPipelineSensors(fp, ff)) {
-      sim_pipeline_flow = max(0.0f, ff);
-      if (fp >= 0.0f) sim_pipeline_pressure = max(0.0f, fp);
+  // ── 2b. Muestreo rápido pipeline — adaptativo (100 ms burst / 500 ms nominal) ──
+  //        LeakDetector, ring buffer y estadísticas de ventana corren a este ritmo.
+  {
+    bool valveNow = anyRelayActive();
+
+    // Flanco ascendente de válvula → activar ráfaga de muestreo fino
+    if (valveNow && !_prevAnyRelay) {
+      _burstSamplesLeft = PIPELINE_BURST_SAMPLES;
+      _pipelineFastMs   = PIPELINE_FAST_MS_BURST;
+      DLOGF("[PIPE] Valve open — burst 100ms x%d\n", PIPELINE_BURST_SAMPLES);
     }
-    lastPipelineFastRead = now;
+    _prevAnyRelay = valveNow;
+
+    if (strcmp(pipelineMode, "real") == 0 && (now - lastPipelineFastRead >= _pipelineFastMs)) {
+      float fp = NAN, ff = 0.0f;
+      if (readRealPipelineSensors(fp, ff)) {
+        sim_pipeline_flow = max(0.0f, ff);
+        if (!isnan(fp) && fp >= 0.0f) sim_pipeline_pressure = max(0.0f, fp);
+      }
+
+      // LeakDetector al ritmo rápido (reemplaza la llamada que antes estaba en updatePipelineValues)
+      leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, valveNow);
+      const char* newScenario = leakDetector.scenario();
+      strlcpy(pipelineScenario, newScenario, sizeof(pipelineScenario));
+
+      // Ring buffer pre-evento
+      pipeRingPush(sim_pipeline_pressure, sim_pipeline_flow, valveNow);
+
+      // Acumuladores de estadísticas de ventana
+      _winPSum  += sim_pipeline_pressure;
+      _winFSum  += sim_pipeline_flow;
+      _winP2Sum += sim_pipeline_pressure * sim_pipeline_pressure;
+      _winF2Sum += sim_pipeline_flow     * sim_pipeline_flow;
+      if (sim_pipeline_pressure < _winPMin) _winPMin = sim_pipeline_pressure;
+      if (sim_pipeline_pressure > _winPMax) _winPMax = sim_pipeline_pressure;
+      if (sim_pipeline_flow     < _winFMin) _winFMin = sim_pipeline_flow;
+      if (sim_pipeline_flow     > _winFMax) _winFMax = sim_pipeline_flow;
+      _winCount++;
+
+      // Tiempo de válvula abierta en la ventana
+      if (valveNow && _winValveOpenSince == 0) {
+        _winValveOpenSince = now;
+      } else if (!valveNow && _winValveOpenSince > 0) {
+        _winValveOpenMs   += now - _winValveOpenSince;
+        _winValveOpenSince = 0;
+      }
+
+      // Snapshot de ring buffer al detectar cualquier cambio de escenario (fallo o recuperación)
+      if (strcmp(newScenario, _prevScenario) != 0) {
+        if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          uint8_t n = (_pipeRingFull < 20) ? _pipeRingFull : 20;
+          uint8_t start = (_pipeRingHead + 30 - n) % 30;
+          _alertFrameCount = 0;
+          for (uint8_t i = 0; i < n; i++)
+            _alertFrames[_alertFrameCount++] = _pipeRing[(start + i) % 30];
+          strlcpy(_alertScenario, newScenario, sizeof(_alertScenario));
+          _alertPending = true;
+          xSemaphoreGive(dataMutex);
+        }
+        DLOGF("[PIPE] Scenario change: %s → %s (alert queued)\n", _prevScenario, newScenario);
+      }
+      strlcpy(_prevScenario, newScenario, sizeof(_prevScenario));
+
+      // Fin de ráfaga: volver a intervalo nominal
+      if (_burstSamplesLeft > 0 && --_burstSamplesLeft == 0) {
+        _pipelineFastMs = PIPELINE_FAST_MS_NORMAL;
+        DLOGLN("[PIPE] Burst complete — 500ms sampling");
+      }
+
+      lastPipelineFastRead = now;
+    }
   }
 
   // ── 3. Refresco de pantalla (cada SCREEN_MS = 1s, solo si hay display) ────────
