@@ -57,7 +57,7 @@
   //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
-  #define FLOW_K_FACTOR   240   // YF-B4 — ajustar con medición real si es necesario
+  #define FLOW_K_FACTOR   456   // YF-S201 — calibrado: 1 L en 38 s → K=456 p/L (F=7.5·Q Hz)
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   #define HAS_DISPLAY
