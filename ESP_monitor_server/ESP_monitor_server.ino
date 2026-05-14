@@ -1894,7 +1894,7 @@ void networkTask(void* pvParameters) {
   }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(1024);
+  mqttClient.setBufferSize(1280);
 #endif
 
   for (;;) {
