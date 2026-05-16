@@ -2093,8 +2093,16 @@ void networkTask(void* pvParameters) {
     // ── Alarmas MQTT — solo al cambio de estado (no spamear cada ciclo) ──────
     {
       static char   _lastScenario[16] = "normal";
-      static bool   _lastXdb401Ok     = true;
-      static bool   _lastHeapWarn     = false;
+      static bool   _lastXdb401Ok         = true;
+      static bool   _lastHeapWarn         = false;
+#if DEVICE_PROFILE == PROFILE_METEO
+      static bool   _lastMcpOk            = true;
+      static bool   _lastBmpOk            = true;
+      static bool   _lastMicroPressureOk  = true;
+#endif
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+      static bool   _lastHtuOk            = true;
+#endif
 
       // Pipeline: leak / burst / obstruction / recuperacion
       if (strcmp(pipelineScenario, _lastScenario) != 0) {
@@ -2116,6 +2124,38 @@ void networkTask(void* pvParameters) {
       else if (xdb401_ok && !_lastXdb401Ok)
         mqttPublishAlert("sensor_ok",      "info",    "XDB401 recuperado");
       _lastXdb401Ok = xdb401_ok;
+
+#if DEVICE_PROFILE == PROFILE_METEO
+      // MCP9808
+      if (!mcp_ok && _lastMcpOk)
+        mqttPublishAlert("sensor_failure", "warning", "MCP9808 sin respuesta — temperatura exterior no disponible");
+      else if (mcp_ok && !_lastMcpOk)
+        mqttPublishAlert("sensor_ok",      "info",    "MCP9808 recuperado");
+      _lastMcpOk = mcp_ok;
+
+      // BMP280
+      if (!bmp_ok && _lastBmpOk)
+        mqttPublishAlert("sensor_failure", "warning", "BMP280 sin respuesta — temperatura/presion barometrica no disponibles");
+      else if (bmp_ok && !_lastBmpOk)
+        mqttPublishAlert("sensor_ok",      "info",    "BMP280 recuperado");
+      _lastBmpOk = bmp_ok;
+
+      // MicroPressure
+      if (!micropressure_ok && _lastMicroPressureOk)
+        mqttPublishAlert("sensor_failure", "warning", "MicroPressure sin respuesta — barometro no disponible");
+      else if (micropressure_ok && !_lastMicroPressureOk)
+        mqttPublishAlert("sensor_ok",      "info",    "MicroPressure recuperado");
+      _lastMicroPressureOk = micropressure_ok;
+#endif
+
+#if DEVICE_PROFILE != PROFILE_AGROMETEO
+      // HTU2x
+      if (!htu_ok && _lastHtuOk)
+        mqttPublishAlert("sensor_failure", "warning", "HTU2x sin respuesta — temperatura/humedad interior no disponibles");
+      else if (htu_ok && !_lastHtuOk)
+        mqttPublishAlert("sensor_ok",      "info",    "HTU2x recuperado");
+      _lastHtuOk = htu_ok;
+#endif
 
       // Heap bajo (< 30 KB)
       bool heapWarn = (ESP.getFreeHeap() < 30000);
@@ -2892,6 +2932,11 @@ void loop() {
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // BMP280 — leer siempre para mandar sus datos explícitos por telemetría
+    // Reintento de reinit si el sensor falló en ciclo anterior (cada telemetryIntervalMs = 20 s)
+    if (!bmp_ok) {
+      bmp_ok = beginBMP280();
+      if (bmp_ok) DLOGLN("[BMP280] Reconectado tras fallo");
+    }
     bmp_temp_ok = false;
     bmp_pressure_ok = false;
     if (bmp_ok) {
@@ -2912,6 +2957,11 @@ void loop() {
     }
 
     // Temperatura exterior — prioridad MCP9808, fallback BMP280
+    // Reintento de reinit si el sensor falló en ciclo anterior
+    if (!mcp_ok) {
+      mcp_ok = tempsensor.begin(0x19);
+      if (mcp_ok) { tempsensor.setResolution(3); DLOGLN("[MCP9808] Reconectado tras fallo"); }
+    }
     temp_ok = false;
     if (mcp_ok) {
       tempsensor.wake();
@@ -2932,6 +2982,11 @@ void loop() {
     if (!temp_ok) temperatureMCP = sim_tempMCP;
 
     // Barómetro — prioridad MicroPressure, fallback BMP280
+    // Reintento de reinit si el sensor falló en ciclo anterior
+    if (!micropressure_ok) {
+      micropressure_ok = barometer.begin();
+      if (micropressure_ok) DLOGLN("[MicroPressure] Reconectado tras fallo");
+    }
     bar_ok = false;
     if (micropressure_ok) {
       double p = barometer.readPressure(KPA);
@@ -2952,6 +3007,11 @@ void loop() {
 
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
     // HTU2x — omitido en AGROMETEO (0x40 = HDC1080)
+    // Reintento de reinit si el sensor falló en ciclo anterior
+    if (!htu_ok) {
+      htu_ok = htu_begin();
+      if (htu_ok) DLOGLN("[HTU2x] Reconectado tras fallo");
+    }
     if (htu_ok) {
       float t = htu_readTemp();
       float h = htu_readHumidity();
