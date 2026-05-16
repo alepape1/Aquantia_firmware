@@ -54,11 +54,28 @@
  */
 #define PRESSURE_SENSOR_FULLSCALE  1000.0f  // kPa — sensor 0-1 MPa (0-10 bar) Aquantia
 
-/** Tiempo de espera máximo para que el sensor complete la adquisición (ms) */
-#define PRESSURE_SENSOR_TIMEOUT_MS 200
+/**
+ * Frecuencia I2C para las transacciones del sensor de presión (Hz).
+ * 50 kHz en vez de 100 kHz: con un cable de ~1 m la capacidad parásita
+ * (~100-150 pF) estrecha el margen de subida a 100 kHz. A 50 kHz el
+ * semiciclo dobla (20 µs) y la señal sube con holgura incluso con connectors
+ * adicionales en el recorrido.
+ */
+#define PRESSURE_SENSOR_I2C_FREQ_HZ  50000U
 
-/** Delay base de adquisición indicado en datasheet (~50ms) */
-#define PRESSURE_SENSOR_ACQ_DELAY_MS 50
+/**
+ * Tiempo de adquisición fijo antes de leer el registro de estado (ms).
+ * El XGZP6847D completa la conversión en ~35-50 ms según datasheet.
+ * 60 ms da margen extra sin bloquear el bus innecesariamente.
+ */
+#define PRESSURE_SENSOR_ACQ_DELAY_MS 60
+
+/**
+ * Timeout total de la lectura si el sensor no reporta conversión OK (ms).
+ * ACQ_DELAY + hasta 2 checks de 30 ms = 60+60 = 120 ms nominales; 300 ms
+ * cubre fallos transitorios de señal en cable largo sin bloquear el loop.
+ */
+#define PRESSURE_SENSOR_TIMEOUT_MS   300
 
 // ─── Registros (no tocar) ─────────────────────────────────────────────────────
 
@@ -128,3 +145,15 @@ bool pressureSensor_readTemperature(float *temp_out);
  * @return true si ACK recibido
  */
 bool pressureSensor_isPresent(void);
+
+/**
+ * @brief Recuperación de bus I2C atascado (UM10204 §3.1.16).
+ *
+ * Genera 9 pulsos SCL en modo GPIO para liberar cualquier dispositivo
+ * que tenga SDA bloqueado en LOW tras un glitch de señal. A continuación
+ * emite una condición STOP y reinicializa Wire a PRESSURE_SENSOR_I2C_FREQ_HZ.
+ *
+ * Llamar desde xdb401_begin() cuando isPresent() falla, antes del reintento.
+ * Solo disponible en Arduino/ESP32.
+ */
+void pressureSensor_recover(void);

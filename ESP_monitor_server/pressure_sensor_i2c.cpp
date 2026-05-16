@@ -7,7 +7,9 @@
  */
 
 #include "pressure_sensor_i2c.h"
-
+// Pines I2C almacenados en init() y usados por recover()
+static int _sda_pin = -1;
+static int _scl_pin = -1;
 // ─── Helpers I2C internos ─────────────────────────────────────────────────────
 
 /**
@@ -97,33 +99,90 @@ static float _convert_temperature(uint8_t high, uint8_t low) {
 
 /**
  * Espera a que el sensor complete la adquisición (Sco bit = 0).
- * Retorna true si completó antes del timeout.
+ *
+ * Estrategia de baja interferencia para cable largo:
+ *   1. Espera fija PRESSURE_SENSOR_ACQ_DELAY_MS (60 ms) — cubre el tiempo
+ *      de conversión típico sin generar ningún tráfico I2C.
+ *   2. Lee el registro de estado una vez. Si Sco=0 → listo.
+ *   3. Si aún ocupado, espera 30 ms más y reintenta una última vez.
+ *
+ * Esto reduce las transacciones I2C de ~40 (bucle 5 ms) a un máximo de 2,
+ * lo que minimiza las interferencias en el bus compartido y el ruido de
+ * reflexión en el cable.
  */
 static bool _wait_for_ready(void) {
-    uint8_t status;
-    uint32_t start = millis();
+    // Espera principal: la conversión típica del XGZP6847D tarda ~35-50 ms.
+    delay(PRESSURE_SENSOR_ACQ_DELAY_MS);
 
-    while ((millis() - start) < PRESSURE_SENSOR_TIMEOUT_MS) {
+    // Hasta 2 comprobaciones con una pausa breve entre ellas.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint8_t status = 0xFF;
         if (!_read_registers(PSEN_REG_STATUS, &status, 1)) {
-            return false;   // Error I2C
+            return false;   // Error I2C — línea probablemente inestable
         }
         if ((status & PSEN_SCO_BIT) == 0) {
-            return true;   // Sco = 0 → adquisición completa
+            return true;    // Sco = 0 → conversión completa
         }
-        delay(5);   // Pequeño yield para no saturar el bus
+        delay(30);          // Conversión aún en progreso — breve espera extra
     }
 
-    return false;   // Timeout
+    return false;           // No listo tras ACQ_DELAY + 2 × 30 ms
 }
 
 // ─── API pública ──────────────────────────────────────────────────────────────
 
 bool pressureSensor_init(int sda_pin, int scl_pin, uint32_t freq_hz) {
+    _sda_pin = sda_pin;
+    _scl_pin = scl_pin;
+    (void)freq_hz;   // ignorado — siempre se usa PRESSURE_SENSOR_I2C_FREQ_HZ
+                     // para garantizar margen de señal en cables largos (~1 m).
     Wire.begin(sda_pin, scl_pin);
-    Wire.setClock(freq_hz);
+    Wire.setClock(PRESSURE_SENSOR_I2C_FREQ_HZ);
     delay(10);   // Tiempo de estabilización tras power-on
 
     return pressureSensor_isPresent();
+}
+
+void pressureSensor_recover(void) {
+    // Recuperación de bus I2C atascado (UM10204 §3.1.16).
+    // Si un glitch hace que un esclavo pierda la cuenta de su byte, SDA
+    // queda en LOW indefinidamente. La solución es generar hasta 9 pulsos
+    // SCL en modo GPIO hasta que el esclavo libere SDA, seguido de STOP.
+#ifdef ARDUINO
+    Wire.end();
+    delay(5);
+
+    if (_sda_pin >= 0 && _scl_pin >= 0) {
+        // Configurar SCL como salida, SDA como entrada con pull-up
+        pinMode(_scl_pin, OUTPUT);
+        digitalWrite(_scl_pin, HIGH);
+        pinMode(_sda_pin, INPUT_PULLUP);
+        delayMicroseconds(10);
+
+        // 9 pulsos SCL — a 50 kHz el semiciclo es 10 µs
+        for (int i = 0; i < 9; i++) {
+            digitalWrite(_scl_pin, LOW);
+            delayMicroseconds(10);
+            digitalWrite(_scl_pin, HIGH);
+            delayMicroseconds(10);
+            if (digitalRead(_sda_pin) == HIGH) break;  // SDA libre → listo
+        }
+
+        // Condición STOP: SDA pasa de LOW a HIGH con SCL en HIGH
+        pinMode(_sda_pin, OUTPUT);
+        digitalWrite(_sda_pin, LOW);
+        delayMicroseconds(5);
+        digitalWrite(_scl_pin, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(_sda_pin, HIGH);
+        delayMicroseconds(5);
+    }
+
+    // Reinicializar bus a la frecuencia reducida del sensor
+    Wire.begin(_sda_pin, _scl_pin);
+    Wire.setClock(PRESSURE_SENSOR_I2C_FREQ_HZ);
+    delay(20);   // Estabilización del bus tras recovery
+#endif
 }
 
 bool pressureSensor_isPresent(void) {
@@ -141,21 +200,18 @@ bool pressureSensor_read(PressureSensorData_t *out) {
         return false;
     }
 
-    // 2. Polling hasta que Sco bit = 0 (o timeout)
+    // 2. Esperar conversión + verificar Sco=0 (delay incluido dentro de _wait_for_ready)
     if (!_wait_for_ready()) {
         return false;
     }
 
-    // 3. Delay adicional de seguridad indicado en datasheet (~50ms)
-    delay(PRESSURE_SENSOR_ACQ_DELAY_MS);
-
-    // 4. Leer 3 bytes de presión: registros 0x06, 0x07, 0x08
+    // 3. Leer 3 bytes de presión: registros 0x06, 0x07, 0x08
     uint8_t pressure_raw[3];
     if (!_read_registers(PSEN_REG_PRESS_H, pressure_raw, 3)) {
         return false;
     }
 
-    // 5. Leer 2 bytes de temperatura: registros 0x09, 0x0A
+    // 4. Leer 2 bytes de temperatura: registros 0x09, 0x0A
     uint8_t temp_raw[2];
     if (!_read_registers(PSEN_REG_TEMP_H, temp_raw, 2)) {
         return false;
@@ -180,8 +236,6 @@ bool pressureSensor_readPressure(float *pressure_out) {
         return false;
     }
 
-    delay(PRESSURE_SENSOR_ACQ_DELAY_MS);
-
     uint8_t raw[3];
     if (!_read_registers(PSEN_REG_PRESS_H, raw, 3)) {
         return false;
@@ -201,8 +255,6 @@ bool pressureSensor_readTemperature(float *temp_out) {
     if (!_wait_for_ready()) {
         return false;
     }
-
-    delay(PRESSURE_SENSOR_ACQ_DELAY_MS);
 
     uint8_t raw[2];
     if (!_read_registers(PSEN_REG_TEMP_H, raw, 2)) {

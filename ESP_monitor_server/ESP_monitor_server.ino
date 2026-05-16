@@ -277,7 +277,8 @@ void ledTick() {
 #define SEND_MS         2000
 #define RELAY_MS        2000   // Consulta estado relay cada 2s para respuesta casi inmediata
 #define PIPELINE_SYNC_MS 20000UL
-#define PIPELINE_FAST_MS  500UL  // Muestreo rápido caudalímetro/presión para display y detección de fugas
+#define PIPELINE_FAST_MS  1500UL  // Muestreo caudalímetro/presión para display y detección de fugas
+                                  // 1.5 s: suficiente para leak detection y reduce carga I2C en cable largo
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 600000UL  // Apagar pantalla tras 10 minutos sin actividad
@@ -340,8 +341,8 @@ bool tsl_ok   = false;
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
 static uint8_t       xdb401_failures  = 0;       // fallos consecutivos de lectura
 static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar reinit
-static constexpr uint8_t  XDB401_MAX_FAILURES  = 5;
-static constexpr uint32_t XDB401_RETRY_INTERVAL = 30000UL;  // ms entre reintentos
+static constexpr uint8_t  XDB401_MAX_FAILURES  = 8;    // más tolerante con cable largo (~1 m)
+static constexpr uint32_t XDB401_RETRY_INTERVAL = 15000UL;  // reintento más rápido tras recovery
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
 static bool beginBMP280() {
@@ -463,13 +464,20 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 #include "pressure_sensor_i2c.h"
 
 // Detecta el sensor en el bus I2C ya inicializado por setup().
-// Wire.begin(I2C_SDA, I2C_SCL) se llama antes — aquí solo forzamos 100 kHz
-// y verificamos ACK en PRESSURE_SENSOR_I2C_ADDR.
+// Registra los pines en el driver (para recovery futuro) y fuerza
+// PRESSURE_SENSOR_I2C_FREQ_HZ (50 kHz) para acomodar el cable de ~1 m.
+// En el 2.º y 3.er intento ejecuta bus recovery (9 pulsos SCL + STOP)
+// antes de volver a intentar la detección.
 static bool xdb401_begin() {
-  Wire.setClock(100000);  // forzar 100 kHz — algunos ejemplares fallan a 400 kHz
-  // Tres intentos con pausa: el bus puede estar inestable tras otros inits I2C
+  // Init del driver: almacena I2C_SDA/I2C_SCL y aplica PRESSURE_SENSOR_I2C_FREQ_HZ.
+  pressureSensor_init(I2C_SDA, I2C_SCL, PRESSURE_SENSOR_I2C_FREQ_HZ);
+
   for (int i = 0; i < 3; i++) {
-    if (i > 0) delay(50);
+    if (i > 0) {
+      DLOGF("[XDB401] Reintento %d — recuperando bus I2C\n", i);
+      pressureSensor_recover();  // 9 pulsos SCL + STOP + Wire.begin a 50 kHz
+      delay(30);
+    }
     if (pressureSensor_isPresent()) {
       DLOGF("[XDB401] Detectado en 0x%02X (intento %d)\n", PRESSURE_SENSOR_I2C_ADDR, i + 1);
       return true;
@@ -2150,8 +2158,11 @@ void setup() {
   // registre los pines correctamente antes de que SPI los reclame.
   DLOGLN("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(100000);  // 100 kHz globales — el XDB401 no aguanta 400 kHz
-  Wire.setTimeOut(100);   // timeout 100ms para evitar hang si un sensor no responde
+  Wire.setClock(50000);   // 50 kHz — el sensor de presión tiene cable de ~1 m;
+                          // a 100 kHz el tiempo de subida es marginal con esa capacidad
+                          // parásita. 50 kHz dobla el margen sin impacto real en el resto
+                          // de sensores (solo se leen cada 20 s).
+  Wire.setTimeOut(200);   // timeout 200 ms — más holgura para cable largo
   DLOGLN("I2C OK");
 
   // ── TFT init — debe ir antes del provisioning para poder mostrar ──
