@@ -3325,115 +3325,53 @@ void loop() {
   if (now - lastDebugReport >= DEBUG_INTERVAL_MS) {
     lastDebugReport = now;
 
-    DLOGLN(F("\n====== AQUANTIA TEST REPORT ======"));
-
-    // Perfil e info de compilacion
-    DLOGF("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
-      (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
-      (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION",
-      DEVICE_PROFILE, RELAY_COUNT,
-#ifdef HAS_DISPLAY
-      "SI",
-#else
-      "NO",
-#endif
-#ifdef USE_MQTT
-      "SI"
-#else
-      "NO"
-#endif
-    );
-
-    // Tiempo y memoria
+    // ── Datos variables ──────────────────────────────────────────────────────
     unsigned long up = millis() / 1000;
-    DLOGF("[TIEMPO] Uptime: %luh %02lum %02lus | Heap libre: %ld B\n",
-      up / 3600, (up % 3600) / 60, up % 60, (long)ESP.getFreeHeap());
+    DLOGF("[STATUS] %luh%02lum%02lus  Heap:%ld B  RSSI:%d dBm\n",
+      up / 3600, (up % 3600) / 60, up % 60,
+      (long)ESP.getFreeHeap(), WiFi.RSSI());
 
-    // Serial / MAC del dispositivo
-    DLOGF("[DEVICE] Serial: %s\n", device_serial_get());
-
-    // WiFi
-    if (WiFi.status() == WL_CONNECTED) {
-      DLOGF("[WIFI  ] CONECTADO | IP: %s | RSSI: %d dBm | SSID: %s\n",
-        WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.SSID().c_str());
-    } else {
-      DLOGLN("[WIFI  ] DESCONECTADO");
-    }
-
-#if defined(USE_MQTT)
-    DLOGF("[MQTT  ] %s\n",
-      mqttClient.connected() ? "CONECTADO" : "DESCONECTADO");
-#endif
-
-    // Estado de sensores
-    DLOG("[SENSOR]");
-#if DEVICE_PROFILE == PROFILE_METEO
-    DLOGF(" TempExt:%s  Barometro:%s  DHT11:%s",
-      temp_ok ? temperatureSourceName() : "SIM",
-      bar_ok ? pressureSourceName() : "SIM",
-      dht_ok ? "REAL" : "SIM");
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
-    DLOGF(" HDC1080:%s  BMP280:%s  BH1750:%s",
-      hdc_ok ? "REAL" : "SIM",
-      bmp_ok ? "REAL" : "SIM",
-      bh1750_ok ? "REAL" : "SIM");
-#else
-    DLOG(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
-#endif
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
-    DLOGF("  HTU2x:%s  LuzAmb:%s\n",
-      htu_ok ? "REAL" : "SIM", tsl_ok ? "REAL" : "SIM");
-#else
-    DLOGLN();  // AGROMETEO: sensores ya listados arriba
-#endif
-
-    // Valores medidos / simulados
 #if DEVICE_PROFILE == PROFILE_AGROMETEO
     DLOGF("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
       temperatureMCP, humidity, bmpTemperature, (float)pressure, lightLevel);
     DLOGF("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
       agroDewPoint, agroHeatIndex, agroAbsHum);
-    DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
-      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
-#else
-    DLOGF("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
-      temperatureMCP, temperatureDHT, humidity, lightLevel);
-#if DEVICE_PROFILE == PROFILE_METEO
-    DLOGF("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
-      (float)pressure, temperatureDHT11, humidityDHT11, soilMoisture);
-#endif
-    DLOGF("[PIPE  ] Presion:%.2f bar  Caudal:%.2f L/min  Fuente:%s  Escenario:%s\n",
-      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
-#if defined(FLOW_PIN)
-    DLOGF("[FLOW  ] Pulsos/intervalo:%lu  Total:%lu  Intervalo:%lu ms  K:%d p/L\n",
-      (unsigned long)_flowLastPulses, (unsigned long)_flowPulseTotal,
-      (unsigned long)_flowLastDtMs, FLOW_K_FACTOR);
-#endif
-    DLOGF("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
+#elif DEVICE_PROFILE == PROFILE_METEO
+    DLOGF("[DATOS ] T:%.1f C  H:%.1f%%  P:%.2f kPa  T_DHT:%.1f C  H_DHT:%.1f%%  Lux:%.1f lx  Suelo:%.1f%%\n",
+      temperatureMCP, humidity, (float)pressure, temperatureDHT11, humidityDHT11, lightLevel, soilMoisture);
+    DLOGF("[VIENTO] %.1f m/s (filt:%.1f)  Dir:%.0f° (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
 #if defined(FLOW_PIN)
-    if (_flowPulseTotal == 0) {
-      DLOGLN("[FLOW  ] WARN — sin pulsos recibidos (verif. cableado GPIO" + String(FLOW_PIN) + " y transistor BC547)");
-    }
+    DLOGF("[FLOW  ] %.2f L/min  Total:%lu p  Intervalo:%lu ms\n",
+      _flowLpm, (unsigned long)_flowPulseTotal, (unsigned long)_flowLastDtMs);
+    if (_flowPulseTotal == 0)
+      DLOGLN("[WARN  ] Caudalimetro: sin pulsos — verif. cableado GPIO" + String(FLOW_PIN));
 #endif
-#endif  // PROFILE_AGROMETEO / else
+#endif
+    DLOGF("[PIPE  ] %.3f bar  %.2f L/min  fuente:%s  escenario:%s\n",
+      sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
 
-    // Estado relays
-    DLOG("[RELAYS]");
-    for (int i = 0; i < RELAY_COUNT; i++) {
-      DLOGF(" R%d:%s", i, relayActive[i] ? "ON " : "OFF");
-    }
-    DLOGLN();
-
-    // Test assertions
-    bool allRelaysOff = true;
-    for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) { allRelaysOff = false; break; }
-
-    DLOGLN("[TEST  ] " + String(allRelaysOff ? "PASS" : "FAIL") +
-                   " — Todos los relays en OFF (estado seguro)");
-    DLOGLN("[TEST  ] PASS — Boot completado sin crash (uptime > 0)");
-    DLOGLN("[TEST  ] PASS — Sensores: modo SIM cuando no hay hardware conectado");
-    DLOGLN(F("==================================\n"));
+    // ── Alertas de estado — solo imprime si hay algo anómalo ─────────────────
+    if (WiFi.status() != WL_CONNECTED)
+      DLOGLN("[WARN  ] WiFi DESCONECTADO");
+#if defined(USE_MQTT)
+    if (!mqttClient.connected())
+      DLOGLN("[WARN  ] MQTT DESCONECTADO");
+#endif
+#if DEVICE_PROFILE == PROFILE_METEO
+    if (!temp_ok)         DLOGLN("[WARN  ] Temperatura exterior: SIM (sin sensor real)");
+    if (!bar_ok)          DLOGLN("[WARN  ] Barometro: SIM (sin sensor real)");
+    if (!htu_ok)          DLOGLN("[WARN  ] HTU2x: SIM (sin sensor real)");
+#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+    if (!hdc_ok)          DLOGLN("[WARN  ] HDC1080: SIM (sin sensor real)");
+    if (!bmp_ok)          DLOGLN("[WARN  ] BMP280: SIM (sin sensor real)");
+    if (!bh1750_ok)       DLOGLN("[WARN  ] BH1750: SIM (sin sensor real)");
+#endif
+    if (!xdb401_ok)       DLOGLN("[WARN  ] XDB401: sin respuesta — presion tuberia no disponible");
+    for (int i = 0; i < RELAY_COUNT; i++)
+      if (relayActive[i]) DLOGF("[WARN  ] Relay R%d ACTIVO\n", i);
+    if (strcmp(pipelineScenario, "normal") != 0)
+      DLOGF("[WARN  ] Pipeline escenario: %s\n", pipelineScenario);
   }
 #endif  // DEBUG_MODE
 }
