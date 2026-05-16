@@ -2123,6 +2123,10 @@ void networkTask(void* pvParameters) {
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
       static bool   _lastHtuOk            = true;
 #endif
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+      static bool   _lastHdcOk            = true;
+      static bool   _lastBh1750Ok         = true;
+#endif
 
       // Pipeline: leak / burst / obstruction / recuperacion
       if (strcmp(pipelineScenario, _lastScenario) != 0) {
@@ -2175,6 +2179,22 @@ void networkTask(void* pvParameters) {
       else if (htu_ok && !_lastHtuOk)
         mqttPublishAlert("sensor_ok",      "info",    "HTU2x recuperado");
       _lastHtuOk = htu_ok;
+#endif
+
+#if DEVICE_PROFILE == PROFILE_AGROMETEO
+      // HDC1080
+      if (!hdc_ok && _lastHdcOk)
+        mqttPublishAlert("sensor_failure", "warning", "HDC1080 sin respuesta — temperatura/humedad no disponibles");
+      else if (hdc_ok && !_lastHdcOk)
+        mqttPublishAlert("sensor_ok",      "info",    "HDC1080 recuperado");
+      _lastHdcOk = hdc_ok;
+
+      // BH1750
+      if (!bh1750_ok && _lastBh1750Ok)
+        mqttPublishAlert("sensor_failure", "warning", "BH1750 sin respuesta — luz ambiental no disponible");
+      else if (bh1750_ok && !_lastBh1750Ok)
+        mqttPublishAlert("sensor_ok",      "info",    "BH1750 recuperado");
+      _lastBh1750Ok = bh1750_ok;
 #endif
 
       // Heap bajo (< 30 KB)
