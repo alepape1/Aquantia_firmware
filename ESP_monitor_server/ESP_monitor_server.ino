@@ -277,8 +277,8 @@ void ledTick() {
 #define SEND_MS         2000
 #define RELAY_MS        2000   // Consulta estado relay cada 2s para respuesta casi inmediata
 #define PIPELINE_SYNC_MS 20000UL
-#define PIPELINE_FAST_MS  1500UL  // Muestreo caudalímetro/presión para display y detección de fugas
-                                  // 1.5 s: suficiente para leak detection y reduce carga I2C en cable largo
+#define PIPELINE_FAST_MS  500UL   // Muestreo caudalímetro/presión: 500 ms para tasa instantanea
+                                  // responsiva. Los litros totales se acumulan en ISR sin perdidas.
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 600000UL  // Apagar pantalla tras 10 minutos sin actividad
@@ -304,8 +304,28 @@ void ledTick() {
   TFT_eSprite spr = TFT_eSprite(&tft);
   unsigned long lastActivityTime = 0;
   bool          displayOn        = true;
-  uint8_t       displayView      = 0;   // 0 = meteo, 1 = pipeline
+  uint8_t       displayView      = 0;   // 0 = meteo, 1 = pipeline, 2 = info
 #endif
+
+// ── Info de arranque (reset reason + timestamp de primera conexión) ────────────
+#include "esp_system.h"
+static char g_rebootReason[24]    = "desconocido";
+static char g_lastConnectStr[20]  = "--:--:-- --/--/--";  // HH:MM:SS DD/MM/YY
+
+static const char* resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "encendido";
+    case ESP_RST_SW:        return "reinicio SW";
+    case ESP_RST_PANIC:     return "panic/crash";
+    case ESP_RST_INT_WDT:   return "WDT interrup.";
+    case ESP_RST_TASK_WDT:  return "WDT tarea";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_EXT:       return "reset externo";
+    default:                return "desconocido";
+  }
+}
 
 // ── Relay electroválvula(s) ────────────────────────────────────────────────────
 // Relay activo-HIGH: HIGH = relay ON (válvula abierta), LOW = relay OFF
@@ -469,8 +489,9 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 // En el 2.º y 3.er intento ejecuta bus recovery (9 pulsos SCL + STOP)
 // antes de volver a intentar la detección.
 static bool xdb401_begin() {
-  // Init del driver: almacena I2C_SDA/I2C_SCL y aplica PRESSURE_SENSOR_I2C_FREQ_HZ.
-  pressureSensor_init(I2C_SDA, I2C_SCL, PRESSURE_SENSOR_I2C_FREQ_HZ);
+  // Init del driver: almacena I2C_SDA/I2C_SCL. Pasa 100000 como _normal_freq
+  // para que el driver restaure 100 kHz al terminar cada transacción.
+  pressureSensor_init(I2C_SDA, I2C_SCL, 100000);
 
   for (int i = 0; i < 3; i++) {
     if (i > 0) {
@@ -1074,6 +1095,7 @@ struct TelemetrySnapshot {
   float light, tempDHT11, humDHT11, soil;
   float bmpTemp, bmpPressure;
   float pipePressure, pipeFlow;
+  float flowTotalL;   ///< Litros acumulados desde el arranque (_flowPulseTotal / K). 0 si sin caudalimetro.
   float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
   long  heap, uptime;
   int   rssi, relayMask;
@@ -1494,9 +1516,10 @@ void drawScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("METEOSTATION", 6, 4, 2);
 
-  // Indicadores de vista: ● • (punto 1 activo, punto 2 inactivo)
+  // Indicadores de vista: ● • • (punto 1 activo)
   spr.fillCircle(114, 9, 3, C_TEXT);   // vista 1 (meteo) — activa
   spr.fillCircle(123, 9, 3, C_LABEL);  // vista 2 (pipeline) — inactiva
+  spr.fillCircle(132, 9, 3, C_LABEL);  // vista 3 (info) — inactiva
 
   // Luz en la cabecera (icono + valor lux)
   uint16_t luxCol = tsl_ok ? C_REAL : C_SIM;
@@ -1537,9 +1560,10 @@ void drawPipelineScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("PIPELINE", 6, 4, 2);
 
-  // Indicadores de vista: • ● (punto 1 inactivo, punto 2 activo)
+  // Indicadores de vista: • ● • (punto 2 activo)
   spr.fillCircle(114, 9, 3, C_LABEL);  // vista 1 (meteo) — inactiva
   spr.fillCircle(123, 9, 3, C_TEXT);   // vista 2 (pipeline) — activa
+  spr.fillCircle(132, 9, 3, C_LABEL);  // vista 3 (info) — inactiva
 
   if (WiFi.status() == WL_CONNECTED) {
     spr.setTextColor(C_REAL, C_HDR);
@@ -1628,6 +1652,94 @@ void drawPipelineScreen() {
     spr.setTextColor(C_LABEL, C_CARD);
     spr.drawString("\xB0C", 198, bY + 14, 1);
   }
+
+  spr.pushSprite(0, 0);
+}
+
+// ── Vista 3: Info del dispositivo (última conexión, motivo reinicio) ──────────
+void drawInfoScreen() {
+  spr.fillSprite(C_BG);
+
+  // Cabecera
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
+  spr.setTextColor(C_TEXT, C_HDR);
+  spr.drawString("DISPOSITIVO", 6, 4, 2);
+
+  // Indicadores de vista: • • ●
+  spr.fillCircle(114, 9, 3, C_LABEL);
+  spr.fillCircle(123, 9, 3, C_LABEL);
+  spr.fillCircle(132, 9, 3, C_TEXT);   // vista 3 (info) — activa
+
+  // Estado WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    spr.setTextColor(C_REAL, C_HDR);
+    spr.drawString("WiFi", 168, 5, 1);
+  } else {
+    spr.setTextColor(C_RED, C_HDR);
+    spr.drawString("NoWiFi", 157, 5, 1);
+  }
+  uint16_t srvCol = lastServerOK ? C_REAL : C_RED;
+  spr.fillCircle(230, 9, 5, srvCol);
+  spr.drawCircle(230, 9, 5, C_TEXT);
+
+  // ── Contenido ─────────────────────────────────────────────────────────────
+  int y = HDR_H + 6;
+  const int lh = 16;  // line height
+
+  // Motivo de reinicio
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("Reinicio:", 4, y, 1);
+  spr.setTextColor(C_TEXT, C_BG);
+  spr.drawString(g_rebootReason, 70, y, 1);
+  y += lh;
+
+  // Última conexión al servidor
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("Conexion:", 4, y, 1);
+  spr.setTextColor(C_REAL, C_BG);
+  spr.drawString(g_lastConnectStr, 70, y, 1);
+  y += lh;
+
+  // IP local
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("IP:", 4, y, 1);
+  spr.setTextColor(C_TEXT, C_BG);
+  spr.drawString(WiFi.localIP().toString().c_str(), 70, y, 1);
+  y += lh;
+
+  // RSSI
+  int rssi = WiFi.RSSI();
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("RSSI:", 4, y, 1);
+  char rssiBuf[12];
+  snprintf(rssiBuf, sizeof(rssiBuf), "%d dBm", rssi);
+  spr.setTextColor(rssi > -70 ? C_REAL : C_RED, C_BG);
+  spr.drawString(rssiBuf, 70, y, 1);
+  y += lh;
+
+  // Uptime
+  unsigned long up = millis() / 1000;
+  char uptBuf[20];
+  snprintf(uptBuf, sizeof(uptBuf), "%luh %02lum %02lus",
+           up / 3600, (up % 3600) / 60, up % 60);
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("Uptime:", 4, y, 1);
+  spr.setTextColor(C_TEXT, C_BG);
+  spr.drawString(uptBuf, 70, y, 1);
+  y += lh;
+
+  // MAC
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("MAC:", 4, y, 1);
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString(WiFi.macAddress().c_str(), 36, y, 1);
+  y += lh;
+
+  // Firmware
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("FW:", 4, y, 1);
+  spr.setTextColor(C_TEXT, C_BG);
+  spr.drawString(FIRMWARE_VERSION, 36, y, 1);
 
   spr.pushSprite(0, 0);
 }
@@ -1956,6 +2068,18 @@ void networkTask(void* pvParameters) {
       if (!deviceInfoSent) {
         mqttPublishRegister();
         deviceInfoSent = true;
+        // Guardar timestamp de primera conexión para la pantalla de info
+        time_t t = time(nullptr);
+        if (t > 1000000000L) {
+          struct tm tm_info;
+          localtime_r(&t, &tm_info);
+          strftime(g_lastConnectStr, sizeof(g_lastConnectStr),
+                   "%H:%M:%S %d/%m/%y", &tm_info);
+        }
+        // Notificar reinicio al backend con motivo
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Dispositivo reiniciado: %s", g_rebootReason);
+        mqttPublishAlert("device_reboot", "info", msg);
       } else {
         mqttPublishAlert("mqtt_reconnect", "info", "Dispositivo reconectado al broker MQTT");
       }
@@ -2033,6 +2157,7 @@ void networkTask(void* pvParameters) {
       doc["soil_moisture"]         = r1(snap.soil);
       doc["pipeline_pressure"]     = r2(snap.pipePressure);
       doc["pipeline_flow"]         = r2(snap.pipeFlow);
+      doc["flow_total_l"]          = roundf(snap.flowTotalL * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
       doc["pipeline_scenario"]     = pipelineScenario;
       doc["pipeline_mode"]         = pipelineMode;
       doc["pipeline_source"]       = pipelineSource;
@@ -2098,14 +2223,15 @@ void networkTask(void* pvParameters) {
       const TelemetrySnapshot& snap = _netSnap;
 
       String url = serverBaseUrl() + "/send_message";
-      char msg[320];
+      char msg[340];
       snprintf(msg, sizeof(msg),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f,%.1f",
         snap.tempMCP, snap.pressure, snap.tempDHT, snap.humidity,
         snap.windSpeed, snap.windDir, snap.windSpeedFilt, snap.avgWindDir,
         snap.light, snap.tempDHT11, snap.humDHT11,
         snap.rssi, snap.heap, snap.uptime, snap.relayMask,
-        snap.pipePressure, snap.pipeFlow, snap.soil
+        snap.pipePressure, snap.pipeFlow, snap.soil,
+        snap.flowTotalL   // litros acumulados desde arranque
       );
 
       DLOGF("[NET] TX: %s\n", msg);
@@ -2130,6 +2256,9 @@ void setup() {
   delay(200);
   setCpuFrequencyMhz(160);
   DLOGLN("\n\n=== MeteoStation BOOT ===");
+
+  // Capturar la razón de reinicio lo antes posible
+  strlcpy(g_rebootReason, resetReasonStr(esp_reset_reason()), sizeof(g_rebootReason));
 
 #ifdef DEBUG_MODE
   DLOGLN("=== DEBUG MODE ACTIVO ===");
@@ -2158,11 +2287,11 @@ void setup() {
   // registre los pines correctamente antes de que SPI los reclame.
   DLOGLN("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(50000);   // 50 kHz — el sensor de presión tiene cable de ~1 m;
-                          // a 100 kHz el tiempo de subida es marginal con esa capacidad
-                          // parásita. 50 kHz dobla el margen sin impacto real en el resto
-                          // de sensores (solo se leen cada 20 s).
-  Wire.setTimeOut(200);   // timeout 200 ms — más holgura para cable largo
+  Wire.setClock(100000);  // 100 kHz globales — los sensores de placa (MCP9808, BMP280…)
+                          // funcionan bien a esta frecuencia con sus cables cortos.
+                          // El XDB401 (cable ~1 m) baja a 50 kHz sólo durante sus propias
+                          // transacciones (ver PRESSURE_SENSOR_I2C_FREQ_HZ en el driver).
+  Wire.setTimeOut(200);   // 200 ms — holgura extra para no bloquear si un sensor no responde
   DLOGLN("I2C OK");
 
   // ── TFT init — debe ir antes del provisioning para poder mostrar ──
@@ -2716,7 +2845,7 @@ void loop() {
   bool leftEdge  = (!curBtnLeft  && prevBtnLeft);
   bool rightEdge = (!curBtnRight && prevBtnRight);
   if (displayOn && (leftEdge || rightEdge)) {
-    displayView = (displayView == 0) ? 1 : 0;
+    displayView = (displayView + 1) % 3;
   }
 
   prevBtnLeft  = curBtnLeft;
@@ -3006,6 +3135,16 @@ void loop() {
       snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
       snap.pipePressure  = sim_pipeline_pressure;
       snap.pipeFlow      = sim_pipeline_flow;
+#if defined(FLOW_PIN)
+      // Leer _flowPulseTotal con interrupciones desactivadas para coherencia.
+      // Es el único acumulador que nunca se resetea — la ISR asegura cero pérdida de pulsos.
+      noInterrupts();
+      uint32_t totalPulses = _flowPulseTotal;
+      interrupts();
+      snap.flowTotalL = totalPulses / (float)FLOW_K_FACTOR;
+#else
+      snap.flowTotalL = 0.0f;
+#endif
       snap.xdb401Temp    = xdb401Temperature;
       snap.relayMask     = 0;
       // relayActive[] es escrito por Core 0 (MQTT callback) — mutex breve solo aquí
@@ -3051,8 +3190,9 @@ void loop() {
   // ── 3. Refresco de pantalla (cada SCREEN_MS = 1s, solo si hay display) ────────
 #ifdef HAS_DISPLAY
   if (now - lastScreenTime >= SCREEN_MS) {
-    if (displayView == 1) drawPipelineScreen();
-    else                  drawScreen();
+    if (displayView == 1)      drawPipelineScreen();
+    else if (displayView == 2) drawInfoScreen();
+    else                       drawScreen();
     lastScreenTime = now;
   }
 #endif
