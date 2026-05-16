@@ -2240,8 +2240,13 @@ void networkTask(void* pvParameters) {
       }
       bool ok = mqttClient.publish(topic, buf, false);
       setLedState(ok ? LED_TX_OK : LED_TX_ERROR);
-      DLOGF("[MQTT] TX %s (%u B): %s\n", ok ? "OK" : "ERROR",
-                    (unsigned)payload_len, buf);
+      DLOGF("[MQTT] TX %s (%u B) → T:%.1f°C  H:%.0f%%  P:%.2fkPa  V:%.1fm/s  "
+            "Pipe:%.3fbar %.2fL/min(%s)  Luz:%.0flux  Heap:%ldB  RSSI:%ddBm\n",
+            ok ? "OK" : "ERROR", (unsigned)payload_len,
+            snap.tempMCP, snap.humidity, snap.pressure,
+            snap.windSpeedFilt,
+            snap.pipePressure, snap.pipeFlow, pipelineScenario,
+            snap.light, snap.heap, snap.rssi);
 
       lastServerOK = ok;
       lastSendTime = now;
