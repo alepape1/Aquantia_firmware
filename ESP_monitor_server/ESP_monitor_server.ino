@@ -2118,6 +2118,8 @@ void networkTask(void* pvParameters) {
 #if DEVICE_PROFILE == PROFILE_METEO
       static bool   _lastMcpOk            = true;
       static bool   _lastBmpOk            = true;
+#endif
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
       static bool   _lastMicroPressureOk  = true;
 #endif
 #if DEVICE_PROFILE != PROFILE_AGROMETEO
@@ -2164,6 +2166,9 @@ void networkTask(void* pvParameters) {
         mqttPublishAlert("sensor_ok",      "info",    "BMP280 recuperado");
       _lastBmpOk = bmp_ok;
 
+#endif
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
       // MicroPressure
       if (!micropressure_ok && _lastMicroPressureOk)
         mqttPublishAlert("sensor_failure", "warning", "MicroPressure sin respuesta — barometro no disponible");
