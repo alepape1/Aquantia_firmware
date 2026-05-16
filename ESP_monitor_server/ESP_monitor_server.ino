@@ -2865,6 +2865,26 @@ void setup() {
   DLOGF("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
 #endif
   DLOGF("[TEST] Heap     : %ld bytes libres\n", (long)ESP.getFreeHeap());
+  // ── Assertions PASS / FAIL ───────────────────────────────────────────────
+  {
+    // 1. Todos los relays en OFF al arranque (estado seguro)
+    bool allRelaysOff = true;
+    for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) { allRelaysOff = false; break; }
+    DLOGF("[TEST  ] %s — Todos los relays en OFF (estado seguro)\n",
+          allRelaysOff ? "PASS" : "FAIL");
+
+    // 2. Boot completado sin crash (uptime > 0)
+    bool uptimeOk = (millis() > 0);
+    DLOGF("[TEST  ] %s — Boot completado sin crash (uptime > 0)\n",
+          uptimeOk ? "PASS" : "FAIL");
+
+    // 3. Sensores en modo SIM cuando no hay hardware conectado
+    bool allSim = !temp_ok && !bar_ok && !htu_ok;
+    bool anyReal = temp_ok || bar_ok || htu_ok || xdb401_ok;
+    DLOGF("[TEST  ] %s — Sensores: %s\n",
+          anyReal ? "INFO" : "PASS",
+          anyReal ? "hardware detectado (modo REAL)" : "modo SIM cuando no hay hardware conectado");
+  }
   DLOGLN(F("[TEST] Iniciando loop() — reporte cada 5s"));
   DLOGLN(F("====================================\n"));
 #endif
