@@ -2287,11 +2287,13 @@ void setup() {
   // registre los pines correctamente antes de que SPI los reclame.
   DLOGLN("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(100000);  // 100 kHz globales — los sensores de placa (MCP9808, BMP280…)
-                          // funcionan bien a esta frecuencia con sus cables cortos.
-                          // El XDB401 (cable ~1 m) baja a 50 kHz sólo durante sus propias
-                          // transacciones (ver PRESSURE_SENSOR_I2C_FREQ_HZ en el driver).
-  Wire.setTimeOut(200);   // 200 ms — holgura extra para no bloquear si un sensor no responde
+  Wire.setClock(PRESSURE_SENSOR_I2C_FREQ_HZ);  // 50 kHz globales — el XDB401 tiene cable
+                                                // ~1 m: a 100 kHz la capacidad parásita
+                                                // (~100 pF) produce flancos lentos que
+                                                // provocan ACK-miss y bloqueos de bus.
+                                                // MCP9808, BMP280, HTU2x se leen cada 20 s
+                                                // → sin impacto real en rendimiento.
+  Wire.setTimeOut(200);   // 200 ms — holgura para cable largo sin bloquear el loop
   DLOGLN("I2C OK");
 
   // ── TFT init — debe ir antes del provisioning para poder mostrar ──

@@ -10,13 +10,6 @@
 // Pines I2C almacenados en init() y usados por recover()
 static int      _sda_pin    = -1;
 static int      _scl_pin    = -1;
-static uint32_t _sensor_freq = PRESSURE_SENSOR_I2C_FREQ_HZ;  // 50 kHz para cable largo
-static uint32_t _normal_freq = 100000;  // frecuencia del resto del bus; se restaura al soltar
-
-// Reduce la frecuencia del bus al valor del sensor (50 kHz) antes de cada operación
-// y la restaura al terminar. Así los demás sensores siguen a 100 kHz.
-static inline void _bus_claim()   { Wire.setClock(_sensor_freq); }
-static inline void _bus_release() { Wire.setClock(_normal_freq); }
 // ─── Helpers I2C internos ─────────────────────────────────────────────────────
 
 /**
@@ -139,12 +132,12 @@ static bool _wait_for_ready(void) {
 // ─── API pública ──────────────────────────────────────────────────────────────
 
 bool pressureSensor_init(int sda_pin, int scl_pin, uint32_t freq_hz) {
-    _sda_pin     = sda_pin;
-    _scl_pin     = scl_pin;
-    _sensor_freq = PRESSURE_SENSOR_I2C_FREQ_HZ;  // siempre 50 kHz para cable largo
-    _normal_freq = (freq_hz > PRESSURE_SENSOR_I2C_FREQ_HZ) ? freq_hz : 100000;
-    // NO se llama Wire.begin() aquí — el bus ya está inicializado por setup().
-    // Solo verificamos la presencia del sensor (bajo la frecuencia del bus normal).
+    _sda_pin = sda_pin;
+    _scl_pin = scl_pin;
+    // El bus ya está a PRESSURE_SENSOR_I2C_FREQ_HZ (50 kHz) porque setup()
+    // llama Wire.setClock(PRESSURE_SENSOR_I2C_FREQ_HZ) antes de cualquier sensor.
+    // freq_hz se acepta pero se ignora — la frecuencia global ya es la correcta.
+    (void)freq_hz;
     return pressureSensor_isPresent();
 }
 
@@ -183,50 +176,45 @@ void pressureSensor_recover(void) {
         delayMicroseconds(5);
     }
 
-    // Reinicializar bus a frecuencia normal del sistema (no a la del sensor)
+    // Reinicializar bus a la frecuencia del sensor (50 kHz para cable largo)
     Wire.begin(_sda_pin, _scl_pin);
-    Wire.setClock(_normal_freq);
+    Wire.setClock(PRESSURE_SENSOR_I2C_FREQ_HZ);
+    Wire.setTimeOut(200);
     delay(20);   // Estabilización del bus tras recovery
 #endif
 }
 
 bool pressureSensor_isPresent(void) {
-    _bus_claim();
     Wire.beginTransmission(PRESSURE_SENSOR_I2C_ADDR);
-    bool ok = (Wire.endTransmission() == 0);
-    _bus_release();
-    return ok;
+    return (Wire.endTransmission() == 0);
 }
 
 bool pressureSensor_read(PressureSensorData_t *out) {
     if (out == nullptr) return false;
 
     out->valid = false;
-    _bus_claim();   // bajar a 50 kHz sólo para este sensor
 
     // 1. Iniciar adquisición: escribir 0x0A en registro 0x30
     if (!_write_register(PSEN_REG_TRIGGER, PSEN_CMD_START_ACQ)) {
-        _bus_release(); return false;
+        return false;
     }
 
     // 2. Esperar conversión + verificar Sco=0 (delay incluido en _wait_for_ready)
     if (!_wait_for_ready()) {
-        _bus_release(); return false;
+        return false;
     }
 
     // 3. Leer 3 bytes de presión: registros 0x06, 0x07, 0x08
     uint8_t pressure_raw[3];
     if (!_read_registers(PSEN_REG_PRESS_H, pressure_raw, 3)) {
-        _bus_release(); return false;
+        return false;
     }
 
     // 4. Leer 2 bytes de temperatura: registros 0x09, 0x0A
     uint8_t temp_raw[2];
     if (!_read_registers(PSEN_REG_TEMP_H, temp_raw, 2)) {
-        _bus_release(); return false;
+        return false;
     }
-
-    _bus_release();   // restaurar 100 kHz antes de convertir
 
     out->pressure_kpa  = _convert_pressure(pressure_raw[0], pressure_raw[1], pressure_raw[2]);
     out->temperature_c = _convert_temperature(temp_raw[0], temp_raw[1]);
@@ -237,13 +225,11 @@ bool pressureSensor_read(PressureSensorData_t *out) {
 bool pressureSensor_readPressure(float *pressure_out) {
     if (pressure_out == nullptr) return false;
 
-    _bus_claim();
-    if (!_write_register(PSEN_REG_TRIGGER, PSEN_CMD_START_ACQ)) { _bus_release(); return false; }
-    if (!_wait_for_ready())                                       { _bus_release(); return false; }
+    if (!_write_register(PSEN_REG_TRIGGER, PSEN_CMD_START_ACQ)) return false;
+    if (!_wait_for_ready())                                       return false;
 
     uint8_t raw[3];
-    if (!_read_registers(PSEN_REG_PRESS_H, raw, 3))              { _bus_release(); return false; }
-    _bus_release();
+    if (!_read_registers(PSEN_REG_PRESS_H, raw, 3))              return false;
 
     *pressure_out = _convert_pressure(raw[0], raw[1], raw[2]);
     return true;
@@ -252,13 +238,11 @@ bool pressureSensor_readPressure(float *pressure_out) {
 bool pressureSensor_readTemperature(float *temp_out) {
     if (temp_out == nullptr) return false;
 
-    _bus_claim();
-    if (!_write_register(PSEN_REG_TRIGGER, PSEN_CMD_START_ACQ)) { _bus_release(); return false; }
-    if (!_wait_for_ready())                                       { _bus_release(); return false; }
+    if (!_write_register(PSEN_REG_TRIGGER, PSEN_CMD_START_ACQ)) return false;
+    if (!_wait_for_ready())                                       return false;
 
     uint8_t raw[2];
-    if (!_read_registers(PSEN_REG_TEMP_H, raw, 2))              { _bus_release(); return false; }
-    _bus_release();
+    if (!_read_registers(PSEN_REG_TEMP_H, raw, 2))              return false;
 
     *temp_out = _convert_temperature(raw[0], raw[1]);
     return true;
