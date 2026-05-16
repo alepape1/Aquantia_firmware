@@ -738,9 +738,29 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   unsigned long dt  = now - _flowLastCalcMs;
 
   if (dt < 500UL) {
-    // Intervalo demasiado corto — reutilizamos el último valor calculado
-    flowLpm     = _flowLpm;
-    pressureBar = NAN;  // NAN = sin lectura de presión en este ciclo; el caller usará sim
+    // Intervalo demasiado corto para recalcular caudal — reutilizar último valor.
+    // Pero SÍ leemos el XDB401: presión y caudal son independientes; sin esto
+    // el caller alterna entre valor real y simulado cada 2-3 ciclos de 200 ms.
+    flowLpm = _flowLpm;
+    pressureBar = NAN;
+    if (!xdb401_ok && millis() >= xdb401_retry_at) {
+      xdb401_ok = xdb401_begin();
+      if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
+      else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+    }
+    if (xdb401_ok) {
+      float p, tc;
+      if (xdb401_read(p, tc)) {
+        pressureBar       = p;
+        xdb401Temperature = tc;
+        xdb401_failures   = 0;
+      } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
+        xdb401_ok       = false;
+        xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
+        DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
+              (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
+      }
+    }
     return true;
   }
 
