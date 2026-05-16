@@ -277,8 +277,11 @@ void ledTick() {
 #define SEND_MS         2000
 #define RELAY_MS        2000   // Consulta estado relay cada 2s para respuesta casi inmediata
 #define PIPELINE_SYNC_MS 20000UL
-#define PIPELINE_FAST_MS  500UL   // Muestreo caudalímetro/presión: 500 ms para tasa instantanea
-                                  // responsiva. Los litros totales se acumulan en ISR sin perdidas.
+// Intervalo mínimo entre lecturas del XDB401 + caudalímetro.
+// El sensor tarda ~120 ms por lectura (60 ms adquisición + 2 polls de 30 ms).
+// 200 ms deja ~80 ms de margen entre lecturas → tasa máxima real ~5 Hz.
+// No tiene sentido bajar más: el sensor completo necesita 60 ms mínimo según datasheet.
+#define PIPELINE_FAST_MS  200UL
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 600000UL  // Apagar pantalla tras 10 minutos sin actividad
@@ -1136,8 +1139,9 @@ float calcAndResetWindVector() {
 bool lastServerOK    = false;
 unsigned long lastSendTime        = 0;
 unsigned long lastScreenTime      = 0;
-unsigned long lastSensorRead      = 0;  // lectura I2C sincronizada con el intervalo de telemetría
-unsigned long lastPipelineFastRead = 0; // muestreo rápido caudalímetro/XDB401 — solo para display
+unsigned long lastSlowSensorRead   = 0;  // sensores lentos I2C: MCP9808, BMP280, HTU21, DHT, luz, suelo
+unsigned long lastPipelineFastRead = 0;  // XDB401 + caudalímetro: tan rápido como PIPELINE_FAST_MS
+unsigned long lastSensorRead       = 0;  // alias para compatibilidad con el bloque telemetría
 
 
 // ── Info estática del hardware ────────────────────────────────────────────────
@@ -2816,7 +2820,8 @@ void setup() {
 
   // Forzar primera lectura de sensores en el primer ciclo del loop
   // (sin este offset, habría que esperar telemetryIntervalMs antes de tener datos)
-  lastSensorRead = millis() - telemetryIntervalMs;
+  lastSlowSensorRead = millis() - telemetryIntervalMs;
+  lastSensorRead      = lastSlowSensorRead;
 }
 
 // =============================================================================
@@ -2881,8 +2886,9 @@ void loop() {
     lastWindRead = now;
   }
 
-  // ── 2. Sensores I2C (cada telemetryIntervalMs, sincronizado con la telemetría) ──
-  if (now - lastSensorRead >= telemetryIntervalMs) {
+  // ── 2. Sensores lentos I2C (cada telemetryIntervalMs): MCP9808, BMP280, HTU21, DHT, luz, suelo ──
+  // El XDB401 se lee en el bloque 2b con su propio timer más rápido.
+  if (now - lastSlowSensorRead >= telemetryIntervalMs) {
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // BMP280 — leer siempre para mandar sus datos explícitos por telemetría
@@ -3116,7 +3122,9 @@ void loop() {
 #endif
 
     updateSimulatedValues();
-    updatePipelineValues();
+    // updatePipelineValues() se llama en bloque 2b cuando hay sensor real.
+    // Aquí solo actualizamos si estamos en modo simulación (sin XDB401 activo).
+    if (strcmp(pipelineMode, "sim") == 0) updatePipelineValues();
 
     // Construir snapshot y publicar en la queue para Core 0 — sin mutex, sin bloqueo
     if (telemetryQueue) {
@@ -3174,17 +3182,38 @@ void loop() {
       (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel, soilMoisture);
 #endif
 
-    lastSensorRead = now;
+    lastSlowSensorRead = now;
+    lastSensorRead      = now;
   }
 
-  // ── 2b. Muestreo rápido pipeline (cada PIPELINE_FAST_MS) — solo actualiza ────────
-  //        variables de display; la telemetría sigue al ritmo de telemetryIntervalMs.
-  //        Permite detectar fugas/roturas sin esperar el intervalo completo.
+  // ── 2b. XDB401 + caudalímetro — timer propio a PIPELINE_FAST_MS (200 ms) ────────
+  // Independiente de los sensores lentos. En modo real actualiza display, LeakDetector
+  // y genera alertas de fuga/rotura sin esperar el ciclo de telemetría completo.
+  // La telemetría MQTT sigue al ritmo de telemetryIntervalMs (toma el último valor).
   if (strcmp(pipelineMode, "real") == 0 && (now - lastPipelineFastRead >= PIPELINE_FAST_MS)) {
-    float fp = 0.0f, ff = 0.0f;
+    float fp = NAN, ff = 0.0f;
     if (readRealPipelineSensors(fp, ff)) {
-      sim_pipeline_flow = max(0.0f, ff);
-      if (fp >= 0.0f) sim_pipeline_pressure = max(0.0f, fp);
+      sim_pipeline_flow     = max(0.0f, ff);
+      pipelineFlowOk        = true;
+      if (!isnan(fp)) {
+        sim_pipeline_pressure = fp;         // permitir negativos (vacío, golpe de ariete)
+        pipelinePressureOk    = true;
+        pipelineSource        = "real";
+      } else {
+        // Sin presión real — actualizar solo la sim de presión
+        float savedFlow = sim_pipeline_flow;
+        updatePipelineSimValues();
+        sim_pipeline_flow  = savedFlow;
+        pipelinePressureOk = false;
+        pipelineSource     = "real_flow";
+      }
+      // Detección de fugas a 5 Hz — respuesta ~200 ms
+      leakDetector.update(sim_pipeline_pressure, sim_pipeline_flow, anyRelayActive());
+      strlcpy(pipelineScenario, leakDetector.scenario(), sizeof(pipelineScenario));
+    } else {
+      pipelineSource     = "fallback";
+      pipelinePressureOk = false;
+      pipelineFlowOk     = false;
     }
     lastPipelineFastRead = now;
   }
