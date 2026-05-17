@@ -480,7 +480,16 @@ float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
 float  xdb401Temperature     = NAN;  // temperatura interna del sensor de presión (XDB401)
 #if defined(FLOW_PIN)
-float  g_flowSessionL        = 0.0f; // litros desde última apertura de válvula — actualizado en pipeline tick (Core 1)
+float    g_flowSessionL      = 0.0f; // litros desde última apertura de válvula — actualizado en pipeline tick (Core 1)
+// ── Contadores de pulsos por tipo de flujo ────────────────────────────────────
+// Acumulamos pulsos (uint32_t) en lugar de litros (float) para evitar pérdida
+// de precisión al sumar incrementos pequeños a un acumulador grande.
+// Overflow de uint32_t a K=660: ~4.3e9 / 660 ≈ 6.5 millones de litros → inaceptable
+// en campo, pero overflow aritmético uint32_t es predecible y se puede wrap con
+// la misma técnica que _flowPulseTotal (diferencia siempre correcta si el sistema
+// no acumula más de 4.3e9 pulsos entre lecturas).
+static volatile uint32_t _flowIrrigPulses = 0; // pulsos con relay ON  (riego)
+static volatile uint32_t _flowLeakPulses  = 0; // pulsos con relay OFF (fuga)
 #endif
 IrrigationType irrigationType = IRRIG_SPRINKLER;  // perfil de riego activo (configurable vía MQTT/HTTP)
 LeakDetector   leakDetector;                       // detector automático de fugas (solo modo real)
@@ -616,6 +625,10 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   float dt_s  = dt * 1e-6f;  // µs → s (precisión µs reduce error de cuantización a caudales bajos)
   _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
   flowLpm     = _flowLpm;
+  // Acumular pulsos del intervalo en riego o fuga según estado del relay.
+  // Usamos contadores de pulsos uint32_t para evitar pérdida de precisión float.
+  if (anyRelayActive()) _flowIrrigPulses += pulses;
+  else                  _flowLeakPulses  += pulses;
   // Actualizar litros de sesión visibles por la pantalla (Core 1 → no mutex, noInterrupts suficiente)
   noInterrupts();
   uint32_t _fTot  = _flowPulseTotal;
@@ -788,6 +801,8 @@ struct TelemetrySnapshot {
   float pipePressure, pipeFlow;
   float flowTotalL;    ///< Litros acumulados desde el arranque (_flowPulseTotal / K). 0 si sin caudalimetro.
   float flowSessionL;  ///< Litros desde la última apertura de válvula (se resetea al abrir relay). 0 si sin caudalimetro.
+  float flowIrrigL;    ///< Litros acumulados con relay ON  (riego). 0 si sin caudalimetro.
+  float flowLeakL;     ///< Litros acumulados con relay OFF (fuga detectada). 0 si sin caudalimetro.
   float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
   long  heap, uptime;
   int   rssi, relayMask;
@@ -969,6 +984,19 @@ void syncPipelineScenario() {
 #endif
 
       // Proteger escrituras de config con mutex (leídas desde Core 1)
+#if defined(FLOW_PIN)
+      // Reset de contadores de flujo si el backend lo solicita (one-shot)
+      if (doc["reset_flow_counters"] | false) {
+        portENTER_CRITICAL(&_flowMux);
+        _flowIrrigPulses = 0;
+        _flowLeakPulses  = 0;
+        _flowSessionBase = _flowPulseTotal;  // también resetea el contador de sesión
+        portEXIT_CRITICAL(&_flowMux);
+        DLOGLN("[FLOW] Contadores reseteados por el backend");
+        // Notificar al backend que ya se ejecutó el reset
+        httpPost(serverBaseUrl() + "/api/flow/reset-ack?mac=" + WiFi.macAddress(), "");
+      }
+#endif
       if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
       if (strcmp(nextScenario, "normal") == 0 || strcmp(nextScenario, "leak") == 0 ||
           strcmp(nextScenario, "burst")  == 0 || strcmp(nextScenario, "obstruction") == 0) {
@@ -1045,6 +1073,10 @@ void checkRelayCommand() {
   for (int i = 0; i < RELAY_COUNT; i++) {
     bool desired = (bitmask >> i) & 1;
     if (desired != relayActive[i]) {
+#if defined(FLOW_PIN)
+      // OFF→ON: resetear contador de sesión para contar litros de este ciclo de riego.
+      if (desired && !relayActive[i]) flowSessionReset();
+#endif
       relayActive[i] = desired;
       // Relay activo-HIGH: HIGH = relay ON, LOW = relay OFF
       digitalWrite(RELAY_PINS[i], desired ? HIGH : LOW);
@@ -1361,6 +1393,8 @@ void networkTask(void* pvParameters) {
       doc["pipeline_flow"]         = r2(snap.pipeFlow);
       doc["flow_total_l"]          = roundf(snap.flowTotalL   * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
       doc["flow_session_l"]        = roundf(snap.flowSessionL * 10.0f) / 10.0f;  // litros desde última apertura de válvula
+      doc["flow_irrig_l"]          = roundf(snap.flowIrrigL   * 10.0f) / 10.0f;  // litros acumulados con relay ON (riego)
+      doc["flow_leak_l"]           = roundf(snap.flowLeakL    * 10.0f) / 10.0f;  // litros acumulados con relay OFF (fuga)
       doc["pipeline_scenario"]     = pipelineScenario;
       doc["pipeline_mode"]         = pipelineMode;
       doc["pipeline_source"]       = pipelineSource;
@@ -2402,11 +2436,20 @@ void loop() {
       totalPulses = _flowPulseTotal;
       sessionBase = _flowSessionBase;
       portEXIT_CRITICAL(&_flowMux);
+      uint32_t irrigPulses, leakPulses;
+      portENTER_CRITICAL(&_flowMux);
+      irrigPulses = _flowIrrigPulses;
+      leakPulses  = _flowLeakPulses;
+      portEXIT_CRITICAL(&_flowMux);
       snap.flowTotalL   = totalPulses / (float)FLOW_K_FACTOR;
       snap.flowSessionL = (totalPulses - sessionBase) / (float)FLOW_K_FACTOR;
+      snap.flowIrrigL   = irrigPulses / (float)FLOW_K_FACTOR;
+      snap.flowLeakL    = leakPulses  / (float)FLOW_K_FACTOR;
 #else
       snap.flowTotalL   = 0.0f;
       snap.flowSessionL = 0.0f;
+      snap.flowIrrigL   = 0.0f;
+      snap.flowLeakL    = 0.0f;
 #endif
       snap.xdb401Temp    = xdb401Temperature;
       snap.relayMask     = 0;
