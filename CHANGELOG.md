@@ -11,6 +11,37 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feature/aqualeak-profile`
+
+### Changed
+- **`PROFILE_AGROMETEO` renombrado a `PROFILE_AQUALEAK`** (`#define PROFILE_AQUALEAK 3`).
+  El perfil mantiene el mismo número (3) para retrocompatibilidad con provisioning NVS.
+  El string `device_profile` en el payload MQTT register y en los logs internos cambia de
+  `"AGROMETEO"` a `"AQUALEAK"`. El Flash Tool GUI actualiza la etiqueta del perfil.
+
+### Added
+- **Relay para AQUALEAK**: `RELAY_COUNT = 1`, GPIO `RELAY_PIN` (GPIO26, Wemos D1 Mini ESP32),
+  activo-HIGH. Idéntica configuración a PROFILE_METEO. Permite controlar una electroválvula
+  de corte directamente desde el dispositivo AquaLeak.
+- **`flow_session_l` en telemetría MQTT**: litros acumulados desde la última apertura del
+  relay (GPIO26). Se resetea automáticamente al transicionar `relay OFF → ON` (nueva sesión
+  de riego). Se publica en el campo `flow_session_l` del payload MQTT telemetría.
+- **`flowSessionReset()`**: función pública para reiniciar el contador de sesión; también
+  llamada internamente al abrir el relay.
+
+### Improved
+- **Precisión del caudalímetro**: timer del caudal migrado de `millis()` (±1 ms) a
+  `micros()` (±1 µs). Reduce el error de cuantización del intervalo `dt` en un factor
+  ×1000, especialmente relevante a caudales bajos (<1 L/min) donde el período llega a
+  varios segundos. El umbral mínimo de intervalo pasa de 500 ms a 500 000 µs (idéntico
+  valor, solo cambio de unidad).
+- **Lectura atómica de contadores de pulsos**: reemplazado `noInterrupts()/interrupts()`
+  por `portENTER_CRITICAL(&_flowMux)/portEXIT_CRITICAL(&_flowMux)` (spinlock IDF).
+  Correcto en contexto dual-core: el ISR se ejecuta en Core 1, `readRealPipelineSensors`
+  también en Core 1 — el spinlock garantiza exclusión sin deshabilitar interrupciones
+  globalmente del sistema.
+- **Spinlock `_flowMux`** declarado junto a los contadores ISR para mantener cohesión.
+
 ---
 
 ## [0.2.0-beta.3] — 2026-05-06

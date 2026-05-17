@@ -12,7 +12,7 @@
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
-#define PROFILE_AGROMETEO   3   // ECU agrometeorológica — sin relays, sensores CJMCU-14 (BH1750+HDC1080+BMP280)
+#define PROFILE_AQUALEAK   3   // ECU AquaLeak — 1 relay para válvula, sensores CJMCU-14 (BH1750+HDC1080+BMP280)
 
 #ifndef DEVICE_PROFILE
   #define DEVICE_PROFILE PROFILE_METEO
@@ -58,7 +58,7 @@
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
   #define FLOW_K_FACTOR   318   // YF-B9 — calibrado: 1 L en 38 s → K=456 p/L (F=7.5·Q Hz)
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   #define FLOW_PIN         17   // Caudalímetro — GPIO17 en WEMOS D1 MINI ESP32 (sin función especial, soporta ISR)
   // K factor según modelo:
   //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
@@ -93,7 +93,7 @@
   #include <Adafruit_BMP280.h>
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
@@ -135,10 +135,10 @@
   #endif
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN_1, RELAY_PIN_2,
                                                    RELAY_PIN_3, RELAY_PIN_4};
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
-  // AGROMETEO: sin relays — array dummy para que el código compile sin cambios
-  #define RELAY_COUNT 0
-  static const uint8_t RELAY_PINS[1] = {0};
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
+  // AQUALEAK: 1 relay para válvula de corte electroválvula — GPIO RELAY_PIN (Wemos D1 Mini ESP32)
+  #define RELAY_COUNT 1
+  static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN};
 #else
   #define RELAY_COUNT 1
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN};
@@ -169,7 +169,7 @@ const char* mqtt_pass   = MQTT_PASS;
 // ── Pines ─────────────────────────────────────────────────────────────────────
 // LED onboard por perfil de hardware (activo-HIGH):
 //   METEO      — LilyGo T-Display      : sin LED de usuario → -1 (desactivado)
-//   AGROMETEO  — Wemos D1 Mini ESP32   : GPIO 2
+//   AQUALEAK   — Wemos D1 Mini ESP32   : GPIO 2
 //   IRRIGATION — ESP32 4-Relay Board   : GPIO 23
 #if DEVICE_PROFILE == PROFILE_METEO
   const int ledPin = -1;   // LilyGo T-Display no tiene LED onboard
@@ -295,7 +295,7 @@ void ledTick() {
   Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
   Adafruit_BMP280        bmp280;
   DHTesp                 dht;
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   Adafruit_BMP280        bmp280;
   BH1750                 bh1750;
   QWIIC_POWER            qwiic_ps;
@@ -333,7 +333,7 @@ static const char* resetReasonStr(esp_reset_reason_t r) {
 // ── Relay electroválvula(s) ────────────────────────────────────────────────────
 // Relay activo-HIGH: HIGH = relay ON (válvula abierta), LOW = relay OFF
 // relayActive[i] — estado actual de cada relay (índice = bit en bitmask)
-// RELAY_COUNT puede ser 0 en AGROMETEO — usamos max(1,…) para evitar array de tamaño 0
+// Protección: si RELAY_COUNT es 0 (algún perfil futuro sin relay) evitamos array de tamaño 0
 bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 
 #ifdef USE_MQTT
@@ -354,7 +354,7 @@ bool htu_ok = false;
 #if DEVICE_PROFILE == PROFILE_METEO
 bool dht_ok = false;
 static uint8_t bmp280_addr = 0x00;
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
 bool hdc_ok        = false;   // HDC1080 — temperatura y humedad primaria
 bool bh1750_ok     = false;   // BH1750  — iluminancia
 bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
@@ -367,7 +367,7 @@ static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar re
 static constexpr uint8_t  XDB401_MAX_FAILURES  = 8;    // más tolerante con cable largo (~1 m)
 static constexpr uint32_t XDB401_RETRY_INTERVAL = 15000UL;  // reintento más rápido tras recovery
 
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
 static bool beginBMP280() {
   if (bmp280.begin(0x76)) {
     bmp280_addr = 0x76;
@@ -390,14 +390,14 @@ static bool readBMP280PressureKPa(float& outPressure) {
   outPressure = bmp280.readPressure() / 1000.0f;
   return !isnan(outPressure) && outPressure > 30.0f && outPressure < 120.0f;
 }
-#endif  // PROFILE_METEO || PROFILE_AGROMETEO
+#endif  // PROFILE_METEO || PROFILE_AQUALEAK
 
 // =============================================================================
-// HDC1080 — temperatura y humedad I2C (solo PROFILE_AGROMETEO)
+// HDC1080 — temperatura y humedad I2C (solo PROFILE_AQUALEAK)
 // Dirección 0x40. Se accede directamente via Wire, sin librería externa.
 // NOTA: comparte dirección con HTU2x pero protocolo diferente.
 // =============================================================================
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
 #define HDC1080_ADDR 0x40
 
 static bool hdc1080_init() {
@@ -462,12 +462,12 @@ static float agro_calcAbsHumidity(float tempC, float hum) {
 }
 
 // =============================================================================
-// Qwiic Power Switch — solo PROFILE_AGROMETEO
+// Qwiic Power Switch — solo PROFILE_AQUALEAK
 // El objeto qwiic_ps (QWIIC_POWER) gestiona el PCA9536 en 0x41.
 // Se enciende una vez en setup() y permanece ON durante toda la ejecución.
 // powerOn/powerOff siguen disponibles si en el futuro se necesita deep-sleep.
 // =============================================================================
-#endif  // PROFILE_AGROMETEO
+#endif  // PROFILE_AQUALEAK
 
 // =============================================================================
 // Sensor presión tubería I2C — familia XGZP6847D / XDB401 digital
@@ -555,7 +555,7 @@ static const char* temperatureSourceName() {
 #if DEVICE_PROFILE == PROFILE_METEO
   if (mcp_ok) return "MCP9808";
   if (bmp_temp_ok) return "BMP280";
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (hdc_ok) return "HDC1080";
   if (bmp_temp_ok) return "BMP280";
 #endif
@@ -567,7 +567,7 @@ static const char* pressureSourceName() {
 #if DEVICE_PROFILE == PROFILE_METEO
   if (micropressure_ok) return "MicroPressure";
   if (bmp_pressure_ok) return "BMP280";
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (micropressure_ok) return "MicroPressure";
   if (bmp_pressure_ok)  return "BMP280";
 #endif
@@ -589,8 +589,8 @@ float  currentWindDirDeg = 0;
 float  lightLevel        = 0;
 float  soilMoisture      = 0;   // YL-69 — humedad suelo (0=seco, 100=saturado)
 
-// ── Parámetros calculados AGROMETEO ───────────────────────────────────────────
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+// ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
 float  agroTempAvg   = NAN;  // media HDC1080 + BMP280 si ambos disponibles
 float  agroDewPoint  = NAN;  // punto de rocío (Magnus)
 float  agroHeatIndex = NAN;  // índice de calor (>27°C y >40% HR)
@@ -613,16 +613,26 @@ float sim_soilMoisture   = 50.0f;
 // BC547 NPN invierte la señal: pulso del sensor → GPIO LOW → FALLING edge.
 // ISR en IRAM_ATTR para ejecución desde RAM (no se suspende durante cache miss).
 #if defined(FLOW_PIN)
-static volatile uint32_t _flowPulseCount = 0;     // contador crudo (escrito solo por ISR)
-static volatile uint32_t _flowPulseTotal = 0;     // acumulador histórico — nunca se resetea
-static unsigned long     _flowLastCalcMs = 0;     // marca de tiempo última lectura
-static unsigned long     _flowLastDtMs   = 0;     // duración del último intervalo de cálculo (ms)
-static uint32_t          _flowLastPulses = 0;     // pulsos contados en el último intervalo
-static float             _flowLpm        = 0.0f;  // último caudal calculado (L/min)
+static portMUX_TYPE      _flowMux         = portMUX_INITIALIZER_UNLOCKED;  // protección ISR ↔ Core1
+static volatile uint32_t _flowPulseCount  = 0;     // contador crudo (escrito solo por ISR, se resetea cada intervalo)
+static volatile uint32_t _flowPulseTotal  = 0;     // acumulador histórico — nunca se resetea
+static volatile uint32_t _flowSessionBase = 0;     // base de pulsos para conteo de sesión
+static unsigned long     _flowLastCalcUs  = 0;     // marca de tiempo última lectura (micros)
+static unsigned long     _flowLastDtUs    = 0;     // duración del último intervalo de cálculo (µs)
+static uint32_t          _flowLastPulses  = 0;     // pulsos contados en el último intervalo
+static float             _flowLpm         = 0.0f;  // último caudal calculado (L/min)
 
 void IRAM_ATTR flowPulseISR() {
   _flowPulseCount++;
   _flowPulseTotal++;
+}
+
+// Reinicia el contador de sesión (litros desde apertura de válvula).
+// Llamar cuando el relay abre la válvula (transition OFF→ON).
+void flowSessionReset() {
+  portENTER_CRITICAL(&_flowMux);
+  _flowSessionBase = _flowPulseTotal;
+  portEXIT_CRITICAL(&_flowMux);
 }
 #endif
 
@@ -734,10 +744,10 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   // Devuelve true en cuanto hay datos válidos del caudalímetro.
   // pressureBar = NAN indica "sin sensor de presión en este ciclo" → el caller
   // mantiene la estimación simulada para la presión.
-  unsigned long now = millis();
-  unsigned long dt  = now - _flowLastCalcMs;
+  unsigned long now = micros();
+  unsigned long dt  = now - _flowLastCalcUs;
 
-  if (dt < 500UL) {
+  if (dt < 500000UL) {  // < 500 ms en microsegundos
     // Intervalo demasiado corto para recalcular caudal — reutilizar último valor.
     // Pero SÍ leemos el XDB401: presión y caudal son independientes; sin esto
     // el caller alterna entre valor real y simulado cada 2-3 ciclos de 200 ms.
@@ -769,13 +779,12 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   _flowPulseCount  = 0;
   interrupts();
 
-  _flowLastCalcMs = now;
-  _flowLastDtMs   = dt;       // guardamos para el debug
+  _flowLastCalcUs = now;
+  _flowLastDtUs   = dt;       // guardamos para el debug
   _flowLastPulses = pulses;   // guardamos para el debug
 
   // L/min = (pulsos / dt_s) * (60.0 / K_FACTOR)
-  // Equivalente: pulsos * 60.0 / (dt_s * K_FACTOR)
-  float dt_s  = dt / 1000.0f;
+  float dt_s  = dt * 1e-6f;  // µs → s (precisión µs reduce error de cuantización a caudales bajos)
   _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
   flowLpm     = _flowLpm;
   // Intentar leer presión real del XDB401; NAN si no disponible (el caller usará sim)
@@ -1118,11 +1127,12 @@ struct TelemetrySnapshot {
   float light, tempDHT11, humDHT11, soil;
   float bmpTemp, bmpPressure;
   float pipePressure, pipeFlow;
-  float flowTotalL;   ///< Litros acumulados desde el arranque (_flowPulseTotal / K). 0 si sin caudalimetro.
+  float flowTotalL;    ///< Litros acumulados desde el arranque (_flowPulseTotal / K). 0 si sin caudalimetro.
+  float flowSessionL;  ///< Litros desde la última apertura de válvula (se resetea al abrir relay). 0 si sin caudalimetro.
   float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
   long  heap, uptime;
   int   rssi, relayMask;
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
   float dewPoint, heatIndex, absHum;
 #endif
 } _netSnap;
@@ -1850,9 +1860,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     int  relay = doc["relay"] | 0;
     bool state = doc["state"] | false;
     if (relay >= 0 && relay < RELAY_COUNT) {
+      bool wasActive = relayActive[relay];
       relayActive[relay] = state;
       digitalWrite(RELAY_PINS[relay], state ? HIGH : LOW);  // activo-HIGH
       DLOGF("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+      // Al abrir la válvula (OFF→ON) reiniciar contador de sesión para medir litros
+      // exactamente desde esta apertura. Sólo aplica si hay caudalímetro.
+#if defined(FLOW_PIN)
+      if (state && !wasActive) flowSessionReset();
+#endif
       setLedState(anyRelayActive() ? LED_RELAY_ON : LED_IDLE);
     }
   }
@@ -1948,7 +1964,7 @@ void mqttPublishRegister() {
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["device_profile"]   =
     (DEVICE_PROFILE == PROFILE_METEO)      ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_IRRIGATION) ? "IRRIGATION" : "AGROMETEO";
+    (DEVICE_PROFILE == PROFILE_IRRIGATION) ? "IRRIGATION" : "AQUALEAK";
 
   char topic[64], buf[768];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
@@ -2119,13 +2135,13 @@ void networkTask(void* pvParameters) {
       static bool   _lastMcpOk            = true;
       static bool   _lastBmpOk            = true;
 #endif
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
       static bool   _lastMicroPressureOk  = true;
 #endif
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
       static bool   _lastHtuOk            = true;
 #endif
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
       static bool   _lastHdcOk            = true;
       static bool   _lastBh1750Ok         = true;
 #endif
@@ -2168,7 +2184,7 @@ void networkTask(void* pvParameters) {
 
 #endif
 
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
       // MicroPressure
       if (!micropressure_ok && _lastMicroPressureOk)
         mqttPublishAlert("sensor_failure", "warning", "MicroPressure sin respuesta — barometro no disponible");
@@ -2177,7 +2193,7 @@ void networkTask(void* pvParameters) {
       _lastMicroPressureOk = micropressure_ok;
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
       // HTU2x
       if (!htu_ok && _lastHtuOk)
         mqttPublishAlert("sensor_failure", "warning", "HTU2x sin respuesta — temperatura/humedad interior no disponibles");
@@ -2186,7 +2202,7 @@ void networkTask(void* pvParameters) {
       _lastHtuOk = htu_ok;
 #endif
 
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
       // HDC1080
       if (!hdc_ok && _lastHdcOk)
         mqttPublishAlert("sensor_failure", "warning", "HDC1080 sin respuesta — temperatura/humedad no disponibles");
@@ -2246,7 +2262,8 @@ void networkTask(void* pvParameters) {
       doc["soil_moisture"]         = r1(snap.soil);
       doc["pipeline_pressure"]     = r2(snap.pipePressure);
       doc["pipeline_flow"]         = r2(snap.pipeFlow);
-      doc["flow_total_l"]          = roundf(snap.flowTotalL * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
+      doc["flow_total_l"]          = roundf(snap.flowTotalL   * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
+      doc["flow_session_l"]        = roundf(snap.flowSessionL * 10.0f) / 10.0f;  // litros desde última apertura de válvula
       doc["pipeline_scenario"]     = pipelineScenario;
       doc["pipeline_mode"]         = pipelineMode;
       doc["pipeline_source"]       = pipelineSource;
@@ -2263,8 +2280,8 @@ void networkTask(void* pvParameters) {
       doc["ip_address"]            = WiFi.localIP().toString();
       doc["relay_count"]           = RELAY_COUNT;
       doc["firmware_version"]      = FIRMWARE_VERSION;
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
-      // Parámetros calculados agrometeorologícos — solo PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
+      // Parámetros calculados agroambientales — solo PROFILE_AQUALEAK
       if (!isnan(snap.dewPoint))   doc["dew_point"]    = r1(snap.dewPoint);
       if (!isnan(snap.heatIndex))  doc["heat_index"]   = r1(snap.heatIndex);
       if (!isnan(snap.absHum))     doc["abs_humidity"] = r2(snap.absHum);
@@ -2364,7 +2381,7 @@ void setup() {
   DLOGLN("=== DEBUG MODE ACTIVO ===");
   DLOGF("[TEST] Perfil  : %s (%d)\n",
     (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", DEVICE_PROFILE);
+    (DEVICE_PROFILE == PROFILE_AQUALEAK) ? "AQUALEAK" : "IRRIGATION", DEVICE_PROFILE);
   DLOGF("[TEST] Relays  : %d\n", RELAY_COUNT);
   DLOGF("[TEST] Display : %s\n",
 #ifdef HAS_DISPLAY
@@ -2467,7 +2484,7 @@ void setup() {
   DLOGF("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
 #endif  // DEV_MODE / producción
 
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
   // ── AGROMETEO: Qwiic Power Switch — encender ANTES del escáner ───────────
   qwiic_ps_ok = qwiic_ps.begin(Wire);   // begin() devuelve false si no detecta el PCA9536 en 0x41
   if (qwiic_ps_ok) {
@@ -2515,7 +2532,7 @@ void setup() {
 #if defined(FLOW_PIN)
   // Caudalímetro: pull-up interno activo (BC547 NPN invierte señal → FALLING = pulso)
   pinMode(FLOW_PIN, INPUT_PULLUP);
-  _flowLastCalcMs = millis();
+  _flowLastCalcUs = micros();
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowPulseISR, FALLING);
   DLOGF("Caudalimetro GPIO%d configurado (ISR FALLING, K=%d pulsos/L)\n",
         FLOW_PIN, FLOW_K_FACTOR);
@@ -2573,7 +2590,7 @@ void setup() {
   }
   DLOGF("Sensores activos → TempExt:%s | Presion:%s\n",
     temperatureSourceName(), pressureSourceName());
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   DLOGLN("MCP9808 — perfil AGROMETEO, sensor omitido");
   DLOGLN("BMP280 y MicroPressure — inicializados en bloque AGROMETEO");
 #else
@@ -2582,7 +2599,7 @@ void setup() {
   DLOGLN("Barometro — perfil IRRIGATION, sensor omitido");
 #endif
 
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
   // Nota: Qwiic Power Switch ya inicializado antes del escáner I2C (ver arriba)
 
   // ── AGROMETEO: MicroPressure + BMP280 + HDC1080 + BH1750 ────────────────
@@ -2653,9 +2670,9 @@ void setup() {
   // mediciones estables. Apagarlos entre lecturas reinicia los filtros internos y exige
   // esperar 120-180 ms de conversión en cada ciclo.
   DLOGLN("Qwiic Power Switch — sensores alimentados de forma continua");
-#endif  // PROFILE_AGROMETEO
+#endif  // PROFILE_AQUALEAK
 
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
   // HTU2x — omitido en AGROMETEO (dirección 0x40 ocupada por HDC1080)
   htu_ok = htu_begin();
   if (htu_ok) {
@@ -2698,13 +2715,13 @@ void setup() {
       humidityDHT11    = sim_humDHT11;
     }
   }
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   DLOGLN("DHT11 — perfil AGROMETEO, sensor omitido");
 #else
   DLOGLN("DHT11 — perfil IRRIGATION, sensor omitido");
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
   // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750 inicializado arriba)
   tsl_ok = tsl_begin();
   if (tsl_ok) {
@@ -2894,12 +2911,12 @@ void setup() {
   DLOGLN(F("\n====== AQUANTIA BOOT COMPLETO ======"));
   DLOGF("[TEST] Perfil   : %s | Relays: %d\n",
     (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_AGROMETEO) ? "AGROMETEO" : "IRRIGATION", RELAY_COUNT);
+    (DEVICE_PROFILE == PROFILE_AQUALEAK) ? "AQUALEAK" : "IRRIGATION", RELAY_COUNT);
   DLOGF("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
   DLOGF("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
   DLOGF("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
   DLOGF("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
   DLOGF("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
 #else
@@ -3081,7 +3098,7 @@ void loop() {
     if (!bar_ok) pressure = sim_pressure;
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
     // HTU2x — omitido en AGROMETEO (0x40 = HDC1080)
     // Reintento de reinit si el sensor falló en ciclo anterior
     if (!htu_ok) {
@@ -3103,7 +3120,7 @@ void loop() {
       temperatureDHT = sim_tempDHT;
       humidity       = sim_humidity;
     }
-#endif  // PROFILE_AGROMETEO
+#endif  // PROFILE_AQUALEAK
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // DHT11
@@ -3123,7 +3140,7 @@ void loop() {
     }
 #endif
 
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
     // ── AGROMETEO: HDC1080 + BMP280 + BH1750 + parámetros calculados ────────
     // Sensores siempre alimentados (Qwiic Power Switch ON permanente desde setup).
     // Solo se reinicializa un sensor concreto si falló en el ciclo anterior.
@@ -3228,9 +3245,9 @@ void loop() {
       }
     }
 
-#endif  // PROFILE_AGROMETEO
+#endif  // PROFILE_AQUALEAK
 
-#if DEVICE_PROFILE != PROFILE_AGROMETEO
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
     // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750)
     if (tsl_ok) {
       float lux = tsl_readLux();
@@ -3242,7 +3259,7 @@ void loop() {
       }
     }
     if (!tsl_ok) lightLevel = sim_light;
-#endif  // PROFILE_AGROMETEO (TSL guard)
+#endif  // PROFILE_AQUALEAK (TSL guard)
 
 #if defined(SOIL_PIN)
     {
@@ -3282,14 +3299,17 @@ void loop() {
       snap.pipePressure  = sim_pipeline_pressure;
       snap.pipeFlow      = sim_pipeline_flow;
 #if defined(FLOW_PIN)
-      // Leer _flowPulseTotal con interrupciones desactivadas para coherencia.
-      // Es el único acumulador que nunca se resetea — la ISR asegura cero pérdida de pulsos.
-      noInterrupts();
-      uint32_t totalPulses = _flowPulseTotal;
-      interrupts();
-      snap.flowTotalL = totalPulses / (float)FLOW_K_FACTOR;
+      // Leer contadores con portENTER_CRITICAL para coherencia en dual-core.
+      uint32_t totalPulses, sessionBase;
+      portENTER_CRITICAL(&_flowMux);
+      totalPulses = _flowPulseTotal;
+      sessionBase = _flowSessionBase;
+      portEXIT_CRITICAL(&_flowMux);
+      snap.flowTotalL   = totalPulses / (float)FLOW_K_FACTOR;
+      snap.flowSessionL = (totalPulses - sessionBase) / (float)FLOW_K_FACTOR;
 #else
-      snap.flowTotalL = 0.0f;
+      snap.flowTotalL   = 0.0f;
+      snap.flowSessionL = 0.0f;
 #endif
       snap.xdb401Temp    = xdb401Temperature;
       snap.relayMask     = 0;
@@ -3299,7 +3319,7 @@ void loop() {
           if (relayActive[i]) snap.relayMask |= (1 << i);
         xSemaphoreGive(dataMutex);
       }
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
       snap.dewPoint  = agroDewPoint;
       snap.heatIndex = agroHeatIndex;
       snap.absHum    = agroAbsHum;
@@ -3307,7 +3327,7 @@ void loop() {
       xQueueOverwrite(telemetryQueue, &snap);
     }
 
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
     DLOGF("[sensor] HDC:T=%.1f H=%.1f%% | BMP:T=%.1f P=%.2fkPa | BH:%.1flx | Dp=%.1f Hi=%.1f Ah=%.2f\n",
       temperatureMCP, humidity, bmpTemperature, (float)pressure,
       lightLevel, agroDewPoint, agroHeatIndex, agroAbsHum);
@@ -3376,7 +3396,7 @@ void loop() {
       up / 3600, (up % 3600) / 60, up % 60,
       (long)ESP.getFreeHeap(), WiFi.RSSI());
 
-#if DEVICE_PROFILE == PROFILE_AGROMETEO
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
     DLOGF("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
       temperatureMCP, humidity, bmpTemperature, (float)pressure, lightLevel);
     DLOGF("[AGROCALC] Dp=%.1f C  HI=%.1f C  AH=%.2f g/m3\n",
@@ -3407,7 +3427,7 @@ void loop() {
     if (!temp_ok)         DLOGLN("[WARN  ] Temperatura exterior: SIM (sin sensor real)");
     if (!bar_ok)          DLOGLN("[WARN  ] Barometro: SIM (sin sensor real)");
     if (!htu_ok)          DLOGLN("[WARN  ] HTU2x: SIM (sin sensor real)");
-#elif DEVICE_PROFILE == PROFILE_AGROMETEO
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
     if (!hdc_ok)          DLOGLN("[WARN  ] HDC1080: SIM (sin sensor real)");
     if (!bmp_ok)          DLOGLN("[WARN  ] BMP280: SIM (sin sensor real)");
     if (!bh1750_ok)       DLOGLN("[WARN  ] BH1750: SIM (sin sensor real)");
