@@ -1,6 +1,8 @@
 # Aquantia — Firmware ESP32
 
-Firmware para la estación meteorológica y sistema de riego doméstico Aquantia. Compatible con **dos perfiles de hardware** seleccionables en tiempo de compilación.
+**Versión activa:** `0.2.0-beta.3` · **Rama:** `feature/mqtt-alerts` · **Backend compatible:** `v0.1.0+`
+
+Firmware para la estación meteorológica y sistema de detección de fugas/control de riego Aquantia. Compatible con **tres perfiles de hardware** seleccionables en tiempo de compilación.
 
 Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/alepape1/app_meteo)
 
@@ -23,6 +25,8 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 - [Simulación de sensores](#simulación-de-sensores)
 - [Sensor de presión de tubería XDB401](#sensor-de-presión-de-tubería-xdb401)
 - [Umbrales de alerta de presión](#umbrales-de-alerta-de-presión)
+- [Detector automático de fugas](#detector-automático-de-fugas-leakdetector)
+- [Alertas MQTT](#alertas-mqtt)
 - [Modo debug](#modo-debug)
 - [Ahorro energético](#ahorro-energético)
 - [Problemas conocidos](#problemas-conocidos)
@@ -38,6 +42,8 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 | **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
 | **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | No |
 | **AGROMETEO** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | Sin relays | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
+
+> **Nota:** El perfil AGROMETEO no incluye relays. Publica parámetros agrometeorológicos calculados: `dew_point`, `heat_index` y `abs_humidity`.
 
 Pinout completo de cada perfil: [PINOUT.md](PINOUT.md)
 
@@ -150,13 +156,11 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | `DHTesp` | beegee-tokyo | METEO | DHT11 |
 | `BH1750` | claws | AGROMETEO | Iluminancia |
 | `SparkFun Qwiic Power Switch Library` | SparkFun | AGROMETEO | PCA9536 — alimenta el bus I2C |
-
-> **Nota:** El perfil AGROMETEO no incluye relays ni pantalla. Los parámetros `dew_point`, `heat_index` y `abs_humidity` se calculan en firmware y se publican en telemetría MQTT cuando `DEVICE_PROFILE = PROFILE_AGROMETEO`.
 | `ArduinoJson` | Benoit Blanchon | Todos | Payloads JSON |
 | `PubSubClient` | knolleary | Todos (MQTT) | Cliente MQTT |
 
 HTU2x, HDC1080 y el sensor de luz TSL2584/APDS-9930 se implementan directamente sobre I2C sin librería externa.
-El driver del sensor de presión de tubería XDB401 (familia XGZP6847D) también es inline, sin librería.
+El driver del sensor de presión de tubería XDB401 (familia XGZP6847D) está en `pressure_sensor_i2c.h/.cpp`.
 
 ### Configuración TFT_eSPI (PROFILE_METEO)
 
@@ -229,20 +233,24 @@ El motivo es que en PROD el broker identifica cada dispositivo **por su MAC** y 
 Core 1 — loop()
  ├─ Cada 100ms   → Leer ADC anemómetro/veleta (METEO)
  │                Acumular vector de viento para promedio vectorial
- ├─ Cada 500ms   → [solo pipeline_mode=real] Leer XDB401 + caudalímetro
+ ├─ Cada 200ms   → [solo pipeline_mode=real] Leer XDB401 + caudalímetro
  │                Actualizar display y LeakDetector sin enviar a backend
  ├─ Cada 20s*    → Leer I2C: sensores meteo según perfil
  │                Calcular parámetros agrometeorológicos (AGROMETEO)
  │                Construir TelemetrySnapshot → xQueueOverwrite (sin bloqueo)
  │                Actualizar pantalla TFT (METEO)
  └─ Siempre      → Gestionar botones y timeout de pantalla (METEO)
+                   ledTick() — máquina de estados LED no-bloqueante
 
-Core 0 — networkTask()  [prioridad 2, watchdog 30s]
+Core 0 — networkTask()  [prioridad 2, watchdog 30s, trigger_panic]
  ├─ Cada ~10ms   → ArduinoOTA.handle()  ← nunca bloqueado
+ │                esp_task_wdt_reset()
  ├─ Al arrancar  → [HTTP] POST /api/device_info
- │                 [MQTT] mqttConnect() + publish register
+ │                 [MQTT] mqttConnect() + mqttPublishRegister()
+ │                 mqttPublishAlert("device_reboot", …)
  ├─ Continuo     → [MQTT] mqttClient.loop()  ← recibe comandos relay
  ├─ Cada 2s      → [HTTP] GET /api/relay/command → actuar relays + ack
+ ├─ Edge-trig.   → mqttPublishAlert() — alertas de sensor/pipeline/heap
  └─ Cada 20s*    → xQueuePeek (sin bloqueo) → envío telemetría
                    [HTTP] CSV → POST /send_message
                    [MQTT] JSON → publish aquantia/<finca_id>/telemetry
@@ -252,14 +260,15 @@ Core 0 — networkTask()  [prioridad 2, watchdog 30s]
 
 Sincronización entre cores:
 - **`telemetryQueue`** (FreeRTOS Queue, tamaño 1): Core 1 publica el snapshot con `xQueueOverwrite`; Core 0 lo consume con `xQueuePeek`. Nunca bloquea ningún core.
-- **`dataMutex`** (FreeRTOS Mutex): protege exclusivamente las escrituras de config desde Core 0 (`pipelineScenario`, `telemetryIntervalMs`, `relayActive[]`) que Core 1 lee.
-- **`windMux`** (sección crítica): protege los acumuladores vectoriales del viento
+- **`dataMutex`** (semáforo binario): protege exclusivamente las escrituras de config desde Core 0 (`pipelineScenario`, `pipelineMode`, `relayActive[]`, `irrigationType`). Lecturas en Core 1 son eventual-consistent (máx. 1 ciclo).
+- **`windMux`** (`portMUX_TYPE`): sección crítica de bare-metal para acumuladores vectoriales del viento. Seguro frente a preempción entre loop y sección crítica de snapshot.
+- **`char[16]`** para `pipelineMode` y `pipelineScenario**: elimina carreras de heap entre cores que ocurrían con `String`.
 
 ### Seguridad OTA
 
 Al arrancar una actualización OTA:
 - `networkTask` deja de enviar datos
-- Todos los relays pasan a OFF (HIGH)
+- Todos los relays pasan a OFF (LOW para relay activo-HIGH)
 - Core 1 (sensores/pantalla) sigue funcionando
 
 ---
@@ -272,15 +281,15 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 
 | Intervalo | Constante | Core | Qué ocurre | Perfiles |
 |----------:|-----------|:----:|-----------|:--------:|
-| **100 ms** | `WIND_MS` | 1 | Lee ADC anemómetro (GPIO 36) → `windSpeed`; ADC veleta → `windDirection`; acumula vector para promedio | METEO |
-| **500 ms** | `PIPELINE_FAST_MS` | 1 | Lee XDB401 (presión + temperatura agua) y caudalímetro → actualiza display y detector de fugas. **Solo activo cuando `pipeline_mode = real`** | Todos |
+| **100 ms** | `WIND_MS` | 1 | Lee ADC anemómetro (GPIO 36) → `windSpeed`; ADC veleta → `windDirection`; acumula vector | METEO |
+| **200 ms** | `PIPELINE_FAST_MS` | 1 | Lee XDB401 (presión + temperatura agua) y caudalímetro → actualiza display y LeakDetector. **Solo activo cuando `pipeline_mode = real`** | METEO, AGROMETEO |
 | **1 s** | `SCREEN_MS` | 1 | Refresca pantalla TFT (doble buffer, sin parpadeo) | METEO |
 | **2 s** | `RELAY_MS` | 0 | `GET /api/relay/command` — solo modo HTTP legacy | Todos |
-| **5 s** | `DEBUG_INTERVAL_MS` | 1 | Imprime reporte completo de estado por Serial — **solo con `DEBUG_MODE` activo** | Todos |
-| **20 s** \* | `telemetryIntervalMs` | 1 → 0 | Lee todos los sensores I2C + ADC suelo → construye `TelemetrySnapshot` → Core 0 envía MQTT o HTTP | Todos |
-| **20 s** | `PIPELINE_SYNC_MS` | 0 | Sincroniza config pipeline (`pipeline_mode`, escenario) desde el servidor | Todos |
-| **30 s** | `XDB401_RETRY_INTERVAL` | 1 | Reintenta `xdb401_begin()` tras 5 fallos consecutivos de lectura | Todos |
-| **60 s** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones | METEO |
+| **10 s** | `DEBUG_INTERVAL_MS` | 1 | Imprime reporte de estado por Serial — **solo con `DEBUG_MODE` activo** | Todos |
+| **20 s** \* | `telemetryIntervalMs` | 1 → 0 | Lee todos los sensores I2C → construye `TelemetrySnapshot` → Core 0 envía MQTT o HTTP | Todos |
+| **20 s** | `PIPELINE_SYNC_MS` | 0 | Sincroniza config pipeline desde el servidor | Todos |
+| **15 s** | `XDB401_RETRY_INTERVAL` | 1 | Reintenta `xdb401_begin()` tras 8 fallos consecutivos de lectura | Todos |
+| **10 min** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones | METEO |
 
 \* `telemetryIntervalMs` puede modificarse en tiempo de ejecución mediante MQTT (`telemetry_interval_s`) o HTTP `/api/pipeline/config`. El valor por defecto (y el usado para sincronizar las lecturas I2C) es **20 s**.
 
@@ -297,10 +306,10 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | **TSL2584 / APDS-9930** | Iluminancia | ✓ | — | — |
 | **BH1750** | Iluminancia | — | — | ✓ |
 | **YL-69** (ADC) | Humedad suelo | ✓ | — | — |
-| **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ (sync) | ✓ (sync) | ✓ (sync) |
-| **Caudalímetro** (pulsos) | Caudal L/min | ✓ (sync) | ✓ (sync) | — |
+| **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ | ✓ | ✓ |
+| **Caudalímetro YF-B9** (ISR) | Caudal L/min + litros totales | ✓ | — | ✓ |
 
-> El XDB401 y el caudalímetro se leen **también cada 500 ms** (ciclo rápido) cuando `pipeline_mode = real`. En el ciclo de 20 s se sincronizan sus valores al snapshot de telemetría.
+> El XDB401 y el caudalímetro se leen **también cada 200 ms** (ciclo rápido) cuando `pipeline_mode = real`. En el ciclo de 20 s se sincronizan sus valores al snapshot de telemetría.
 
 ### Fallback y simulación
 
@@ -316,9 +325,10 @@ Modo de comunicación principal. Activar definiendo `USE_MQTT` en `secrets.h`.
 
 | Topic | Dirección | Cuándo | Contenido |
 |-------|-----------|--------|-----------|
-| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count |
-| `aquantia/<finca_id>/telemetry` | ESP → broker | Cada 20s | JSON con 17 campos de sensores |
-| `aquantia/<finca_id>/cmd` | broker → ESP | Comando relay | `{"relay": 0, "state": true}` |
+| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version |
+| `aquantia/<finca_id>/telemetry` | ESP → broker | Cada 20s | JSON con todos los campos de sensores |
+| `aquantia/<finca_id>/alerts` | ESP → broker | Edge-triggered | JSON alerta de sensor/pipeline/heap |
+| `aquantia/<finca_id>/cmd` | broker → ESP | Comando | `{"relay":0,"state":true}` / `{"pipeline_mode":"real"}` / `{"irrigation_type":"drip"}` |
 
 ### Payload telemetría (JSON)
 
@@ -332,6 +342,11 @@ Campos presentes en todos los perfiles salvo indicación:
   "humidity":                 65.2,
   "temperature_source":       "MCP9808",
   "pressure_source":          "MicroPressure",
+  "bmp280_ok":                true,
+  "bmp280_temperature":       21.5,
+  "bmp280_pressure":          101.2,
+  "pressure_micro":           101.3,
+  "pressure_bmp280":          101.2,
   "windSpeed":                3.5,
   "windDirection":            180.0,
   "windSpeedFiltered":        3.3,
@@ -345,26 +360,29 @@ Campos presentes en todos los perfiles salvo indicación:
   "relay_active":             0,
   "relay_count":              1,
   "soil_moisture":            50.0,
-  "bmp280_ok":                true,
-  "bmp280_temperature":       21.5,
-  "bmp280_pressure":          101.2,
   "pipeline_pressure":        3.50,
   "pipeline_flow":            5.00,
+  "flow_total_l":             12.3,
   "pipeline_scenario":        "normal",
   "pipeline_mode":            "real",
   "pipeline_source":          "real",
   "pipeline_pressure_ok":     true,
   "pipeline_flow_ok":         true,
+  "irrigation_type":          "sprinkler",
+  "leak_detect_trained":      true,
+  "leak_baseline_pressure":   2.80,
+  "leak_baseline_flow":       4.95,
+  "leak_warmup_progress":     20,
   "xdb401_ok":                true,
   "xdb401_temperature":       18.3,
   "mac_address":              "FC:B4:67:F3:77:48",
   "ip_address":               "192.168.1.9",
-  "firmware_version":         "0.1.0-beta.5",
+  "firmware_version":         "0.2.0-beta.3",
   "ts":                       1746360000
 }
 ```
 
-Campos exclusivos **PROFILE_AGROMETEO** (presentes solo cuando el perfil es 3):
+Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
 
 ```json
 {
@@ -374,10 +392,12 @@ Campos exclusivos **PROFILE_AGROMETEO** (presentes solo cuando el perfil es 3):
 }
 ```
 
-> `temperature_source` puede ser `"MCP9808"`, `"BMP280"`, `"HDC1080"` o `"SIM"`.
-> `pressure_source` puede ser `"XDB401"`, `"MicroPressure"`, `"BMP280"` o `"SIM"`.
-> `xdb401_temperature` es la temperatura del fluido medida por el sensor de presión — solo cuando `xdb401_ok = true`.
-> El campo `ts` contiene el timestamp NTP en epoch Unix; se omite si el reloj aún no está sincronizado.
+> - `temperature_source`: `"MCP9808"` | `"BMP280"` | `"HDC1080"` | `"SIM"`
+> - `pressure_source`: `"XDB401"` | `"MicroPressure"` | `"BMP280"` | `"SIM"`
+> - `pipeline_source`: `"real"` (presión+caudal reales) | `"real_flow"` (caudal real, presión sim) | `"sim"` | `"fallback"`
+> - `flow_total_l`: litros acumulados desde el último arranque (resolución 100 mL)
+> - `xdb401_temperature`: temperatura del fluido medida por el sensor de presión — solo cuando `xdb401_ok = true`
+> - `ts`: timestamp NTP epoch Unix; se omite si el reloj aún no está sincronizado
 
 ### Autenticación MQTT — flujo completo
 
@@ -410,6 +430,32 @@ La verificación TLS usa el certificado raíz de Let's Encrypt almacenado en `mq
 
 ---
 
+## Alertas MQTT
+
+El firmware publica en `aquantia/<finca_id>/alerts` solo al **cambio de estado** (edge-triggered). El backend inserta una fila en la tabla `alerts`.
+
+### Payload alerta
+
+```json
+{ "device_mac": "FC:B4:67:F3:77:48", "type": "leak", "severity": "warning", "message": "Fuga detectada: caudal con valvula cerrada" }
+```
+
+### Tipos de alerta
+
+| `type` | `severity` | Cuándo |
+|--------|-----------|--------|
+| `device_reboot` | info | Al reconectar tras reinicio |
+| `mqtt_reconnect` | info | Reconexión al broker (no primer arranque) |
+| `leak` | warning | LeakDetector detecta fuga |
+| `burst` | critical | LeakDetector detecta rotura |
+| `obstruction` | warning | LeakDetector detecta obstrucción |
+| `pipeline_ok` | info | Pipeline se recupera a estado normal |
+| `sensor_failure` | warning | Sensor deja de responder (XDB401, MCP9808, BMP280, HTU2x, HDC1080, BH1750, MicroPressure) |
+| `sensor_ok` | info | Sensor se recupera |
+| `low_heap` | warning | Heap libre < 30 KB |
+
+---
+
 ## Modo HTTP legacy
 
 Modo de compatibilidad. Activo cuando `USE_MQTT` **no** está definido.
@@ -429,12 +475,12 @@ rssi, free_heap, uptime_s, relay_active, soil_moisture
 
 ## Relay y electroválvulas
 
-Los relays **JQC-3FF-S-Z** son **activo-LOW**:
+Los relays son **activo-HIGH** (lote Aquantia, JQC-3FF-S-Z):
 
 | GPIO | Estado | Relay | Válvula |
 |------|--------|:-----:|---------|
-| HIGH | Arranque / seguro | OFF | Cerrada |
-| LOW | Activado | ON | Abierta |
+| LOW | Arranque / seguro | OFF | Cerrada |
+| HIGH | Activado | ON | Abierta |
 
 El campo `relay_active` es un bitmask: bit 0 = relay 1, bit 1 = relay 2, etc.
 
@@ -614,31 +660,7 @@ La lógica de actuación (corte de relay, alerta MQTT) se implementa en el backe
 
 ## Modo debug
 
-La rama `test` tiene `#define DEBUG_MODE 1` activo. Cada 5s imprime por Serial:
-
-```
-====== AQUANTIA TEST REPORT ======
-[PERFIL] METEO (1) | Relays: 1 | Display: SI | MQTT: SI
-[TIEMPO] Uptime: 0h 01m 23s | Heap libre: 245312 B
-[DEVICE] Serial: AQ-FCB467F37748
-[WIFI  ] CONECTADO | IP: 192.168.1.9 | RSSI: -62 dBm
-[SENSOR] MCP9808:OK  Barometro:OK  DHT11:OK  HTU2x:OK  LuzAmb:OK
-[DATOS ] T_MCP:22.1 C  T_HTU:21.8 C  H_HTU:65.2%  Lux:312.0 lx
-[VIENTO] Speed:3.5 m/s (filt:3.3) | Dir:180 grados (S)
-[RELAYS] R1=OFF
-==================================
-```
-
-Útil para verificar el funcionamiento completo sin sensores conectados (modo simulación activo para los sensores ausentes).
-
-### Pipeline: simulación y modo hardware
-
-La beta.2 deja preparada la transición al caudalímetro real:
-
-- `pipeline_mode = sim | real`
-- recepción inmediata de configuración por MQTT dirigida por MAC
-- fallback por lectura HTTP de `/api/pipeline/config`
-- si el sensor real aún no está montado, el firmware mantiene `pipeline_source = fallback` y sigue usando el simulador
+Definir `-DDEBUG_MODE=1` al compilar (casilla "🐛 Debug" en la Flash Tool). Cada 10 s imprime por Serial un reporte de estado con solo los datos variables y advertencias activas. En producción la macro es un no-op — cero overhead en runtime.
 
 ---
 
@@ -654,15 +676,17 @@ La beta.2 deja preparada la transición al caudalímetro real:
 
 ## Detector automático de fugas (LeakDetector)
 
-Clase `LeakDetector` en `LeakDetector.h`. Recibe muestras de presión y caudal cada 500 ms y clasifica el estado de la tubería en tiempo real.
+Clase `LeakDetector` en `LeakDetector.h`. Recibe muestras de presión y caudal cada **200 ms** y clasifica el estado de la tubería en tiempo real.
 
 ### Algoritmo
 
-1. **Warm-up** (20 muestras con válvula abierta): aprende el baseline de presión y caudal mediante EMA sin disparar alertas. Telemetría muestra `leak_detect_trained: false` hasta completar el entrenamiento.
+1. **Warm-up** (20 muestras con válvula abierta): aprende el baseline de presión y caudal mediante EMA (`α = 0.05`). `leak_detect_trained = false` hasta completar el entrenamiento.
 2. **Detección activa** una vez entrenado:
-   - **Válvula cerrada**: cualquier caudal > `leak_idle_threshold_lpm` durante 3 muestras consecutivas → `"leak"`
-   - **Válvula abierta**: caída de presión ≥ `burst_pressure_drop_pct` → `"burst"` / exceso de caudal ≥ `leak_on_deviation_pct` → `"leak"` / caída de caudal ≥ `obstruction_flow_drop_pct` → `"obstruction"`
+   - **Válvula cerrada**: caudal > `leak_idle_threshold_lpm` durante **3 muestras consecutivas** → `"leak"`
+   - **Válvula abierta**: caída de presión ≥ `burst_pressure_drop_pct` durante **2 muestras consecutivas** → `"burst"`; exceso de caudal ≥ `leak_on_deviation_pct` → `"leak"`; caída de caudal ≥ `obstruction_flow_drop_pct` durante **2 muestras consecutivas** → `"obstruction"`
 3. **Normal** en el resto de casos: actualiza EMA con la muestra nueva.
+
+Los contadores de confirmación (`BURST_CONFIRM = 2`, `OBSTR_CONFIRM = 2`, `IDLE_CONFIRM = 3`) evitan falsos positivos por picos de ruido.
 
 ### Perfiles de riego predefinidos
 
@@ -681,9 +705,13 @@ El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`
 |-------|------|-------------|
 | `pipeline_scenario` | string | `normal` / `leak` / `burst` / `obstruction` |
 | `leak_detect_trained` | bool | `true` cuando el baseline EMA está entrenado |
+| `leak_baseline_pressure` | float | Baseline EMA de presión (bar) |
+| `leak_baseline_flow` | float | Baseline EMA de caudal (L/min) |
+| `leak_warmup_progress` | int | Muestras de warm-up completadas (0–20) |
 | `pipeline_pressure_ok` | bool | Sensor de presión real activo |
 | `pipeline_flow_ok` | bool | Caudalímetro real activo |
-| `pipeline_source` | string | `real` / `sim` / `fallback` |
+| `pipeline_source` | string | `real` / `real_flow` / `sim` / `fallback` |
+| `flow_total_l` | float | Litros acumulados desde arranque (resolución ±100 mL) |
 
 ---
 
@@ -693,8 +721,6 @@ El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`
 |----------|--------|
 | DHT11 lecturas inestables ocasionalmente | Conocido — valorar reemplazar por DHT22 o SHT31 |
 | Temperatura agua XDB401 puede reflejar T ambiente si la tubería está seca | Esperado — documentar en dashboard |
-| `pipelineMode` / `pipelineScenario` leídos en Core 1 sin mutex (eventual-consistent) | Pendiente fix en rama `fix/stability-low-cost` |
-| LeakDetector dispara burst/obstruction con 1 sola muestra (sin ventana de confirmación) | Pendiente fix en rama `fix/stability-low-cost` |
 
 ---
 

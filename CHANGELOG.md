@@ -13,6 +13,15 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [0.2.0-beta.3] — 2026-05-06
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feature/mqtt-alerts`
+
+### Fixed
+- **Relay lógica invertida (activo-HIGH)**
+
+---
+
 ## [0.2.0-beta.2] — 2026-05-06
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `fix/stability-low-cost`
