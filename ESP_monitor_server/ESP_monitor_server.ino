@@ -53,11 +53,14 @@
   #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
   #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
   #define FLOW_PIN         32   // Caudalímetro — pulsos digitales vía BC547 NPN (señal invertida, activo LOW)
-  // K factor según modelo:
+  // K factor según modelo (nominal):
   //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
-  //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
+  //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)  ← nominal datasheet
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
-  #define FLOW_K_FACTOR   240   // YF-B4 — F = 4.0·Q Hz  →  K = 240 p/L
+  // CALIBRADO empíricamente: 5 L en 6m32s (392 s) → 3300 pulsos contados → K = 660 p/L
+  // El valor nominal YF-B4 (240) discrepa probablemente por variación de fabricante
+  // y/o el trigger de ISR contando ambos flancos con el circuito BC547 NPN.
+  #define FLOW_K_FACTOR   660   // YF-B4 calibrado — 660 p/L (medido: 5 L en 392 s)
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   #define FLOW_PIN         17   // Caudalímetro — GPIO17 en WEMOS D1 MINI ESP32 (sin función especial, soporta ISR)
   // K factor según modelo:
