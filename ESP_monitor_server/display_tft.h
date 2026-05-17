@@ -237,23 +237,36 @@ void drawPipelineScreen() {
   spr.setTextColor(modeCol, C_CARD);
   spr.drawCentreString(
     pipeSim ? "MODO: SIMULADO" : "MODO: REAL",
-    120, bY + 2, 1);
+    120, bY + 1, 1);
 
   spr.setTextColor(C_LABEL, C_CARD);
-  spr.drawString("Escenario:", 6, bY + 14, 1);
+  spr.drawString("Escenario:", 6, bY + 8, 1);
   spr.setTextColor(C_TEXT, C_CARD);
-  spr.drawString(pipelineScenario, 68, bY + 14, 1);
+  spr.drawString(pipelineScenario, 68, bY + 8, 1);
 
   if (xdb401_ok && !isnan(xdb401Temperature)) {
     char tbuf[10];
     snprintf(tbuf, sizeof(tbuf), "%.1f", xdb401Temperature);
     spr.setTextColor(C_LABEL, C_CARD);
-    spr.drawString("Taq:", 148, bY + 14, 1);
+    spr.drawString("Taq:", 148, bY + 8, 1);
     spr.setTextColor(C_REAL, C_CARD);
-    spr.drawString(tbuf, 170, bY + 14, 1);
+    spr.drawString(tbuf, 170, bY + 8, 1);
     spr.setTextColor(C_LABEL, C_CARD);
-    spr.drawString("\xB0C", 198, bY + 14, 1);
+    spr.drawString("\xB0C", 198, bY + 8, 1);
   }
+
+  // ── Litros del ciclo actual ────────────────────────────────────────────────
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString("Ciclo:", 6, bY + 16, 1);
+#if defined(FLOW_PIN)
+  char lbuf[12];
+  snprintf(lbuf, sizeof(lbuf), "%.2f L", g_flowSessionL);
+  spr.setTextColor(!pipeSim ? C_REAL : C_SIM, C_CARD);
+  spr.drawString(lbuf, 44, bY + 16, 1);
+#else
+  spr.setTextColor(C_SIM, C_CARD);
+  spr.drawString("--", 44, bY + 16, 1);
+#endif
 
   spr.pushSprite(0, 0);
 }

@@ -57,14 +57,14 @@
   //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
-  #define FLOW_K_FACTOR   318   // YF-B9 — calibrado: 1 L en 38 s → K=456 p/L (F=7.5·Q Hz)
+  #define FLOW_K_FACTOR   240   // YF-B4 — F = 4.0·Q Hz  →  K = 240 p/L
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   #define FLOW_PIN         17   // Caudalímetro — GPIO17 en WEMOS D1 MINI ESP32 (sin función especial, soporta ISR)
   // K factor según modelo:
   //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
-  #define FLOW_K_FACTOR   456   // YF-S201 — ajustar si se calibra con agua real
+  #define FLOW_K_FACTOR   288   // YF-B9  — F = 4.8·Q Hz  →  K = 288 p/L
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   #define HAS_DISPLAY
@@ -476,6 +476,9 @@ bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
 float  xdb401Temperature     = NAN;  // temperatura interna del sensor de presión (XDB401)
+#if defined(FLOW_PIN)
+float  g_flowSessionL        = 0.0f; // litros desde última apertura de válvula — actualizado en pipeline tick (Core 1)
+#endif
 IrrigationType irrigationType = IRRIG_SPRINKLER;  // perfil de riego activo (configurable vía MQTT/HTTP)
 LeakDetector   leakDetector;                       // detector automático de fugas (solo modo real)
 unsigned long telemetryIntervalMs  = 20000UL;
@@ -610,6 +613,12 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   float dt_s  = dt * 1e-6f;  // µs → s (precisión µs reduce error de cuantización a caudales bajos)
   _flowLpm    = (pulses * 60.0f) / (dt_s * (float)FLOW_K_FACTOR);
   flowLpm     = _flowLpm;
+  // Actualizar litros de sesión visibles por la pantalla (Core 1 → no mutex, noInterrupts suficiente)
+  noInterrupts();
+  uint32_t _fTot  = _flowPulseTotal;
+  uint32_t _fBase = _flowSessionBase;
+  interrupts();
+  g_flowSessionL = (_fTot - _fBase) / (float)FLOW_K_FACTOR;
   // Intentar leer presión real del XDB401; NAN si no disponible (el caller usará sim)
   // Usar NAN como sentinel permite que lecturas negativas reales (vacío, golpe de ariete) pasen al caller.
   pressureBar = NAN;
