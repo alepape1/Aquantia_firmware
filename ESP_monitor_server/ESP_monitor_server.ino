@@ -96,6 +96,7 @@
   #include <Adafruit_BMP280.h>
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
+  #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
@@ -413,7 +414,10 @@ float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
 float  lightLevel        = 0;
-float  soilMoisture      = 0;   // YL-69 — humedad suelo (0=seco, 100=saturado)
+float  soilMoisture      = 0;   // humedad suelo (0=seco, 100=saturado)
+#if DEVICE_PROFILE == PROFILE_METEO
+HalisenseData halisenseData = {};
+#endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
@@ -808,6 +812,11 @@ struct TelemetrySnapshot {
   int   rssi, relayMask;
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
   float dewPoint, heatIndex, absHum;
+#endif
+#if DEVICE_PROFILE == PROFILE_METEO
+  float soilTemp, soilEc, soilPh, soilTds;
+  int   soilN, soilP, soilK;
+  bool  halisenseOk;
 #endif
 } _netSnap;
 
@@ -1389,6 +1398,18 @@ void networkTask(void* pvParameters) {
       doc["uptime_s"]              = snap.uptime;
       doc["relay_active"]          = snap.relayMask;
       doc["soil_moisture"]         = r1(snap.soil);
+#if DEVICE_PROFILE == PROFILE_METEO
+      doc["halisense_ok"]          = snap.halisenseOk;
+      if (snap.halisenseOk) {
+        doc["soil_temperature"]    = r1(snap.soilTemp);
+        doc["soil_ec"]             = r2(snap.soilEc);
+        doc["soil_ph"]             = r1(snap.soilPh);
+        doc["soil_tds"]            = r1(snap.soilTds);
+        doc["soil_n"]              = snap.soilN;
+        doc["soil_p"]              = snap.soilP;
+        doc["soil_k"]              = snap.soilK;
+      }
+#endif
       doc["pipeline_pressure"]     = r2(snap.pipePressure);
       doc["pipeline_flow"]         = r2(snap.pipeFlow);
       doc["flow_total_l"]          = roundf(snap.flowTotalL   * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
@@ -1879,6 +1900,11 @@ void setup() {
   }
 #endif
 
+#if DEVICE_PROFILE == PROFILE_METEO
+  halisense_init(27);  // DE/RE = GPIO27, RX=GPIO16, TX=GPIO17
+  DLOGLN("Helissense RS485 iniciado");
+#endif
+
   DLOGLN("Plataforma: ESP32 (con pantalla TFT)");
 
   // ── XDB401 — sensor de presión de tubería I2C (todos los perfiles ESP32) ──
@@ -2116,7 +2142,7 @@ void loop() {
   bool leftEdge  = (!curBtnLeft  && prevBtnLeft);
   bool rightEdge = (!curBtnRight && prevBtnRight);
   if (displayOn && (leftEdge || rightEdge)) {
-    displayView = (displayView + 1) % 3;
+    displayView = (displayView + 1) % 4;
   }
 
   prevBtnLeft  = curBtnLeft;
@@ -2392,7 +2418,29 @@ void loop() {
     if (!tsl_ok) lightLevel = sim_light;
 #endif  // PROFILE_AQUALEAK (TSL guard)
 
-#if defined(SOIL_PIN)
+#if DEVICE_PROFILE == PROFILE_METEO
+    {
+      HalisenseData hali;
+      if (halisense_read(hali)) {
+        halisenseData = hali;
+        soilMoisture  = hali.moisture;  // Helissense tiene prioridad sobre YL-69
+      } else {
+        halisenseData.ok = false;
+        // Fallback: YL-69 ADC
+#  if defined(SOIL_PIN)
+        int raw = analogRead(SOIL_PIN);
+        float filtRaw = filteredSoilADC(raw);
+        soilMoisture = constrain(
+          (float)(SOIL_RAW_DRY - filtRaw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
+          0.0f, 100.0f
+        );
+#  else
+        soilMoisture = sim_soilMoisture;
+#  endif
+      }
+    }
+#else
+#  if defined(SOIL_PIN)
     {
       int raw = analogRead(SOIL_PIN);
       float filtRaw = filteredSoilADC(raw);
@@ -2401,8 +2449,9 @@ void loop() {
         0.0f, 100.0f
       );
     }
-#else
+#  else
     soilMoisture = sim_soilMoisture;
+#  endif
 #endif
 
     updateSimulatedValues();
@@ -2425,6 +2474,16 @@ void loop() {
       snap.tempDHT11     = temperatureDHT11;
       snap.humDHT11      = humidityDHT11;
       snap.soil          = soilMoisture;
+#if DEVICE_PROFILE == PROFILE_METEO
+      snap.halisenseOk = halisenseData.ok;
+      snap.soilTemp    = halisenseData.ok ? halisenseData.temperature : NAN;
+      snap.soilEc      = halisenseData.ok ? halisenseData.ec          : NAN;
+      snap.soilPh      = halisenseData.ok ? halisenseData.ph          : NAN;
+      snap.soilTds     = halisenseData.ok ? halisenseData.tds         : NAN;
+      snap.soilN       = halisenseData.ok ? halisenseData.n           : -1;
+      snap.soilP       = halisenseData.ok ? halisenseData.p           : -1;
+      snap.soilK       = halisenseData.ok ? halisenseData.k           : -1;
+#endif
       snap.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
       snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
       snap.pipePressure  = sim_pipeline_pressure;
@@ -2517,8 +2576,17 @@ void loop() {
   // ── 3. Refresco de pantalla (cada SCREEN_MS = 1s, solo si hay display) ────────
 #ifdef HAS_DISPLAY
   if (now - lastScreenTime >= SCREEN_MS) {
-    if (displayView == 1)      drawPipelineScreen();
+    if      (displayView == 1) drawPipelineScreen();
     else if (displayView == 2) drawInfoScreen();
+    else if (displayView == 3) drawSueloScreen(
+      halisenseData.ok,
+      soilMoisture,
+      halisenseData.ok ? halisenseData.temperature : NAN,
+      halisenseData.ok ? halisenseData.ph          : NAN,
+      halisenseData.ok ? halisenseData.n           : 0,
+      halisenseData.ok ? halisenseData.p           : 0,
+      halisenseData.ok ? halisenseData.k           : 0
+    );
     else                       drawScreen();
     lastScreenTime = now;
   }

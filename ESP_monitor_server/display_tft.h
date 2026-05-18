@@ -373,6 +373,90 @@ void drawAPScreen(const char* ap_ssid, const char* serial) {
   spr.pushSprite(0, 0);
 }
 
+// ── Vista 4: Suelo Helissense ─────────────────────────────────────────────────
+void iconLeaf(int cx, int cy, uint16_t col) {
+  spr.fillEllipse(cx, cy - 2, 5, 7, col);
+  spr.drawFastVLine(cx, cy + 3, 5, col);
+}
+
+void iconFlask(int cx, int cy, uint16_t col) {
+  spr.drawLine(cx - 3, cy - 7, cx - 3, cy - 1, col);
+  spr.drawLine(cx + 3, cy - 7, cx + 3, cy - 1, col);
+  spr.fillTriangle(cx - 5, cy + 6, cx + 5, cy + 6, cx, cy - 1, col);
+}
+
+void iconEC(int cx, int cy, uint16_t col) {
+  spr.drawFastHLine(cx - 5, cy - 3, 10, col);
+  spr.drawFastHLine(cx - 5, cy,     8,  col);
+  spr.drawFastHLine(cx - 5, cy + 3, 10, col);
+  spr.drawFastVLine(cx - 5, cy - 3, 7,  col);
+}
+
+void drawSoilCard(int col, int row, const char* label, float value, const char* unit,
+                  bool ok, void (*icon)(int, int, uint16_t), bool isInt = false) {
+  int x = cardX(col);
+  int y = cardY(row);
+  uint16_t accentCol = ok ? C_REAL : C_SIM;
+
+  spr.fillRoundRect(x + 1, y + 1, CARD_W - 2, CARD_H - 2, 4, C_CARD);
+  spr.drawRoundRect(x, y, CARD_W, CARD_H, 4, C_BORDER);
+  spr.fillRoundRect(x + 1, y + 1, CARD_W - 2, 3, 2, accentCol);
+
+  icon(x + 10, y + 13, accentCol);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString(label, x + 22, y + 5, 1);
+
+  spr.setTextColor(ok ? C_TEXT : C_LABEL, C_CARD);
+  char buf[12];
+  if (ok) {
+    if (isInt) snprintf(buf, sizeof(buf), "%.0f", value);
+    else       snprintf(buf, sizeof(buf), "%.1f", value);
+  } else {
+    snprintf(buf, sizeof(buf), "--");
+  }
+  spr.drawString(buf, x + 4, y + 18, 4);
+
+  spr.setTextColor(C_LABEL, C_CARD);
+  spr.drawString(unit, x + 4, y + CARD_H - 13, 1);
+
+  spr.setTextColor(accentCol, C_CARD);
+  spr.drawRightString(ok ? "[OK]" : "[ERR]", x + CARD_W - 2, y + CARD_H - 13, 1);
+}
+
+void drawSueloScreen(bool haliOk, float soilMoist, float soilTemp, float soilPh,
+                     int soilN, int soilP, int soilK) {
+  spr.fillSprite(C_BG);
+
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
+  spr.setTextColor(C_TEXT, C_HDR);
+  spr.drawString("SUELO", 6, 4, 2);
+
+  // Indicadores de vista (4 puntos, el 4º activo)
+  spr.fillCircle(114, 9, 3, C_LABEL);
+  spr.fillCircle(123, 9, 3, C_LABEL);
+  spr.fillCircle(132, 9, 3, C_LABEL);
+  spr.fillCircle(141, 9, 3, C_TEXT);
+
+  // Badge estado Helissense
+  uint16_t haliCol = haliOk ? C_REAL : C_RED;
+  spr.fillRoundRect(164, 3, 70, 12, 3, haliCol);
+  spr.setTextColor(TFT_BLACK, haliCol);
+  spr.drawCentreString(haliOk ? "HELISSENSE OK" : "HELISSENSE ERR", 199, 5, 1);
+
+  // Fila 0: Humedad, Temp suelo, pH
+  drawSoilCard(0, 0, "HUMEDAD",  soilMoist, "%",   haliOk, iconDrop);
+  drawSoilCard(1, 0, "T.SUELO",  soilTemp,  "C",   haliOk, iconThermometer);
+  drawSoilCard(2, 0, "pH",       soilPh,    "",    haliOk, iconFlask);
+
+  // Fila 1: N, P, K
+  drawSoilCard(0, 1, "N",  (float)soilN, "mg/kg", haliOk, iconLeaf, true);
+  drawSoilCard(1, 1, "P",  (float)soilP, "mg/kg", haliOk, iconEC,   true);
+  drawSoilCard(2, 1, "K",  (float)soilK, "mg/kg", haliOk, iconGauge, true);
+
+  spr.pushSprite(0, 0);
+}
+
 void drawBootScreen(const char* wifiMsg) {
   spr.fillSprite(C_BG);
 
