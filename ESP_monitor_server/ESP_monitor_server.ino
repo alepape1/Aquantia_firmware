@@ -96,7 +96,7 @@
   #include <Adafruit_BMP280.h>
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
-  #include "halisense_sensor.h"
+  #include "SoilSensor.h"
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
@@ -199,6 +199,11 @@ const char* mqtt_pass   = MQTT_PASS;
 // 200 ms deja ~80 ms de margen entre lecturas → tasa máxima real ~5 Hz.
 // No tiene sentido bajar más: el sensor completo necesita 60 ms mínimo según datasheet.
 #define PIPELINE_FAST_MS  200UL
+
+// Intervalos de muestreo del sensor de suelo RS485 (PROFILE_METEO)
+#define SOIL_FAST_MS        3000UL    // durante riego activo y ventana post-riego
+#define SOIL_SLOW_MS       20000UL    // reposo normal
+#define SOIL_POST_IRRIG_MS 120000UL   // ventana de absorción tras apagar riego (2 min)
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 600000UL  // Apagar pantalla tras 10 minutos sin actividad
@@ -417,6 +422,7 @@ float  lightLevel        = 0;
 float  soilMoisture      = 0;   // humedad suelo (0=seco, 100=saturado)
 #if DEVICE_PROFILE == PROFILE_METEO
 HalisenseData halisenseData = {};
+SoilSensor    soilSensor(Serial2, 16, 17, 27);  // RX=GPIO16, TX=GPIO17, DE/RE=GPIO27
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -817,6 +823,7 @@ struct TelemetrySnapshot {
   float soilTemp, soilEc, soilPh, soilTds;
   int   soilN, soilP, soilK;
   bool  halisenseOk;
+  bool  soilIrrigMode;  // true si la lectura fue tomada en riego o ventana post-riego
 #endif
 } _netSnap;
 
@@ -855,6 +862,10 @@ unsigned long lastScreenTime      = 0;
 unsigned long lastSlowSensorRead   = 0;  // sensores lentos I2C: MCP9808, BMP280, HTU21, DHT, luz, suelo
 unsigned long lastPipelineFastRead = 0;  // XDB401 + caudalímetro: tan rápido como PIPELINE_FAST_MS
 unsigned long lastSensorRead       = 0;  // alias para compatibilidad con el bloque telemetría
+#if DEVICE_PROFILE == PROFILE_METEO
+unsigned long lastSoilReadMs      = 0;   // último muestreo del sensor de suelo RS485
+unsigned long soilPostIrrigEndMs  = 0;   // millis() cuando se apagó el último relay (0 = inactivo)
+#endif
 
 
 // ── Info estática del hardware ────────────────────────────────────────────────
@@ -1400,6 +1411,7 @@ void networkTask(void* pvParameters) {
       doc["soil_moisture"]         = r1(snap.soil);
 #if DEVICE_PROFILE == PROFILE_METEO
       doc["halisense_ok"]          = snap.halisenseOk;
+      doc["soil_irrig_mode"]       = snap.soilIrrigMode;
       if (snap.halisenseOk) {
         doc["soil_temperature"]    = r1(snap.soilTemp);
         doc["soil_ec"]             = r2(snap.soilEc);
@@ -1901,8 +1913,10 @@ void setup() {
 #endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
-  halisense_init(27);  // DE/RE = GPIO27, RX=GPIO16, TX=GPIO17
-  DLOGLN("Helissense RS485 iniciado");
+  if (soilSensor.begin(4800))
+    DLOGLN("SoilSensor RS485 iniciado OK");
+  else
+    DLOGLN("[WARN] SoilSensor: sin respuesta al arranque — continuando");
 #endif
 
   DLOGLN("Plataforma: ESP32 (con pantalla TFT)");
@@ -2418,26 +2432,21 @@ void loop() {
     if (!tsl_ok) lightLevel = sim_light;
 #endif  // PROFILE_AQUALEAK (TSL guard)
 
+// SoilSensor RS485 se lee en su propio bloque adaptativo (fuera del slow block).
+    // soilMoisture y halisenseData ya están actualizados por ese bloque.
+    // Aquí solo actualizamos soilMoisture desde YL-69 si halisense no está disponible.
 #if DEVICE_PROFILE == PROFILE_METEO
-    {
-      HalisenseData hali;
-      if (halisense_read(hali)) {
-        halisenseData = hali;
-        soilMoisture  = hali.moisture;  // Helissense tiene prioridad sobre YL-69
-      } else {
-        halisenseData.ok = false;
-        // Fallback: YL-69 ADC
+    if (!halisenseData.ok) {
 #  if defined(SOIL_PIN)
-        int raw = analogRead(SOIL_PIN);
-        float filtRaw = filteredSoilADC(raw);
-        soilMoisture = constrain(
-          (float)(SOIL_RAW_DRY - filtRaw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
-          0.0f, 100.0f
-        );
+      int raw = analogRead(SOIL_PIN);
+      float filtRaw = filteredSoilADC(raw);
+      soilMoisture = constrain(
+        (float)(SOIL_RAW_DRY - filtRaw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
+        0.0f, 100.0f
+      );
 #  else
-        soilMoisture = sim_soilMoisture;
+      soilMoisture = sim_soilMoisture;
 #  endif
-      }
     }
 #else
 #  if defined(SOIL_PIN)
@@ -2475,14 +2484,17 @@ void loop() {
       snap.humDHT11      = humidityDHT11;
       snap.soil          = soilMoisture;
 #if DEVICE_PROFILE == PROFILE_METEO
-      snap.halisenseOk = halisenseData.ok;
-      snap.soilTemp    = halisenseData.ok ? halisenseData.temperature : NAN;
-      snap.soilEc      = halisenseData.ok ? halisenseData.ec          : NAN;
-      snap.soilPh      = halisenseData.ok ? halisenseData.ph          : NAN;
-      snap.soilTds     = halisenseData.ok ? halisenseData.tds         : NAN;
-      snap.soilN       = halisenseData.ok ? halisenseData.n           : -1;
-      snap.soilP       = halisenseData.ok ? halisenseData.p           : -1;
-      snap.soilK       = halisenseData.ok ? halisenseData.k           : -1;
+      snap.halisenseOk   = halisenseData.ok;
+      snap.soilTemp      = halisenseData.ok ? halisenseData.temperature : NAN;
+      snap.soilEc        = halisenseData.ok ? halisenseData.ec          : NAN;
+      snap.soilPh        = halisenseData.ok ? halisenseData.ph          : NAN;
+      snap.soilTds       = halisenseData.ok ? halisenseData.tds         : NAN;
+      snap.soilN         = halisenseData.ok ? halisenseData.n           : -1;
+      snap.soilP         = halisenseData.ok ? halisenseData.p           : -1;
+      snap.soilK         = halisenseData.ok ? halisenseData.k           : -1;
+      snap.soilIrrigMode = anyRelayActive() ||
+                           (soilPostIrrigEndMs != 0 &&
+                            (millis() - soilPostIrrigEndMs) < SOIL_POST_IRRIG_MS);
 #endif
       snap.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
       snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
@@ -2540,6 +2552,56 @@ void loop() {
     lastSlowSensorRead = now;
     lastSensorRead      = now;
   }
+
+  // ── 2c. SoilSensor RS485 — muestreo adaptativo según estado de riego ────────────
+  // Rápido (3 s) cuando hay riego activo o en la ventana post-riego (2 min).
+  // Lento (20 s) en reposo. Permite detectar si el suelo se está mojando al regar.
+#if DEVICE_PROFILE == PROFILE_METEO
+  {
+    static bool prevRelayOn = false;
+    bool relayOn = anyRelayActive();
+
+    // Detectar flanco OFF → iniciar ventana post-riego
+    if (!relayOn && prevRelayOn) soilPostIrrigEndMs = now;
+    // Resetear ventana si el riego vuelve a activarse
+    if (relayOn) soilPostIrrigEndMs = 0;
+    prevRelayOn = relayOn;
+
+    unsigned long soilInterval = SOIL_SLOW_MS;
+    if (relayOn) {
+      soilInterval = SOIL_FAST_MS;
+    } else if (soilPostIrrigEndMs != 0) {
+      if (now - soilPostIrrigEndMs < SOIL_POST_IRRIG_MS)
+        soilInterval = SOIL_FAST_MS;
+      else
+        soilPostIrrigEndMs = 0;  // ventana expirada
+    }
+
+    if (now - lastSoilReadMs >= soilInterval) {
+      lastSoilReadMs = now;
+      if (soilSensor.readAllVariables()) {
+        halisenseData.ok          = true;
+        halisenseData.moisture    = soilSensor.getHumidity();
+        halisenseData.temperature = soilSensor.getTemperature();
+        float ecRaw               = soilSensor.getEC();   // µS/cm
+        halisenseData.ec          = ecRaw / 1000.0f;      // → dS/m
+        halisenseData.tds         = ecRaw * 0.5f;         // → ppm
+        halisenseData.ph          = soilSensor.getPH();
+        halisenseData.n           = (int)soilSensor.getNitrogen();
+        halisenseData.p           = (int)soilSensor.getPhosphorus();
+        halisenseData.k           = (int)soilSensor.getPotassium();
+        soilMoisture              = halisenseData.moisture;
+        DLOGF("[SOIL] Hum=%.1f%% T=%.1f°C pH=%.1f N=%d P=%d K=%d [%s]\n",
+              halisenseData.moisture, halisenseData.temperature, halisenseData.ph,
+              halisenseData.n, halisenseData.p, halisenseData.k,
+              relayOn ? "RIEGO" : (soilPostIrrigEndMs != 0 ? "POST-RIEGO" : "REPOSO"));
+      } else {
+        halisenseData.ok = false;
+        DLOGLN("[SOIL] Sin respuesta del sensor RS485");
+      }
+    }
+  }
+#endif  // PROFILE_METEO
 
   // ── 2b. XDB401 + caudalímetro — timer propio a PIPELINE_FAST_MS (200 ms) ────────
   // Independiente de los sensores lentos. En modo real actualiza display, LeakDetector
