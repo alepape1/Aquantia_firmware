@@ -97,6 +97,7 @@
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
   #include "SoilSensor.h"
+  #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
