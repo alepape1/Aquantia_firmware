@@ -21,8 +21,11 @@ Dos perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo d
 | Caudalímetro (pulsos ISR) | 32 | INPUT_PULLUP, ISR FALLING (BC547 NPN, señal invertida) |
 | Relay 1 (electroválvula) | 26 | Activo-LOW, JQC-3FF-S-Z |
 | Botón izquierdo (BOOT) | 0 | INPUT_PULLUP, activo LOW |
-| Botón derecho | 35 | INPUT, activo LOW |
+| Botón derecho | 35 | INPUT, activo LOW — sin pull-up interno; debounce 400 ms en firmware |
 | LED onboard | 2 | Activo-LOW. Estados: parpadeo rápido=WiFi buscando, doble parpadeo=MQTT pendiente, latido=idle, triple=TX OK, 1s/1s=error |
+| RS485 Serial2 RX (DI) | **13** | Helissense sensor suelo — **NO usar GPIO16 (= TFT_DC)** |
+| RS485 Serial2 TX (RO) | 17 | Helissense sensor suelo |
+| RS485 DE/RE | 27 | Control half-duplex Helissense |
 
 ### Pantalla TFT — SPI (ST7789 240×135)
 
@@ -53,20 +56,51 @@ Configurada mediante `TFT_eSPI` → `User_Setups/Setup25_TTGO_T_Display.h`. No m
 ```
 LilyGo TTGO T-Display
 ┌────────────────────┐
-│  3V3 ──────────────┼──► VCC sensores I2C / DHT11 / divisor YL-69
+│  3V3 ──────────────┼──► VCC sensores I2C / DHT11 / divisor YL-69 / adaptador RS485
 │  GND ──────────────┼──► GND común
 │  GPIO21 (SDA) ─────┼──► SDA → MCP9808, MicroPressure, HTU2x, TSL2584
 │  GPIO22 (SCL) ─────┼──► SCL → (mismos sensores)
 │  GPIO15 ───────────┼──► DHT11 DATA  (pull-up 4.7kΩ a 3.3V)
 │  GPIO37 ───────────┼──► Anemómetro salida analógica 0–3.3V
 │  GPIO36 ───────────┼──► Veleta salida analógica 0–3.3V
-│  GPIO33 ───────────┼──► YL-69 AO (tras divisor de tensión)
+│  GPIO33 ───────────┼──► YL-69 AO (tras divisor de tensión) — fallback suelo
 │  GPIO32 ───────────┼──► Caudalímetro (colector BC547 NPN)
 │  GPIO26 ───────────┼──► IN del relay (JQC-3FF-S-Z)
 │  GPIO0  ───────────┼──► Botón BOOT (ya integrado en placa)
 │  GPIO35 ───────────┼──► Botón derecho externo
+│  GPIO13 ───────────┼──► RS485 DI → RX Helissense  ← usar GPIO13, NO GPIO16
+│  GPIO17 ───────────┼──► RS485 RO ← TX Helissense
+│  GPIO27 ───────────┼──► RS485 DE/RE (control half-duplex)
+│  GPIO16 ── TFT_DC ─┼   (interno, NO conectar nada aquí)
 └────────────────────┘
 ```
+
+### Sensor de suelo RS485 — Helissense (Modbus RTU)
+
+Sensor 7-en-1: humedad, temperatura, CE, pH, TDS, N, P, K. Conectado a Serial2 mediante un adaptador RS485 half-duplex TTL.
+
+| Señal | GPIO | Cable del sensor / adaptador RS485 |
+|-------|:----:|------------------------------------|
+| Serial2 RX — DI del adaptador | **13** | Línea de recepción ESP32 ← sensor |
+| Serial2 TX — RO del adaptador | 17 | Línea de transmisión ESP32 → sensor |
+| DE/RE (dirección half-duplex) | 27 | Control de dirección del bus |
+
+> **Conflicto GPIO16:** `TFT_DC = 16` en `Setup25_TTGO_T_Display.h`. TFT_eSPI conmuta este pin en cada transacción SPI. Si se conecta el RX de RS485 a GPIO16, UART2 recibe esas transiciones como datos Modbus falsos → lecturas erróneas + parpadeo de colores en pantalla. Usar siempre **GPIO13** como RX.
+
+```
+Adaptador RS485 (módulo MAX485 o equivalente)
+┌───────────┐
+│  VCC ─────┼──► 3.3V
+│  GND ─────┼──► GND
+│  DI  ─────┼──► GPIO17  (TX — ESP32 → sensor)
+│  DE  ─────┼──► GPIO27  (half-duplex HIGH=TX, LOW=RX)
+│  RE  ─────┼──► GPIO27  (unir DE y RE)
+│  RO  ─────┼──► GPIO13  (RX — sensor → ESP32)
+│  A/B ─────┼──► Bus RS485 al sensor Helissense
+└───────────┘
+```
+
+Parámetros de comunicación: **4800 baud, 8N1**, dirección Modbus esclavo `0x01`, registro inicial `0x0000`, 7 registros.
 
 ### Calibración del sensor de suelo (YL-69)
 

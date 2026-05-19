@@ -423,7 +423,7 @@ float  lightLevel        = 0;
 float  soilMoisture      = 0;   // humedad suelo (0=seco, 100=saturado)
 #if DEVICE_PROFILE == PROFILE_METEO
 HalisenseData halisenseData = {};
-SoilSensor    soilSensor(Serial2, 16, 17, 27);  // RX=GPIO16, TX=GPIO17, DE/RE=GPIO27
+SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -2154,10 +2154,13 @@ void loop() {
   }
 
   // BTN_LEFT o BTN_RIGHT: flanco descendente con pantalla ya encendida → cambiar vista
+  // Debounce 400ms — evita doble avance por rebote y falsos flancos de GPIO35 flotante
+  static unsigned long lastViewChange = 0;
   bool leftEdge  = (!curBtnLeft  && prevBtnLeft);
   bool rightEdge = (!curBtnRight && prevBtnRight);
-  if (displayOn && (leftEdge || rightEdge)) {
+  if (displayOn && (leftEdge || rightEdge) && (now - lastViewChange >= 400)) {
     displayView = (displayView + 1) % 4;
+    lastViewChange = now;
   }
 
   prevBtnLeft  = curBtnLeft;

@@ -21,6 +21,7 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 - [Modo HTTP legacy](#modo-http-legacy)
 - [Relay y electroválvulas](#relay-y-electroválvulas)
 - [Pantalla TFT](#pantalla-tft)
+- [Sensor de suelo RS485 Helissense](#sensor-de-suelo-rs485-helissense)
 - [Filtros y estabilización](#filtros-y-estabilización)
 - [Simulación de sensores](#simulación-de-sensores)
 - [Sensor de presión de tubería XDB401](#sensor-de-presión-de-tubería-xdb401)
@@ -150,6 +151,7 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | Librería | Autor | Perfil | Uso |
 |----------|-------|:------:|-----|
 | `TFT_eSPI` | Bodmer | METEO | Pantalla ST7789 |
+| *(sin librería externa)* | — | METEO | Sensor suelo Helissense — driver RS485 Modbus RTU en `SoilSensor.h/.cpp` |
 | `Adafruit MCP9808 Library` | Adafruit | METEO | Temperatura exterior |
 | `Adafruit BMP280 Library` | Adafruit | METEO, AGROMETEO | Temperatura + presión atmosférica |
 | `SparkFun MicroPressure Library` | SparkFun | METEO, AGROMETEO | Barómetro principal |
@@ -305,7 +307,8 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | — | ✓ |
 | **TSL2584 / APDS-9930** | Iluminancia | ✓ | — | — |
 | **BH1750** | Iluminancia | — | — | ✓ |
-| **YL-69** (ADC) | Humedad suelo | ✓ | — | — |
+| **YL-69** (ADC) | Humedad suelo (fallback si Helissense no responde) | ✓ | — | — |
+| **Helissense RS485** | Humedad + temperatura + CE + pH + TDS + NPK | ✓ | — | — |
 | **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ | ✓ | ✓ |
 | **Caudalímetro YF-B9** (ISR) | Caudal L/min + litros totales | ✓ | — | ✓ |
 
@@ -360,6 +363,15 @@ Campos presentes en todos los perfiles salvo indicación:
   "relay_active":             0,
   "relay_count":              1,
   "soil_moisture":            50.0,
+  "halisense_ok":             true,
+  "soil_irrig_mode":          false,
+  "soil_temperature":         19.5,
+  "soil_ec":                  0.35,
+  "soil_ph":                  6.8,
+  "soil_tds":                 175.0,
+  "soil_n":                   42,
+  "soil_p":                   18,
+  "soil_k":                   31,
   "pipeline_pressure":        3.50,
   "pipeline_flow":            5.00,
   "flow_total_l":             12.3,
@@ -392,6 +404,9 @@ Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
 }
 ```
 
+> - `halisense_ok`: `true` cuando el sensor RS485 respondió correctamente en el último ciclo
+> - `soil_irrig_mode`: `true` si el relay estaba activo o se estaba en ventana post-riego durante la lectura
+> - `soil_temperature … soil_k`: solo presentes cuando `halisense_ok = true`; si es `false`, se omiten del payload
 > - `temperature_source`: `"MCP9808"` | `"BMP280"` | `"HDC1080"` | `"SIM"`
 > - `pressure_source`: `"XDB401"` | `"MicroPressure"` | `"BMP280"` | `"SIM"`
 > - `pipeline_source`: `"real"` (presión+caudal reales) | `"real_flow"` (caudal real, presión sim) | `"sim"` | `"fallback"`
@@ -494,16 +509,22 @@ El campo `relay_active` es un bitmask: bit 0 = relay 1, bit 1 = relay 2, etc.
 
 Solo `PROFILE_METEO`. Resolución **240×135 px** (ST7789). Doble buffer con `TFT_eSprite` → sin parpadeo.
 
+Los botones GPIO0/BOOT y GPIO35 ciclan entre las 4 vistas con debounce de 400 ms. Si la pantalla está apagada, el primer toque la reactiva sin cambiar de vista.
+
 ### Pantallas
 
-| Pantalla | Cuándo se muestra |
-|----------|------------------|
-| **Boot** | Primeros segundos del arranque |
-| **Setup AP** | Sin credenciales WiFi — muestra SSID y contraseña del AP |
-| **Meteo** (vista 1) | Funcionamiento normal — sensores meteorológicos en tiempo real |
-| **Pipeline** (vista 2) | Presión y caudal de tubería — alternar con BTN_LEFT / BTN_RIGHT |
+| Pantalla | `displayView` | Cuándo se muestra |
+|----------|:-------------:|------------------|
+| **Boot** | — | Primeros segundos del arranque |
+| **Setup AP** | — | Sin credenciales WiFi — muestra SSID y contraseña del AP |
+| **Meteo** | 0 | Funcionamiento normal — sensores meteorológicos en tiempo real |
+| **Pipeline** | 1 | Presión y caudal de tubería |
+| **Info** | 2 | Versión de firmware, IP, MAC, uptime |
+| **Suelo** | 3 | Datos del sensor Helissense (humedad, temperatura, pH, NPK) |
 
-### Vista Meteo
+Todas las vistas muestran 4 puntos de navegación en la cabecera (posiciones 110/119/128/137 px). El punto de la vista activa se muestra en blanco; los demás en gris.
+
+### Vista Meteo (vista 0)
 
 ```
 ┌──────────────────────────────────────┐
@@ -519,13 +540,13 @@ Solo `PROFILE_METEO`. Resolución **240×135 px** (ST7789). Doble buffer con `TF
 └──────────────────────────────────────┘
 ```
 
-### Vista Pipeline
+### Vista Pipeline (vista 1)
 
-Accesible pulsando cualquier botón cuando la pantalla está encendida. Dos tarjetas anchas (presión / caudal) más una franja inferior con modo, escenario y temperatura del agua:
+Dos tarjetas anchas (presión / caudal) más una franja inferior con modo, escenario y temperatura del agua:
 
 ```
 ┌──────────────────────────────────────┐
-│ PIPELINE            • ●  WiFi  ●      │  ← puntos: vista activa
+│ PIPELINE          •   WiFi  ●         │  ← punto 2 activo
 ├─────────────────────┬────────────────┤
 │ PRESION             │ CAUDAL         │
 │ 3.50 bar            │ 5.00 L/min     │
@@ -538,7 +559,58 @@ Accesible pulsando cualquier botón cuando la pantalla está encendida. Dos tarj
 
 Cuando el sensor XDB401 no está conectado o `pipeline_mode = sim`, los valores se muestran en naranja con badge `[SIM]` y la línea `Taq` desaparece.
 
+### Vista Suelo (vista 3)
+
+Muestra los datos del sensor Helissense RS485. Si el sensor no responde (`halisense_ok = false`), las tarjetas aparecen en rojo con el badge `HALI!`.
+
+```
+┌──────────────────────────────────────┐
+│ SUELO      HALI  WiFi  ●              │  ← HALI verde=OK / rojo=sin respuesta
+├──────────┬──────────┬────────────────┤
+│ HUM.SUELO│ T.SUELO  │ pH             │
+│ 45.2 %   │ 19.5 °C  │ 6.8           │
+├──────────┴──────────┴────────────────┤
+│ N: 42 mg/kg   P: 18 mg/kg   K: 31 mg/kg │
+└──────────────────────────────────────┘
+```
+
 Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (60 s por defecto, configurable vía MQTT `display_timeout_s`).
+
+---
+
+## Sensor de suelo RS485 Helissense
+
+Solo `PROFILE_METEO`. Sensor Modbus RTU conectado por RS485 half-duplex a `Serial2`.
+
+### Hardware y pines
+
+| Señal | GPIO | Notas |
+|-------|:----:|-------|
+| Serial2 RX (DI del sensor) | **13** | NO usar GPIO16 — es TFT_DC |
+| Serial2 TX (RO del sensor) | 17 | |
+| DE/RE (control half-duplex) | 27 | |
+
+> **Advertencia de hardware:** GPIO16 está asignado a TFT_DC por `Setup25_TTGO_T_Display.h`. Si el RX de RS485 se conecta a GPIO16, TFT_eSPI inyecta transiciones falsas en UART2 que corrompen las lecturas del sensor y provocan que los colores de la pantalla cambien aleatoriamente. Conectar siempre el DI del adaptador RS485 a **GPIO13**.
+
+### Protocolo
+
+Modbus RTU a **4800 baud, 8N1**. El firmware lee 7 registros desde la dirección 0x0000 del esclavo 0x01 con validación CRC-16.
+
+| Registro | Magnitud | Resolución |
+|:--------:|----------|:----------:|
+| 0 | Temperatura del suelo (°C) | ÷10 |
+| 1 | Humedad del suelo (%) | ÷10 |
+| 2 | CE — conductividad eléctrica (µS/cm → dS/m ÷1000, TDS ppm ×0.5) | — |
+| 3 | pH | ÷10 |
+| 4 | Nitrógeno N (mg/kg) | directo |
+| 5 | Fósforo P (mg/kg) | directo |
+| 6 | Potasio K (mg/kg) | directo |
+
+### Modo de operación y fallback
+
+- Si Helissense responde (`halisense_ok = true`): `soilMoisture` se toma de `soil_moisture` del sensor RS485.
+- Si Helissense **no responde** (`halisense_ok = false`): `soilMoisture` se toma del sensor analógico YL-69 (ADC GPIO33) como fallback.
+- El firmware marca `soil_irrig_mode = true` cuando algún relay está activo o se está en ventana post-riego; este flag indica que la lectura puede estar sesgada por el agua de riego reciente.
 
 ---
 
@@ -721,6 +793,8 @@ El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`
 |----------|--------|
 | DHT11 lecturas inestables ocasionalmente | Conocido — valorar reemplazar por DHT22 o SHT31 |
 | Temperatura agua XDB401 puede reflejar T ambiente si la tubería está seca | Esperado — documentar en dashboard |
+| **GPIO16 (TFT_DC) no debe usarse como RX de Serial2** | **Resuelto** — Serial2 RX movido a GPIO13. Requiere reconectar el hilo DI del adaptador RS485 de GPIO16 a GPIO13 en el hardware. |
+| GPIO35 sin pull-up interno puede provocar ciclo de vistas espontáneo | **Resuelto** — debounce de 400 ms en la detección de flanco de botón |
 
 ---
 

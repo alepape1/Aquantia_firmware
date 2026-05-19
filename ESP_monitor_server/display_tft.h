@@ -126,9 +126,10 @@ void drawScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("METEOSTATION", 6, 4, 2);
 
-  spr.fillCircle(114, 9, 3, C_TEXT);
-  spr.fillCircle(123, 9, 3, C_LABEL);
-  spr.fillCircle(132, 9, 3, C_LABEL);
+  spr.fillCircle(110, 9, 3, C_TEXT);
+  spr.fillCircle(119, 9, 3, C_LABEL);
+  spr.fillCircle(128, 9, 3, C_LABEL);
+  spr.fillCircle(137, 9, 3, C_LABEL);
 
   uint16_t luxCol = tsl_ok ? C_REAL : C_SIM;
   iconSun(118, 9, luxCol);
@@ -167,9 +168,10 @@ void drawPipelineScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("PIPELINE", 6, 4, 2);
 
-  spr.fillCircle(114, 9, 3, C_LABEL);
-  spr.fillCircle(123, 9, 3, C_TEXT);
-  spr.fillCircle(132, 9, 3, C_LABEL);
+  spr.fillCircle(110, 9, 3, C_LABEL);
+  spr.fillCircle(119, 9, 3, C_TEXT);
+  spr.fillCircle(128, 9, 3, C_LABEL);
+  spr.fillCircle(137, 9, 3, C_LABEL);
 
   if (WiFi.status() == WL_CONNECTED) {
     spr.setTextColor(C_REAL, C_HDR);
@@ -279,9 +281,10 @@ void drawInfoScreen() {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("DISPOSITIVO", 6, 4, 2);
 
-  spr.fillCircle(114, 9, 3, C_LABEL);
-  spr.fillCircle(123, 9, 3, C_LABEL);
-  spr.fillCircle(132, 9, 3, C_TEXT);
+  spr.fillCircle(110, 9, 3, C_LABEL);
+  spr.fillCircle(119, 9, 3, C_LABEL);
+  spr.fillCircle(128, 9, 3, C_TEXT);
+  spr.fillCircle(137, 9, 3, C_LABEL);
 
   if (WiFi.status() == WL_CONNECTED) {
     spr.setTextColor(C_REAL, C_HDR);
@@ -433,16 +436,26 @@ void drawSueloScreen(bool haliOk, float soilMoist, float soilTemp, float soilPh,
   spr.drawString("SUELO", 6, 4, 2);
 
   // Indicadores de vista (4 puntos, el 4º activo)
-  spr.fillCircle(114, 9, 3, C_LABEL);
-  spr.fillCircle(123, 9, 3, C_LABEL);
-  spr.fillCircle(132, 9, 3, C_LABEL);
-  spr.fillCircle(141, 9, 3, C_TEXT);
+  spr.fillCircle(110, 9, 3, C_LABEL);
+  spr.fillCircle(119, 9, 3, C_LABEL);
+  spr.fillCircle(128, 9, 3, C_LABEL);
+  spr.fillCircle(137, 9, 3, C_TEXT);
 
-  // Badge estado Helissense
+  // Estado Helissense — mismo estilo que WiFi en el resto de pantallas
   uint16_t haliCol = haliOk ? C_REAL : C_RED;
-  spr.fillRoundRect(164, 3, 70, 12, 3, haliCol);
-  spr.setTextColor(TFT_BLACK, haliCol);
-  spr.drawCentreString(haliOk ? "HELISSENSE OK" : "HELISSENSE ERR", 199, 5, 1);
+  spr.setTextColor(haliCol, C_HDR);
+  spr.drawString(haliOk ? "HALI" : "HALI!", 152, 5, 1);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    spr.setTextColor(C_REAL, C_HDR);
+    spr.drawString("WiFi", 178, 5, 1);
+  } else {
+    spr.setTextColor(C_RED, C_HDR);
+    spr.drawString("NoWiFi", 167, 5, 1);
+  }
+  uint16_t srvCol2 = lastServerOK ? C_REAL : C_RED;
+  spr.fillCircle(230, 9, 5, srvCol2);
+  spr.drawCircle(230, 9, 5, C_TEXT);
 
   // Fila 0: Humedad, Temp suelo, pH
   drawSoilCard(0, 0, "HUMEDAD",  soilMoist, "%",   haliOk, iconDrop);

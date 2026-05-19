@@ -37,7 +37,8 @@ void halisense_init(uint8_t de_re_pin) {
     _hali_de_re = de_re_pin;
     pinMode(_hali_de_re, OUTPUT);
     digitalWrite(_hali_de_re, LOW);  // modo recepción por defecto
-    Serial2.begin(4800, SERIAL_8N1, 16, 17);  // RX=GPIO16, TX=GPIO17
+    // GPIO16 = TFT_DC en LilyGo T-Display — NO usar como RX → GPIO13
+    Serial2.begin(4800, SERIAL_8N1, 13, 17);  // RX=GPIO13, TX=GPIO17
     delay(100);
 }
 
