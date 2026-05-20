@@ -1248,6 +1248,8 @@ void networkTask(void* pvParameters) {
     // ── Modo MQTT ────────────────────────────────────────────────────────────
     if (!mqttClient.connected()) {
       setLedState(LED_MQTT_CONNECTING);
+      if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
+      esp_task_wdt_reset();
       if (!mqttConnect()) {
         vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
         if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
