@@ -603,9 +603,20 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
     flowLpm = _flowLpm;
     pressureBar = NAN;
     if (!xdb401_ok && millis() >= xdb401_retry_at) {
-      xdb401_ok = xdb401_begin();
-      if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
-      else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+      // Exigir lectura exitosa antes de declarar el sensor recuperado.
+      // Evita el ciclo begin→ok→8 lecturas fallidas→not-ok que genera alertas repetidas
+      // cuando la sonda responde al ping I2C pero no devuelve datos válidos.
+      if (xdb401_begin()) {
+        float _p0, _t0;
+        if (xdb401_read(_p0, _t0)) {
+          xdb401_ok         = true;
+          xdb401_failures   = 0;
+          pressureBar       = _p0;
+          xdb401Temperature = _t0;
+          DLOGLN("[XDB401] Reconectado tras fallo");
+        }
+      }
+      if (!xdb401_ok) xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
     }
     if (xdb401_ok) {
       float p, tc;
@@ -650,9 +661,17 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   // Usar NAN como sentinel permite que lecturas negativas reales (vacío, golpe de ariete) pasen al caller.
   pressureBar = NAN;
   if (!xdb401_ok && millis() >= xdb401_retry_at) {
-    xdb401_ok = xdb401_begin();
-    if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
-    else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+    if (xdb401_begin()) {
+      float _p0, _t0;
+      if (xdb401_read(_p0, _t0)) {
+        xdb401_ok         = true;
+        xdb401_failures   = 0;
+        pressureBar       = _p0;
+        xdb401Temperature = _t0;
+        DLOGLN("[XDB401] Reconectado tras fallo");
+      }
+    }
+    if (!xdb401_ok) xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
   }
   if (xdb401_ok) {
     float p, tc;
@@ -671,9 +690,18 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
 #else
   // Sin caudalímetro: si hay XDB401 devolvemos presión real con caudal 0
   if (!xdb401_ok && millis() >= xdb401_retry_at) {
-    xdb401_ok = xdb401_begin();
-    if (xdb401_ok) { xdb401_failures = 0; DLOGLN("[XDB401] Reconectado tras fallo"); }
-    else            { xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL; }
+    if (xdb401_begin()) {
+      float _p0, _t0;
+      if (xdb401_read(_p0, _t0)) {
+        xdb401_ok         = true;
+        xdb401_failures   = 0;
+        pressureBar       = _p0;
+        xdb401Temperature = _t0;
+        DLOGLN("[XDB401] Reconectado tras fallo");
+        return true;
+      }
+    }
+    if (!xdb401_ok) xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
   }
   if (xdb401_ok) {
     float p, tc;
@@ -1312,12 +1340,22 @@ void networkTask(void* pvParameters) {
         strlcpy(_lastScenario, pipelineScenario, sizeof(_lastScenario));
       }
 
-      // Sensor XDB401: fallo y recuperación
-      if (!xdb401_ok && _lastXdb401Ok)
-        mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
-      else if (xdb401_ok && !_lastXdb401Ok)
-        mqttPublishAlert("sensor_ok",      "info",    "XDB401 recuperado");
-      _lastXdb401Ok = xdb401_ok;
+      // Sensor XDB401: fallo y recuperación — cooldown de 5 min entre alertas repetidas
+      {
+        static unsigned long _xdb401AlertMs = 0;
+        const  unsigned long XDB401_ALERT_COOLDOWN = 300000UL;
+        if (!xdb401_ok && _lastXdb401Ok) {
+          mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
+          _xdb401AlertMs = millis();
+        } else if (!xdb401_ok && !_lastXdb401Ok &&
+                   millis() - _xdb401AlertMs >= XDB401_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
+          _xdb401AlertMs = millis();
+        } else if (xdb401_ok && !_lastXdb401Ok) {
+          mqttPublishAlert("sensor_ok", "info", "XDB401 recuperado");
+        }
+        _lastXdb401Ok = xdb401_ok;
+      }
 
 #if DEVICE_PROFILE == PROFILE_METEO
       // MCP9808

@@ -291,7 +291,8 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | **20 s** \* | `telemetryIntervalMs` | 1 → 0 | Lee todos los sensores I2C → construye `TelemetrySnapshot` → Core 0 envía MQTT o HTTP | Todos |
 | **20 s** | `PIPELINE_SYNC_MS` | 0 | Sincroniza config pipeline desde el servidor | Todos |
 | **15 s** | `XDB401_RETRY_INTERVAL` | 1 | Reintenta `xdb401_begin()` tras 8 fallos consecutivos de lectura | Todos |
-| **10 min** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones | METEO |
+| **10 min** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones (ajustable vía MQTT `display_timeout_s`) | METEO |
+| **3 s / 20 s** | `SOIL_FAST_MS` / `SOIL_SLOW_MS` | 1 | Muestreo adaptativo del sensor RS485: 3 s durante riego activo y en ventana post-riego (2 min); 20 s en reposo | METEO |
 
 \* `telemetryIntervalMs` puede modificarse en tiempo de ejecución mediante MQTT (`telemetry_interval_s`) o HTTP `/api/pipeline/config`. El valor por defecto (y el usado para sincronizar las lecturas I2C) es **20 s**.
 
@@ -328,10 +329,25 @@ Modo de comunicación principal. Activar definiendo `USE_MQTT` en `secrets.h`.
 
 | Topic | Dirección | Cuándo | Contenido |
 |-------|-----------|--------|-----------|
-| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version |
+| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version, device_profile |
 | `aquantia/<finca_id>/telemetry` | ESP → broker | Cada 20s | JSON con todos los campos de sensores |
 | `aquantia/<finca_id>/alerts` | ESP → broker | Edge-triggered | JSON alerta de sensor/pipeline/heap |
-| `aquantia/<finca_id>/cmd` | broker → ESP | Comando | `{"relay":0,"state":true}` / `{"pipeline_mode":"real"}` / `{"irrigation_type":"drip"}` |
+| `aquantia/<finca_id>/cmd` | broker → ESP | Comando | Ver tabla de comandos más abajo |
+
+### Comandos MQTT (topic `cmd`)
+
+Todos los campos son opcionales — se puede enviar solo el subconjunto que se quiere cambiar. Si se incluye `mac`, solo el dispositivo con esa MAC ejecutará el comando.
+
+| Campo | Tipo | Valores | Efecto |
+|-------|------|---------|--------|
+| `mac` | string | `"FC:B4:67:F3:77:48"` | Filtro por MAC — otros dispositivos ignoran el mensaje |
+| `relay` + `state` | int + bool | `{"relay":0,"state":true}` | Activa/desactiva el relay N (índice 0-based). En transición OFF→ON resetea el contador de sesión de caudal |
+| `pipeline_mode` | string | `"real"` / `"sim"` | Cambia modo pipeline |
+| `pipeline_scenario` | string | `"normal"` / `"leak"` / `"burst"` / `"obstruction"` | Fuerza escenario (solo modo sim) |
+| `irrigation_type` | string | `"sprinkler"` / `"drip"` / `"drip_tape"` / `"micro_sprinkler"` | Cambia perfil de riego y reinicia baseline del LeakDetector |
+| `telemetry_interval_s` | int | 5–3600 | Intervalo de publicación de telemetría (segundos) |
+| `config_sync_interval_s` | int | 5–3600 | Intervalo de sincronización de config desde el servidor (segundos) |
+| `display_timeout_s` | int | 0–3600 | Timeout de apagado de pantalla TFT (solo METEO; 0 = nunca apagar) |
 
 ### Payload telemetría (JSON)
 
@@ -375,6 +391,9 @@ Campos presentes en todos los perfiles salvo indicación:
   "pipeline_pressure":        3.50,
   "pipeline_flow":            5.00,
   "flow_total_l":             12.3,
+  "flow_session_l":           3.5,
+  "flow_irrig_l":             11.8,
+  "flow_leak_l":              0.5,
   "pipeline_scenario":        "normal",
   "pipeline_mode":            "real",
   "pipeline_source":          "real",
@@ -411,6 +430,9 @@ Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
 > - `pressure_source`: `"XDB401"` | `"MicroPressure"` | `"BMP280"` | `"SIM"`
 > - `pipeline_source`: `"real"` (presión+caudal reales) | `"real_flow"` (caudal real, presión sim) | `"sim"` | `"fallback"`
 > - `flow_total_l`: litros acumulados desde el último arranque (resolución 100 mL)
+> - `flow_session_l`: litros desde la última apertura de válvula (se resetea en transición OFF→ON del relay)
+> - `flow_irrig_l`: litros acumulados mientras el relay estuvo activo (ciclos de riego)
+> - `flow_leak_l`: litros acumulados mientras el relay estaba cerrado (posibles fugas de fondo)
 > - `xdb401_temperature`: temperatura del fluido medida por el sensor de presión — solo cuando `xdb401_ok = true`
 > - `ts`: timestamp NTP epoch Unix; se omite si el reloj aún no está sincronizado
 
@@ -459,7 +481,7 @@ El firmware publica en `aquantia/<finca_id>/alerts` solo al **cambio de estado**
 
 | `type` | `severity` | Cuándo |
 |--------|-----------|--------|
-| `device_reboot` | info | Al reconectar tras reinicio |
+| `device_reboot` | info | Al reconectar tras reinicio — el campo `message` incluye el motivo de reset (`encendido`, `reinicio SW`, `panic/crash`, `WDT tarea`, `brownout`, etc.) |
 | `mqtt_reconnect` | info | Reconexión al broker (no primer arranque) |
 | `leak` | warning | LeakDetector detecta fuga |
 | `burst` | critical | LeakDetector detecta rotura |
@@ -574,7 +596,7 @@ Muestra los datos del sensor Helissense RS485. Si el sensor no responde (`halise
 └──────────────────────────────────────┘
 ```
 
-Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (60 s por defecto, configurable vía MQTT `display_timeout_s`).
+Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (10 min por defecto, configurable vía MQTT `display_timeout_s`).
 
 ---
 
@@ -611,6 +633,18 @@ Modbus RTU a **4800 baud, 8N1**. El firmware lee 7 registros desde la dirección
 - Si Helissense responde (`halisense_ok = true`): `soilMoisture` se toma de `soil_moisture` del sensor RS485.
 - Si Helissense **no responde** (`halisense_ok = false`): `soilMoisture` se toma del sensor analógico YL-69 (ADC GPIO33) como fallback.
 - El firmware marca `soil_irrig_mode = true` cuando algún relay está activo o se está en ventana post-riego; este flag indica que la lectura puede estar sesgada por el agua de riego reciente.
+
+### Muestreo adaptativo
+
+El sensor no se lee a intervalo fijo. El firmware ajusta la frecuencia según el estado del riego para capturar la evolución de la humedad en tiempo real:
+
+| Estado | Intervalo | Constante |
+|--------|----------:|-----------|
+| Reposo (válvula cerrada, fuera de ventana) | 20 s | `SOIL_SLOW_MS` |
+| Riego activo (relay ON) | 3 s | `SOIL_FAST_MS` |
+| Ventana post-riego (2 min tras cerrar) | 3 s | `SOIL_FAST_MS` |
+
+Al detectar el flanco OFF del relay se inicia la ventana post-riego (`soilPostIrrigEndMs`). Si el riego se reactiva antes de expirar, la ventana se cancela y el intervalo sigue siendo 3 s. Pasados 2 min (`SOIL_POST_IRRIG_MS = 120 000 ms`) sin nuevo riego, el intervalo vuelve a 20 s.
 
 ---
 
@@ -784,6 +818,13 @@ El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`
 | `pipeline_flow_ok` | bool | Caudalímetro real activo |
 | `pipeline_source` | string | `real` / `real_flow` / `sim` / `fallback` |
 | `flow_total_l` | float | Litros acumulados desde arranque (resolución ±100 mL) |
+| `flow_session_l` | float | Litros desde la última apertura de válvula (resetea en OFF→ON) |
+| `flow_irrig_l` | float | Litros acumulados con relay activo (riego) |
+| `flow_leak_l` | float | Litros acumulados con relay cerrado (posible fuga de fondo) |
+
+> **Nota sobre contadores de pulsos:** los cuatro contadores de caudal se acumulan internamente como `uint32_t` (pulsos) para evitar pérdida de precisión float en largos periodos. El backend puede pedir su reset enviando `reset_flow_counters: true` en la respuesta de `/api/pipeline/config`; el firmware los borra y responde con un ACK a `POST /api/flow/reset-ack?mac=<MAC>`.
+
+> **Cambio de perfil:** al cambiar `irrigation_type` (vía MQTT o HTTP), el LeakDetector reinicia su baseline EMA automáticamente, descartando el entrenamiento previo e iniciando un nuevo warm-up de 20 muestras.
 
 ---
 
