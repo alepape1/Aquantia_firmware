@@ -424,6 +424,9 @@ float  soilMoisture      = 0;   // humedad suelo (0=seco, 100=saturado)
 #if DEVICE_PROFILE == PROFILE_METEO
 HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+HalisenseData halisenseData = {};
+SoilSensor    soilSensor(Serial2, 13, 14);      // RX=GPIO13, TX=GPIO14, DE/RE automático (no conectar)
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -1978,6 +1981,9 @@ void setup() {
 #endif
 
   setLedState(LED_WIFI_CONNECTING);
+  DLOGLN("Ajustando potencia WiFi...");
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Potencia ajustada a ~19.5 dBm
+  WiFi.mode(WIFI_STA); // Modo estación, más robusto
   DLOGLN("Conectando WiFi...");
   WiFi.begin(ssid, password);
   int tries = 0;

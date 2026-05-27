@@ -75,27 +75,26 @@ LilyGo TTGO T-Display
 └────────────────────┘
 ```
 
+
 ### Sensor de suelo RS485 — Helissense (Modbus RTU)
 
 Sensor 7-en-1: humedad, temperatura, CE, pH, TDS, N, P, K. Conectado a Serial2 mediante un adaptador RS485 half-duplex TTL.
 
-| Señal | GPIO | Cable del sensor / adaptador RS485 |
-|-------|:----:|------------------------------------|
-| Serial2 RX — DI del adaptador | **13** | Línea de recepción ESP32 ← sensor |
-| Serial2 TX — RO del adaptador | 17 | Línea de transmisión ESP32 → sensor |
-| DE/RE (dirección half-duplex) | 27 | Control de dirección del bus |
+| Perfil      | RX (ESP32) | TX (ESP32) | DE/RE | Notas |
+|------------|:----------:|:----------:|:-----:|-------|
+| METEO      | 13         | 17         | 27    | DE/RE manual (GPIO27) |
+| IRRIGATION | 13         | 14         | —     | DE/RE automático (no conectar) |
 
-> **Conflicto GPIO16:** `TFT_DC = 16` en `Setup25_TTGO_T_Display.h`. TFT_eSPI conmuta este pin en cada transacción SPI. Si se conecta el RX de RS485 a GPIO16, UART2 recibe esas transiciones como datos Modbus falsos → lecturas erróneas + parpadeo de colores en pantalla. Usar siempre **GPIO13** como RX.
+> **Conflicto GPIO16:** `TFT_DC = 16` en `Setup25_TTGO_T_Display.h`. No usar para RX.
 
 ```
-Adaptador RS485 (módulo MAX485 o equivalente)
+Adaptador RS485 (MAX485 o similar)
 ┌───────────┐
 │  VCC ─────┼──► 3.3V
 │  GND ─────┼──► GND
-│  DI  ─────┼──► GPIO17  (TX — ESP32 → sensor)
-│  DE  ─────┼──► GPIO27  (half-duplex HIGH=TX, LOW=RX)
-│  RE  ─────┼──► GPIO27  (unir DE y RE)
+│  DI  ─────┼──► GPIO14  (TX — ESP32 → sensor) [IRRIGATION]
 │  RO  ─────┼──► GPIO13  (RX — sensor → ESP32)
+│  DE/RE  ──┼──► (solo METEO: GPIO27; IRRIGATION: automático, no conectar)
 │  A/B ─────┼──► Bus RS485 al sensor Helissense
 └───────────┘
 ```
@@ -129,6 +128,8 @@ Ajustar en `ESP_monitor_server.ino` según el sensor real:
 | LED estado | 23 | Activo-LOW. Mismos estados que METEO + encendido fijo cuando relay activo |
 | I2C SDA | 21 | Sin sensores en v actual |
 | I2C SCL | 22 | Sin sensores en v actual |
+| RS485 Serial2 RX (DI) | 13 | Helissense sensor suelo — RX (ESP32 ← sensor) |
+| RS485 Serial2 TX (RO) | 14 | Helissense sensor suelo — TX (ESP32 → sensor) |
 
 > Este perfil no tiene sensores meteorológicos ni pantalla. Solo gestiona los 4 relays por MQTT.
 
@@ -145,18 +146,23 @@ El campo `relay_active` en la telemetría y en los comandos es un bitmask de 4 b
 | `8`  | Relay 4 ON (bit 3) |
 | `15` | Los 4 relays ON |
 
+
 ### Diagrama de conexiones
 
 ```
 ESP32 4-Relay Board
-┌────────────────────┐
-│  GPIO32 ───────────┼──► IN1 relay 1 (zona riego 1)
-│  GPIO33 ───────────┼──► IN2 relay 2 (zona riego 2)
-│  GPIO25 ───────────┼──► IN3 relay 3 (zona riego 3)
-│  GPIO26 ───────────┼──► IN4 relay 4 (zona riego 4)
-│  GPIO23 ───────────┼──► LED estado (integrado)
-│  VCC / GND ────────┼──► Alimentación 5 V / GND común
-└────────────────────┘
+┌────────────────────────────┐
+│  GPIO32 ─────────────┼──► IN1 relay 1 (zona riego 1)
+│  GPIO33 ─────────────┼──► IN2 relay 2 (zona riego 2)
+│  GPIO25 ─────────────┼──► IN3 relay 3 (zona riego 3)
+│  GPIO26 ─────────────┼──► IN4 relay 4 (zona riego 4)
+│  GPIO23 ─────────────┼──► LED estado (integrado)
+│  GPIO13 ─────────────┼──► RS485 RO (RX — sensor Helissense → ESP32)
+│  GPIO14 ─────────────┼──► RS485 DI (TX — ESP32 → sensor Helissense)
+│  VCC / GND ──────────┼──► Alimentación 5 V / GND común
+└────────────────────────────┘
+
+*Para módulos MAX485 con DE/RE automático, no conectar ni definir pin de control DE/RE.*
 
 Cada relay:
   COM ──► neutro / positivo de la válvula
