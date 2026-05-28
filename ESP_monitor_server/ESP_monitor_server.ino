@@ -424,9 +424,6 @@ float  soilMoisture      = 0;   // humedad suelo (0=seco, 100=saturado)
 #if DEVICE_PROFILE == PROFILE_METEO
 HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
-#elif DEVICE_PROFILE == PROFILE_IRRIGATION
-HalisenseData halisenseData = {};
-SoilSensor    soilSensor(Serial2, 13, 14);      // RX=GPIO13, TX=GPIO14, DE/RE automático (no conectar)
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -1321,7 +1318,7 @@ void networkTask(void* pvParameters) {
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
       static bool   _lastMicroPressureOk  = true;
 #endif
-#if DEVICE_PROFILE != PROFILE_AQUALEAK
+#if DEVICE_PROFILE == PROFILE_METEO
       static bool   _lastHtuOk            = true;
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
@@ -1386,7 +1383,7 @@ void networkTask(void* pvParameters) {
       _lastMicroPressureOk = micropressure_ok;
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AQUALEAK
+#if DEVICE_PROFILE == PROFILE_METEO
       // HTU2x
       if (!htu_ok && _lastHtuOk)
         mqttPublishAlert("sensor_failure", "warning", "HTU2x sin respuesta — temperatura/humedad interior no disponibles");
@@ -1880,8 +1877,8 @@ void setup() {
   DLOGLN("Qwiic Power Switch — sensores alimentados de forma continua");
 #endif  // PROFILE_AQUALEAK
 
-#if DEVICE_PROFILE != PROFILE_AQUALEAK
-  // HTU2x — omitido en AGROMETEO (dirección 0x40 ocupada por HDC1080)
+#if DEVICE_PROFILE == PROFILE_METEO
+  // HTU2x — omitido en IRRIGATION y AGROMETEO
   htu_ok = htu_begin();
   if (htu_ok) {
     htu_heater_warmup();
@@ -1900,10 +1897,15 @@ void setup() {
     temperatureDHT = sim_tempDHT;
     humidity       = sim_humidity;
   }
-#else
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: sin HTU2x — HDC1080 ya inicializado
   htu_ok         = false;
-  temperatureDHT = sim_tempDHT;  // campo no usado en AGROMETEO
+  temperatureDHT = sim_tempDHT;
+#else
+  // IRRIGATION: sin HTU2x
+  htu_ok         = false;
+  temperatureDHT = sim_tempDHT;
+  humidity       = sim_humidity;
 #endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
@@ -1929,8 +1931,7 @@ void setup() {
   DLOGLN("DHT11 — perfil IRRIGATION, sensor omitido");
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AQUALEAK
-  // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750 inicializado arriba)
+#if DEVICE_PROFILE == PROFILE_METEO
   tsl_ok = tsl_begin();
   if (tsl_ok) {
     DLOGLN("Sensor luz OK");
@@ -1939,8 +1940,12 @@ void setup() {
     DLOGLN("Sensor luz no detectado — modo simulacion");
     lightLevel = sim_light;
   }
-#else
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   tsl_ok = false;  // AGROMETEO usa BH1750, no TSL/APDS
+#else
+  tsl_ok    = false;
+  lightLevel = sim_light;
+  DLOGLN("Sensor luz — perfil IRRIGATION, sensor omitido");
 #endif
 
 #if defined(SOIL_PIN)
@@ -1963,7 +1968,13 @@ void setup() {
     DLOGLN("[WARN] SoilSensor: sin respuesta al arranque — continuando");
 #endif
 
-  DLOGLN("Plataforma: ESP32 (con pantalla TFT)");
+#if DEVICE_PROFILE == PROFILE_METEO
+  DLOGLN("Plataforma: LilyGo TTGO T-Display (con pantalla TFT)");
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  DLOGLN("Plataforma: ESP32 4-Relay Board (sin pantalla)");
+#else
+  DLOGLN("Plataforma: Wemos D1 Mini ESP32 (sin pantalla)");
+#endif
 
   // ── XDB401 — sensor de presión de tubería I2C (todos los perfiles ESP32) ──
   xdb401_ok = xdb401_begin();
@@ -2134,10 +2145,10 @@ void setup() {
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
   DLOGF("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
   DLOGF("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
-#if DEVICE_PROFILE != PROFILE_AQUALEAK
+#if DEVICE_PROFILE == PROFILE_METEO
   DLOGF("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
   DLOGF("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
-#else
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
   DLOGF("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
   DLOGF("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
 #endif
@@ -2319,8 +2330,8 @@ void loop() {
     if (!bar_ok) pressure = sim_pressure;
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AQUALEAK
-    // HTU2x — omitido en AGROMETEO (0x40 = HDC1080)
+#if DEVICE_PROFILE == PROFILE_METEO
+    // HTU2x — omitido en IRRIGATION y AGROMETEO
     // Reintento de reinit si el sensor falló en ciclo anterior
     if (!htu_ok) {
       htu_ok = htu_begin();
@@ -2341,7 +2352,7 @@ void loop() {
       temperatureDHT = sim_tempDHT;
       humidity       = sim_humidity;
     }
-#endif  // PROFILE_AQUALEAK
+#endif  // PROFILE_METEO
 
 #if DEVICE_PROFILE == PROFILE_METEO
     // DHT11
