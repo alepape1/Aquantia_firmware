@@ -110,6 +110,11 @@ bool SoilSensor::sendCommand(const byte *command, size_t length)
     delayMicroseconds(200);                        // allow last stop bit to complete before releasing DE
     if (_dePin >= 0) digitalWrite(_dePin, LOW);   // back to RX
 
+    // Flush TX echo — some RS485 adapters reflect TX bytes back into RX during transmission.
+    // After flush() the last byte is fully shifted out, so the echo is already in the FIFO.
+    delay(2);
+    while (sensorSerial.available()) sensorSerial.read();
+
     uint32_t startTime = millis();
     while (!sensorSerial.available()) {
         if (millis() - startTime > RESPONSE_TIMEOUT_MS) {

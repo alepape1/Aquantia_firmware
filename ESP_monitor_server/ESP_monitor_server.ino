@@ -98,6 +98,11 @@
   #include <DHTesp.h>
   #include "SoilSensor.h"
   #include "halisense_sensor.h"
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  // IRRIGATION: RS485 Helissense soil sensor + Wire básico
+  #include <Wire.h>
+  #include "SoilSensor.h"
+  #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
@@ -424,6 +429,9 @@ float  soilMoisture      = 0;   // humedad suelo (0=seco, 100=saturado)
 #if DEVICE_PROFILE == PROFILE_METEO
 HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+HalisenseData halisenseData = {};
+SoilSensor    soilSensor(Serial2, 13, 14, 27);  // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -848,7 +856,7 @@ struct TelemetrySnapshot {
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
   float dewPoint, heatIndex, absHum;
 #endif
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
   float soilTemp, soilEc, soilPh, soilTds;
   int   soilN, soilP, soilK;
   bool  halisenseOk;
@@ -891,7 +899,7 @@ unsigned long lastScreenTime      = 0;
 unsigned long lastSlowSensorRead   = 0;  // sensores lentos I2C: MCP9808, BMP280, HTU21, DHT, luz, suelo
 unsigned long lastPipelineFastRead = 0;  // XDB401 + caudalímetro: tan rápido como PIPELINE_FAST_MS
 unsigned long lastSensorRead       = 0;  // alias para compatibilidad con el bloque telemetría
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
 unsigned long lastSoilReadMs      = 0;   // último muestreo del sensor de suelo RS485
 unsigned long soilPostIrrigEndMs  = 0;   // millis() cuando se apagó el último relay (0 = inactivo)
 #endif
@@ -1450,7 +1458,7 @@ void networkTask(void* pvParameters) {
       doc["uptime_s"]              = snap.uptime;
       doc["relay_active"]          = snap.relayMask;
       doc["soil_moisture"]         = r1(snap.soil);
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
       doc["halisense_ok"]          = snap.halisenseOk;
       doc["soil_irrig_mode"]       = snap.soilIrrigMode;
       if (snap.halisenseOk) {
@@ -1961,7 +1969,7 @@ void setup() {
   }
 #endif
 
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
   if (soilSensor.begin(4800))
     DLOGLN("SoilSensor RS485 iniciado OK");
   else
@@ -2495,7 +2503,7 @@ void loop() {
 
 // SoilSensor RS485 se lee en su propio bloque adaptativo (fuera del slow block).
     // soilMoisture y halisenseData ya están actualizados por ese bloque.
-    // Aquí solo actualizamos soilMoisture desde YL-69 si halisense no está disponible.
+    // Aquí solo actualizamos soilMoisture desde YL-69 / sim si halisense no está disponible.
 #if DEVICE_PROFILE == PROFILE_METEO
     if (!halisenseData.ok) {
 #  if defined(SOIL_PIN)
@@ -2509,6 +2517,10 @@ void loop() {
       soilMoisture = sim_soilMoisture;
 #  endif
     }
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+    // IRRIGATION: sin YL-69 analógico; soilMoisture viene del halisense o sim
+    if (!halisenseData.ok)
+      soilMoisture = sim_soilMoisture;
 #else
 #  if defined(SOIL_PIN)
     {
@@ -2544,7 +2556,7 @@ void loop() {
       snap.tempDHT11     = temperatureDHT11;
       snap.humDHT11      = humidityDHT11;
       snap.soil          = soilMoisture;
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
       snap.halisenseOk   = halisenseData.ok;
       snap.soilTemp      = halisenseData.ok ? halisenseData.temperature : NAN;
       snap.soilEc        = halisenseData.ok ? halisenseData.ec          : NAN;
@@ -2617,7 +2629,7 @@ void loop() {
   // ── 2c. SoilSensor RS485 — muestreo adaptativo según estado de riego ────────────
   // Rápido (3 s) cuando hay riego activo o en la ventana post-riego (2 min).
   // Lento (20 s) en reposo. Permite detectar si el suelo se está mojando al regar.
-#if DEVICE_PROFILE == PROFILE_METEO
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
   {
     static bool prevRelayOn = false;
     bool relayOn = anyRelayActive();
@@ -2662,7 +2674,7 @@ void loop() {
       }
     }
   }
-#endif  // PROFILE_METEO
+#endif  // HAS_SOIL_SENSOR
 
   // ── 2b. XDB401 + caudalímetro — timer propio a PIPELINE_FAST_MS (200 ms) ────────
   // Independiente de los sensores lentos. En modo real actualiza display, LeakDetector
