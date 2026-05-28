@@ -117,13 +117,7 @@ bool SoilSensor::sendCommand(const byte *command, size_t length)
 
     uint32_t startTime = millis();
     while (!sensorSerial.available()) {
-        if (millis() - startTime > RESPONSE_TIMEOUT_MS) {
-#ifdef DEBUG_MODE
-            Serial.printf("[SOIL] timeout esperando respuesta (%lu ms)\n",
-                          (unsigned long)RESPONSE_TIMEOUT_MS);
-#endif
-            return false;
-        }
+        if (millis() - startTime > RESPONSE_TIMEOUT_MS) return false;
     }
 
     size_t idx = 0;
@@ -136,12 +130,6 @@ bool SoilSensor::sendCommand(const byte *command, size_t length)
             break;
         }
     }
-
-#ifdef DEBUG_MODE
-    Serial.printf("[SOIL] recibidos %u bytes:", (unsigned)idx);
-    for (size_t i = 0; i < idx; i++) Serial.printf(" %02X", readBuffer[i]);
-    Serial.println();
-#endif
 
     return (idx > 0);
 }
@@ -164,19 +152,8 @@ bool SoilSensor::readAllVariables()
 
 bool SoilSensor::processReadingAll()
 {
-    if (readBuffer[0] != 0x01 || readBuffer[1] != 0x03 || readBuffer[2] != 0x0E) {
-#ifdef DEBUG_MODE
-        Serial.printf("[SOIL] cabecera inesperada: %02X %02X %02X (esperado 01 03 0E)\n",
-                      readBuffer[0], readBuffer[1], readBuffer[2]);
-#endif
-        return false;
-    }
-    if (!validateCRC(readBuffer, 19)) {
-#ifdef DEBUG_MODE
-        Serial.println("[SOIL] CRC invalido");
-#endif
-        return false;
-    }
+    if (readBuffer[0] != 0x01 || readBuffer[1] != 0x03 || readBuffer[2] != 0x0E) return false;
+    if (!validateCRC(readBuffer, 19)) return false;
 
     auto readWord = [&](size_t offset) -> uint16_t {
         return ((uint16_t)readBuffer[offset] << 8) | readBuffer[offset + 1];
