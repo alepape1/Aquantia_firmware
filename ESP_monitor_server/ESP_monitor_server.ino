@@ -1326,13 +1326,19 @@ void networkTask(void* pvParameters) {
         snprintf(msg, sizeof(msg), "Dispositivo reiniciado: %s", g_rebootReason);
         mqttPublishAlert("device_reboot", "info", msg);
       } else {
-        mqttPublishAlert("mqtt_reconnect", "info", "Dispositivo reconectado al broker MQTT");
+        static unsigned long _mqttReconnectAlertMs = 0;
+        if (millis() - _mqttReconnectAlertMs >= 600000UL) {  // máx 1 alerta cada 10 min
+          mqttPublishAlert("mqtt_reconnect", "info", "Dispositivo reconectado al broker MQTT");
+          _mqttReconnectAlertMs = millis();
+        }
       }
     }
     mqttClient.loop();
 
     // ── Alarmas MQTT — solo al cambio de estado (no spamear cada ciclo) ──────
     {
+      static const unsigned long SENSOR_ALERT_COOLDOWN = 43200000UL;  // 12 h entre alertas repetidas del mismo sensor
+
       static char   _lastScenario[16] = "normal";
       static bool   _lastXdb401Ok         = true;
       static bool   _lastHeapWarn         = false;
@@ -1384,53 +1390,124 @@ void networkTask(void* pvParameters) {
 
 #if DEVICE_PROFILE == PROFILE_METEO
       // MCP9808
-      if (!mcp_ok && _lastMcpOk)
-        mqttPublishAlert("sensor_failure", "warning", "MCP9808 sin respuesta — temperatura exterior no disponible");
-      else if (mcp_ok && !_lastMcpOk)
-        mqttPublishAlert("sensor_ok",      "info",    "MCP9808 recuperado");
-      _lastMcpOk = mcp_ok;
+      {
+        static unsigned long _mcpAlertMs = 0;
+        if (!mcp_ok && _lastMcpOk) {
+          mqttPublishAlert("sensor_failure", "warning", "MCP9808 sin respuesta — temperatura exterior no disponible");
+          _mcpAlertMs = millis();
+        } else if (!mcp_ok && !_lastMcpOk && millis() - _mcpAlertMs >= SENSOR_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "MCP9808 sin respuesta — temperatura exterior no disponible");
+          _mcpAlertMs = millis();
+        } else if (mcp_ok && !_lastMcpOk) {
+          mqttPublishAlert("sensor_ok", "info", "MCP9808 recuperado");
+        }
+        _lastMcpOk = mcp_ok;
+      }
 
       // BMP280
-      if (!bmp_ok && _lastBmpOk)
-        mqttPublishAlert("sensor_failure", "warning", "BMP280 sin respuesta — temperatura/presion barometrica no disponibles");
-      else if (bmp_ok && !_lastBmpOk)
-        mqttPublishAlert("sensor_ok",      "info",    "BMP280 recuperado");
-      _lastBmpOk = bmp_ok;
-
+      {
+        static unsigned long _bmpAlertMs = 0;
+        if (!bmp_ok && _lastBmpOk) {
+          mqttPublishAlert("sensor_failure", "warning", "BMP280 sin respuesta — temperatura/presion barometrica no disponibles");
+          _bmpAlertMs = millis();
+        } else if (!bmp_ok && !_lastBmpOk && millis() - _bmpAlertMs >= SENSOR_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "BMP280 sin respuesta — temperatura/presion barometrica no disponibles");
+          _bmpAlertMs = millis();
+        } else if (bmp_ok && !_lastBmpOk) {
+          mqttPublishAlert("sensor_ok", "info", "BMP280 recuperado");
+        }
+        _lastBmpOk = bmp_ok;
+      }
 #endif
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
       // MicroPressure
-      if (!micropressure_ok && _lastMicroPressureOk)
-        mqttPublishAlert("sensor_failure", "warning", "MicroPressure sin respuesta — barometro no disponible");
-      else if (micropressure_ok && !_lastMicroPressureOk)
-        mqttPublishAlert("sensor_ok",      "info",    "MicroPressure recuperado");
-      _lastMicroPressureOk = micropressure_ok;
+      {
+        static unsigned long _mpAlertMs = 0;
+        if (!micropressure_ok && _lastMicroPressureOk) {
+          mqttPublishAlert("sensor_failure", "warning", "MicroPressure sin respuesta — barometro no disponible");
+          _mpAlertMs = millis();
+        } else if (!micropressure_ok && !_lastMicroPressureOk && millis() - _mpAlertMs >= SENSOR_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "MicroPressure sin respuesta — barometro no disponible");
+          _mpAlertMs = millis();
+        } else if (micropressure_ok && !_lastMicroPressureOk) {
+          mqttPublishAlert("sensor_ok", "info", "MicroPressure recuperado");
+        }
+        _lastMicroPressureOk = micropressure_ok;
+      }
 #endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
       // HTU2x
-      if (!htu_ok && _lastHtuOk)
-        mqttPublishAlert("sensor_failure", "warning", "HTU2x sin respuesta — temperatura/humedad interior no disponibles");
-      else if (htu_ok && !_lastHtuOk)
-        mqttPublishAlert("sensor_ok",      "info",    "HTU2x recuperado");
-      _lastHtuOk = htu_ok;
+      {
+        static unsigned long _htuAlertMs = 0;
+        if (!htu_ok && _lastHtuOk) {
+          mqttPublishAlert("sensor_failure", "warning", "HTU2x sin respuesta — temperatura/humedad interior no disponibles");
+          _htuAlertMs = millis();
+        } else if (!htu_ok && !_lastHtuOk && millis() - _htuAlertMs >= SENSOR_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "HTU2x sin respuesta — temperatura/humedad interior no disponibles");
+          _htuAlertMs = millis();
+        } else if (htu_ok && !_lastHtuOk) {
+          mqttPublishAlert("sensor_ok", "info", "HTU2x recuperado");
+        }
+        _lastHtuOk = htu_ok;
+      }
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
       // HDC1080
-      if (!hdc_ok && _lastHdcOk)
-        mqttPublishAlert("sensor_failure", "warning", "HDC1080 sin respuesta — temperatura/humedad no disponibles");
-      else if (hdc_ok && !_lastHdcOk)
-        mqttPublishAlert("sensor_ok",      "info",    "HDC1080 recuperado");
-      _lastHdcOk = hdc_ok;
+      {
+        static unsigned long _hdcAlertMs = 0;
+        if (!hdc_ok && _lastHdcOk) {
+          mqttPublishAlert("sensor_failure", "warning", "HDC1080 sin respuesta — temperatura/humedad no disponibles");
+          _hdcAlertMs = millis();
+        } else if (!hdc_ok && !_lastHdcOk && millis() - _hdcAlertMs >= SENSOR_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "HDC1080 sin respuesta — temperatura/humedad no disponibles");
+          _hdcAlertMs = millis();
+        } else if (hdc_ok && !_lastHdcOk) {
+          mqttPublishAlert("sensor_ok", "info", "HDC1080 recuperado");
+        }
+        _lastHdcOk = hdc_ok;
+      }
 
       // BH1750
-      if (!bh1750_ok && _lastBh1750Ok)
-        mqttPublishAlert("sensor_failure", "warning", "BH1750 sin respuesta — luz ambiental no disponible");
-      else if (bh1750_ok && !_lastBh1750Ok)
-        mqttPublishAlert("sensor_ok",      "info",    "BH1750 recuperado");
-      _lastBh1750Ok = bh1750_ok;
+      {
+        static unsigned long _bh1750AlertMs = 0;
+        if (!bh1750_ok && _lastBh1750Ok) {
+          mqttPublishAlert("sensor_failure", "warning", "BH1750 sin respuesta — luz ambiental no disponible");
+          _bh1750AlertMs = millis();
+        } else if (!bh1750_ok && !_lastBh1750Ok && millis() - _bh1750AlertMs >= SENSOR_ALERT_COOLDOWN) {
+          mqttPublishAlert("sensor_failure", "warning", "BH1750 sin respuesta — luz ambiental no disponible");
+          _bh1750AlertMs = millis();
+        } else if (bh1750_ok && !_lastBh1750Ok) {
+          mqttPublishAlert("sensor_ok", "info", "BH1750 recuperado");
+        }
+        _lastBh1750Ok = bh1750_ok;
+      }
+#endif
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+      // Suelo muy seco
+      {
+        static const float SOIL_DRY_THRESHOLD = 20.0f;  // % — por debajo = suelo seco
+        static bool        _lastSoilDry   = false;
+        static unsigned long _soilDryAlertMs = 0;
+        bool soilDry = (soilMoisture < SOIL_DRY_THRESHOLD);
+        if (soilDry && !_lastSoilDry) {
+          char msg[64];
+          snprintf(msg, sizeof(msg), "Suelo muy seco — humedad %.1f%% (umbral %.0f%%)", soilMoisture, SOIL_DRY_THRESHOLD);
+          mqttPublishAlert("soil_dry", "warning", msg);
+          _soilDryAlertMs = millis();
+        } else if (soilDry && _lastSoilDry && millis() - _soilDryAlertMs >= SENSOR_ALERT_COOLDOWN) {
+          char msg[64];
+          snprintf(msg, sizeof(msg), "Suelo muy seco — humedad %.1f%% (umbral %.0f%%)", soilMoisture, SOIL_DRY_THRESHOLD);
+          mqttPublishAlert("soil_dry", "warning", msg);
+          _soilDryAlertMs = millis();
+        } else if (!soilDry && _lastSoilDry) {
+          mqttPublishAlert("soil_ok", "info", "Humedad del suelo recuperada");
+        }
+        _lastSoilDry = soilDry;
+      }
 #endif
 
       // Heap bajo (< 30 KB)
