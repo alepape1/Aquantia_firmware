@@ -1226,6 +1226,7 @@ void networkTask(void* pvParameters) {
   static unsigned long lastNtpRetry     = 0;
   static unsigned long wifiRetryDelayMs  = 500;
   static unsigned long wifiStableSince   = 0;  // millis() al reconectar
+  static int           wifiFailCount     = 0;
 
 #ifdef USE_MQTT
   static unsigned long mqttRetryDelayMs = 2000;
@@ -1255,11 +1256,27 @@ void networkTask(void* pvParameters) {
     if (WiFi.status() != WL_CONNECTED) {
       setLedState(LED_WIFI_CONNECTING);
       wifiStableSince = 0;
-      WiFi.reconnect();
+      wifiFailCount++;
+
+      if (wifiFailCount >= 60) {
+        // ~5 min sin conectar — reinicio total del dispositivo
+        esp_restart();
+      } else if (wifiFailCount % 10 == 0) {
+        // Cada 10 fallos: reset completo del stack WiFi (WiFi.reconnect() no sale de stack hung)
+        WiFi.disconnect(true);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        WiFi.mode(WIFI_STA);
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+        WiFi.begin(ssid, password);
+      } else {
+        WiFi.reconnect();
+      }
+
       vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
-      if (wifiRetryDelayMs < 5000) wifiRetryDelayMs *= 2;
+      if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
       continue;
     }
+    wifiFailCount = 0;
     // Resetear backoff solo tras 10s de conexión estable (evita martillear el AP)
     if (wifiStableSince == 0) wifiStableSince = millis();
     if (millis() - wifiStableSince > 10000) wifiRetryDelayMs = 500;
