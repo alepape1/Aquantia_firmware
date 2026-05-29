@@ -1266,7 +1266,7 @@ void networkTask(void* pvParameters) {
         WiFi.disconnect(true);
         vTaskDelay(pdMS_TO_TICKS(1000));
         WiFi.mode(WIFI_STA);
-        WiFi.setTxPower(WIFI_POWER_18dBm);
+        WiFi.setTxPower(WIFI_POWER_18_5dBm);
         WiFi.begin(ssid, password);
       } else {
         WiFi.reconnect();
@@ -1371,15 +1371,14 @@ void networkTask(void* pvParameters) {
         strlcpy(_lastScenario, pipelineScenario, sizeof(_lastScenario));
       }
 
-      // Sensor XDB401: fallo y recuperación — cooldown de 5 min entre alertas repetidas
+      // Sensor XDB401: fallo y recuperación
       {
         static unsigned long _xdb401AlertMs = 0;
-        const  unsigned long XDB401_ALERT_COOLDOWN = 300000UL;
         if (!xdb401_ok && _lastXdb401Ok) {
           mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
           _xdb401AlertMs = millis();
         } else if (!xdb401_ok && !_lastXdb401Ok &&
-                   millis() - _xdb401AlertMs >= XDB401_ALERT_COOLDOWN) {
+                   millis() - _xdb401AlertMs >= SENSOR_ALERT_COOLDOWN) {
           mqttPublishAlert("sensor_failure", "warning", "XDB401 sin respuesta — presion no disponible");
           _xdb401AlertMs = millis();
         } else if (xdb401_ok && !_lastXdb401Ok) {
@@ -1489,7 +1488,7 @@ void networkTask(void* pvParameters) {
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
       // Suelo muy seco
       {
-        static const float SOIL_DRY_THRESHOLD = 20.0f;  // % — por debajo = suelo seco
+        static const float SOIL_DRY_THRESHOLD = 30.0f;  // % — por debajo = suelo seco
         static bool        _lastSoilDry   = false;
         static unsigned long _soilDryAlertMs = 0;
         bool soilDry = (soilMoisture < SOIL_DRY_THRESHOLD);
@@ -2095,7 +2094,7 @@ void setup() {
 
   setLedState(LED_WIFI_CONNECTING);
   DLOGLN("Ajustando potencia WiFi...");
-  WiFi.setTxPower(WIFI_POWER_18dBm); // Potencia ajustada a ~18 dBm
+  WiFi.setTxPower(WIFI_POWER_18_5dBm); // Potencia ajustada a ~18.5 dBm
   WiFi.mode(WIFI_STA); // Modo estación, más robusto
   DLOGLN("Conectando WiFi...");
   WiFi.begin(ssid, password);
