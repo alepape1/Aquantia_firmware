@@ -1266,7 +1266,7 @@ void networkTask(void* pvParameters) {
         WiFi.disconnect(true);
         vTaskDelay(pdMS_TO_TICKS(1000));
         WiFi.mode(WIFI_STA);
-        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+        WiFi.setTxPower(WIFI_POWER_18dBm);
         WiFi.begin(ssid, password);
       } else {
         WiFi.reconnect();
@@ -2095,7 +2095,7 @@ void setup() {
 
   setLedState(LED_WIFI_CONNECTING);
   DLOGLN("Ajustando potencia WiFi...");
-  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Potencia ajustada a ~19.5 dBm
+  WiFi.setTxPower(WIFI_POWER_18dBm); // Potencia ajustada a ~18 dBm
   WiFi.mode(WIFI_STA); // Modo estación, más robusto
   DLOGLN("Conectando WiFi...");
   WiFi.begin(ssid, password);
