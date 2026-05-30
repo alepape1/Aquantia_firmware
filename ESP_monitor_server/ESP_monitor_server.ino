@@ -68,6 +68,13 @@
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
   #define FLOW_K_FACTOR   288   // YF-B9 calibrado — 288 p/L (medido: ~9 L / 2678 pulsos)
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  #define FLOW_PIN         34   // Caudalímetro — GPIO34, ADC1_CH6, solo entrada (no usar como salida)
+  // K factor según modelo (sin calibrar — ajustar empíricamente con el caudalímetro instalado):
+  //   YF-S201 → 450 p/L  (F = 7.5·Q Hz)
+  //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)  ← nominal datasheet
+  //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
+  #define FLOW_K_FACTOR   660   // YF-B4 — usar mismo valor calibrado que METEO hasta nueva calibración
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   #define HAS_DISPLAY
@@ -99,10 +106,13 @@
   #include "SoilSensor.h"
   #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
-  // IRRIGATION: RS485 Helissense soil sensor + Wire básico
+  // IRRIGATION: RS485 Helissense + INA219 + AHT20 + BMP280
   #include <Wire.h>
+  #include <Adafruit_BMP280.h>
   #include "SoilSensor.h"
   #include "halisense_sensor.h"
+  #include "aht20_driver.h"
+  #include "ina219_driver.h"
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AGROMETEO: CJMCU-14 (BH1750 + HDC1080 + BMP280) + Qwiic Power Switch + MicroPressure
   #include <Wire.h>
@@ -228,6 +238,8 @@ const char* mqtt_pass   = MQTT_PASS;
   BH1750                 bh1750;
   QWIIC_POWER            qwiic_ps;
   SparkFun_MicroPressure barometer;
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  Adafruit_BMP280        bmp280;
 #endif
 
 #ifdef HAS_DISPLAY
@@ -287,6 +299,10 @@ bool hdc_ok        = false;   // HDC1080 — temperatura y humedad primaria
 bool bh1750_ok     = false;   // BH1750  — iluminancia
 bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
 static uint8_t bmp280_addr = 0x00;
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+bool aht20_ok  = false;   // AHT20  — temperatura y humedad ambiente (I2C 0x38)
+bool ina219_ok = false;   // INA219 — voltaje / corriente / potencia  (I2C 0x40)
+static uint8_t bmp280_addr = 0x00;
 #endif
 bool tsl_ok   = false;
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
@@ -295,7 +311,7 @@ static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar re
 static constexpr uint8_t  XDB401_MAX_FAILURES  = 8;    // más tolerante con cable largo (~1 m)
 static constexpr uint32_t XDB401_RETRY_INTERVAL = 15000UL;  // reintento más rápido tras recovery
 
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK || DEVICE_PROFILE == PROFILE_IRRIGATION
 static bool beginBMP280() {
   if (bmp280.begin(0x76)) {
     bmp280_addr = 0x76;
@@ -396,6 +412,9 @@ static const char* temperatureSourceName() {
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (hdc_ok) return "HDC1080";
   if (bmp_temp_ok) return "BMP280";
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  if (aht20_ok) return "AHT20";
+  if (bmp_temp_ok) return "BMP280";
 #endif
   return "SIM";
 }
@@ -408,6 +427,8 @@ static const char* pressureSourceName() {
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (micropressure_ok) return "MicroPressure";
   if (bmp_pressure_ok)  return "BMP280";
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  if (bmp_pressure_ok) return "BMP280";
 #endif
   return "SIM";
 }
@@ -421,6 +442,11 @@ float  humidityDHT11     = 0;   // DHT11 humedad
 float  bmpTemperature    = NAN; // BMP280 temperatura directa
 float  bmpPressure       = NAN; // BMP280 presión directa en kPa
 double pressure          = 0;
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+float  ina219BusVoltage = NAN;  // INA219 voltaje bus (V)
+float  ina219Current    = NAN;  // INA219 corriente (mA)
+float  ina219Power      = NAN;  // INA219 potencia (mW)
+#endif
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
@@ -431,7 +457,7 @@ HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
 HalisenseData halisenseData = {};
-SoilSensor    soilSensor(Serial2, 13, 14, 27);  // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
+SoilSensor    soilSensor(Serial2, 13, 14, 27);   // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -861,6 +887,9 @@ struct TelemetrySnapshot {
   int   soilN, soilP, soilK;
   bool  halisenseOk;
   bool  soilIrrigMode;  // true si la lectura fue tomada en riego o ventana post-riego
+#endif
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+  float inaVbus, inaCurrent, inaPower;  // INA219
 #endif
 } _netSnap;
 
@@ -1525,8 +1554,8 @@ void networkTask(void* pvParameters) {
       auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
       auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
 
-      // Payload ampliado con métricas explícitas del BMP280.
-      StaticJsonDocument<1280> doc;
+      // Payload ampliado con métricas explícitas del BMP280 e INA219 (IRRIGATION).
+      StaticJsonDocument<1536> doc;
       doc["temperature"]           = r2(snap.tempMCP);
       doc["pressure"]              = r2(snap.pressure);
       doc["temperature_barometer"] = r2(snap.tempDHT);
@@ -1591,6 +1620,13 @@ void networkTask(void* pvParameters) {
       if (!isnan(snap.dewPoint))   doc["dew_point"]    = r1(snap.dewPoint);
       if (!isnan(snap.heatIndex))  doc["heat_index"]   = r1(snap.heatIndex);
       if (!isnan(snap.absHum))     doc["abs_humidity"] = r2(snap.absHum);
+#endif
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+      doc["aht20_ok"]  = aht20_ok;
+      doc["ina219_ok"] = ina219_ok;
+      if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"] = r2(snap.inaVbus);
+      if (!isnan(snap.inaCurrent)) doc["ina219_current_ma"]  = r1(snap.inaCurrent);
+      if (!isnan(snap.inaPower))   doc["ina219_power_mw"]    = r1(snap.inaPower);
 #endif
       // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
       // El backend lo usa como timestamp real de la medición en lugar de NOW().
@@ -1899,10 +1935,66 @@ void setup() {
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   DLOGLN("MCP9808 — perfil AGROMETEO, sensor omitido");
   DLOGLN("BMP280 y MicroPressure — inicializados en bloque AGROMETEO");
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  // ── IRRIGATION: BMP280 + AHT20 + INA219 ─────────────────────────────────
+  mcp_ok = false;  // MCP9808 no presente en este perfil
+
+  // BMP280 — temperatura ambiente + presión atmosférica
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                      Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16,
+                      Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_500);
+    float tBmp = NAN, pBmp = NAN;
+    bmp_temp_ok     = readBMP280Temperature(tBmp);
+    bmp_pressure_ok = readBMP280PressureKPa(pBmp);
+    if (bmp_temp_ok)     bmpTemperature = tBmp;
+    if (bmp_pressure_ok) { bmpPressure = pBmp; pressure = pBmp; bar_ok = true; }
+    DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
+  } else {
+    bmp_temp_ok = bmp_pressure_ok = false;
+    DLOGLN("BMP280 no detectado — modo simulacion");
+  }
+
+  // AHT20 — temperatura y humedad ambiente
+  aht20_ok = aht20_begin();
+  if (aht20_ok) {
+    float t = NAN, h = NAN;
+    if (aht20_read(t, h)) {
+      temperatureMCP = t;
+      humidity       = h;
+      temp_ok        = true;
+      DLOGF("AHT20 OK — T:%.1f C  H:%.1f %%\n", t, h);
+    } else {
+      aht20_ok = false;
+    }
+  }
+  if (!aht20_ok) {
+    DLOGLN("AHT20 no detectado — modo simulacion");
+    if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+    else             { temperatureMCP = sim_tempMCP; }
+    humidity = sim_humidity;
+  }
+
+  // INA219 — voltaje / corriente / potencia
+  ina219_ok = ina219_begin();
+  if (ina219_ok) {
+    ina219BusVoltage = ina219_readBusVoltage();
+    ina219Current    = ina219_readCurrent_mA();
+    ina219Power      = ina219_readPower_mW();
+    DLOGF("INA219 OK — Vbus:%.2f V  I:%.1f mA  P:%.1f mW\n",
+          ina219BusVoltage, ina219Current, ina219Power);
+  } else {
+    DLOGLN("INA219 no detectado");
+  }
+
+  DLOGF("Sensores activos → TempEnv:%s | Presion:%s\n",
+    temperatureSourceName(), pressureSourceName());
 #else
-  DLOGLN("MCP9808 — perfil IRRIGATION, sensor omitido");
-  DLOGLN("BMP280 — perfil IRRIGATION, sensor omitido");
-  DLOGLN("Barometro — perfil IRRIGATION, sensor omitido");
+  // Perfil desconocido — sin sensores I2C meteo
+  DLOGLN("Perfil desconocido — sensores meteo omitidos");
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
@@ -2580,6 +2672,78 @@ void loop() {
 
 #endif  // PROFILE_AQUALEAK
 
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+    // ── IRRIGATION: BMP280 + AHT20 + INA219 ─────────────────────────────────
+
+    // BMP280 — temperatura + presión atmosférica
+    if (!bmp_ok) {
+      bmp_ok = beginBMP280();
+      if (bmp_ok) {
+        bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                          Adafruit_BMP280::SAMPLING_X2,
+                          Adafruit_BMP280::SAMPLING_X16,
+                          Adafruit_BMP280::FILTER_X16,
+                          Adafruit_BMP280::STANDBY_MS_500);
+        DLOGLN("[BMP280] Reconectado tras fallo");
+      }
+    }
+    bmp_temp_ok = bmp_pressure_ok = false;
+    if (bmp_ok) {
+      float tBmp = NAN, pBmp = NAN;
+      if (readBMP280Temperature(tBmp)) { bmpTemperature = tBmp; bmp_temp_ok = true; }
+      if (readBMP280PressureKPa(pBmp)) {
+        bmpPressure = pBmp; bmp_pressure_ok = true;
+        pressure = pBmp; bar_ok = true;
+      }
+      if (!bmp_temp_ok && !bmp_pressure_ok) {
+        bmp_ok = false;
+        DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!bmp_pressure_ok) { bar_ok = false; pressure = sim_pressure; }
+
+    // AHT20 — temperatura y humedad
+    if (!aht20_ok) {
+      aht20_ok = aht20_begin();
+      if (aht20_ok) DLOGLN("[AHT20] Reconectado tras fallo");
+    }
+    if (aht20_ok) {
+      float t = NAN, h = NAN;
+      if (aht20_read(t, h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+      } else {
+        aht20_ok = false;
+        DLOGLN("AHT20 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!aht20_ok) {
+      if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+      else             { temperatureMCP = sim_tempMCP; temp_ok = false; }
+      humidity = sim_humidity;
+    }
+
+    // INA219 — voltaje / corriente / potencia
+    if (!ina219_ok) {
+      ina219_ok = ina219_begin();
+      if (ina219_ok) DLOGLN("[INA219] Reconectado tras fallo");
+    }
+    if (ina219_ok) {
+      float v = ina219_readBusVoltage();
+      float c = ina219_readCurrent_mA();
+      float p = ina219_readPower_mW();
+      if (!isnan(v)) ina219BusVoltage = v;
+      if (!isnan(c)) ina219Current    = c;
+      if (!isnan(p)) ina219Power      = p;
+      if (isnan(v) && isnan(c)) { ina219_ok = false; DLOGLN("INA219 fallo en lectura"); }
+    }
+
+    DLOGF("[IRRIG] AHT:T=%.1f H=%.1f%%  BMP:T=%.1f P=%.2fkPa  INA:V=%.2f I=%.1fmA P=%.1fmW\n",
+      temperatureMCP, humidity, bmpTemperature, (float)pressure,
+      ina219BusVoltage, ina219Current, ina219Power);
+#endif  // PROFILE_IRRIGATION
+
 #if DEVICE_PROFILE != PROFILE_AQUALEAK
     // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750)
     if (tsl_ok) {
@@ -2664,6 +2828,11 @@ void loop() {
 #endif
       snap.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
       snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+      snap.inaVbus    = ina219_ok ? ina219BusVoltage : NAN;
+      snap.inaCurrent = ina219_ok ? ina219Current    : NAN;
+      snap.inaPower   = ina219_ok ? ina219Power      : NAN;
+#endif
       snap.pipePressure  = sim_pipeline_pressure;
       snap.pipeFlow      = sim_pipeline_flow;
 #if defined(FLOW_PIN)
