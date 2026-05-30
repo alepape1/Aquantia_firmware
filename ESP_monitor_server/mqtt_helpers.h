@@ -87,6 +87,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     updatePipelineValues();
     DLOGF("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode, pipelineScenario);
   }
+
+#if defined(FLOW_PIN)
+  if (doc["reset_flow_counters"] | false) {
+    portENTER_CRITICAL(&_flowMux);
+    _flowIrrigPulses  = 0;
+    _flowLeakPulses   = 0;
+    _flowSessionBase  = _flowPulseTotal;
+    portEXIT_CRITICAL(&_flowMux);
+    DLOGLN("[FLOW] Contadores reseteados por MQTT");
+    mqttPublishAlert("flow_counters_reset", "info", "Contadores de flujo reseteados");
+  }
+#endif
 }
 
 // Conectar al broker y suscribirse al topic de comandos
@@ -101,6 +113,7 @@ bool mqttConnect() {
     snprintf(client_id, sizeof(client_id), "aquantia-%s", device_serial_get());
   }
 
+  mqttClient.setKeepAlive(60);
   bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
   if (ok) {
     char cmd_topic[64];

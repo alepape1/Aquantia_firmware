@@ -1341,11 +1341,13 @@ void networkTask(void* pvParameters) {
     }
 #endif
 
+#ifndef USE_MQTT
     if (lastScenarioSync == 0 || now - lastScenarioSync >= configSyncIntervalMs) {
       wdt_heartbeat("NetworkTask", "scenario_sync");
       syncPipelineScenario();
       lastScenarioSync = now;
     }
+#endif
 
 #ifdef USE_MQTT
     // ── Modo MQTT ────────────────────────────────────────────────────────────
