@@ -216,9 +216,7 @@ const char* mqtt_pass   = MQTT_PASS;
 // No tiene sentido bajar más: el sensor completo necesita 60 ms mínimo según datasheet.
 #define PIPELINE_FAST_MS  200UL
 
-// Intervalos de muestreo del sensor de suelo RS485 (PROFILE_METEO)
-#define SOIL_FAST_MS        3000UL    // durante riego activo y ventana post-riego
-#define SOIL_SLOW_MS       20000UL    // reposo normal
+// Intervalos de muestreo del sensor de suelo RS485 — configurables en runtime vía MQTT/HTTP
 #define SOIL_POST_IRRIG_MS 120000UL   // ventana de absorción tras apagar riego (2 min)
 
 #ifdef HAS_DISPLAY
@@ -558,6 +556,10 @@ IrrigationType irrigationType = IRRIG_SPRINKLER;  // perfil de riego activo (con
 LeakDetector   leakDetector;                       // detector automático de fugas (solo modo real)
 unsigned long telemetryIntervalMs  = 20000UL;
 unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+unsigned long soilFastIntervalMs   = 3000UL;    // durante riego activo y ventana post-riego
+unsigned long soilSlowIntervalMs   = 20000UL;   // reposo normal
+#endif
 #ifdef HAS_DISPLAY
 unsigned long displayTimeoutMs     = DISPLAY_TIMEOUT_MS;
 #endif
@@ -1138,6 +1140,16 @@ void syncPipelineScenario() {
           DLOGF("[PIPE] Sync config → %lds\n", nextSync);
         }
       }
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+      {
+        long nextSoilFast = doc["soil_fast_interval_s"] | (long)(soilFastIntervalMs / 1000UL);
+        long nextSoilSlow = doc["soil_slow_interval_s"] | (long)(soilSlowIntervalMs / 1000UL);
+        if (nextSoilFast >= 3 && nextSoilFast <= 300)
+          soilFastIntervalMs = (unsigned long)nextSoilFast * 1000UL;
+        if (nextSoilSlow >= 20 && nextSoilSlow <= 3600)
+          soilSlowIntervalMs = (unsigned long)nextSoilSlow * 1000UL;
+      }
+#endif
 #ifdef HAS_DISPLAY
       if (nextDisplay >= 0 && nextDisplay <= 3600) {
         unsigned long nextMs = (unsigned long)nextDisplay * 1000UL;
@@ -2937,12 +2949,12 @@ void loop() {
     if (relayOn) soilPostIrrigEndMs = 0;
     prevRelayOn = relayOn;
 
-    unsigned long soilInterval = SOIL_SLOW_MS;
+    unsigned long soilInterval = soilSlowIntervalMs;
     if (relayOn) {
-      soilInterval = SOIL_FAST_MS;
+      soilInterval = soilFastIntervalMs;
     } else if (soilPostIrrigEndMs != 0) {
       if (now - soilPostIrrigEndMs < SOIL_POST_IRRIG_MS)
-        soilInterval = SOIL_FAST_MS;
+        soilInterval = soilFastIntervalMs;
       else
         soilPostIrrigEndMs = 0;  // ventana expirada
     }

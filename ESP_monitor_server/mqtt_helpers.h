@@ -10,7 +10,7 @@
 // Callback para comandos entrantes en aquantia/<finca_id>/cmd
 // Payload esperado: {"relay": 0, "state": true} o {"type":"pipeline_config", ...}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   if (deserializeJson(doc, payload, length)) return;
 
   String targetMac = doc["mac"] | "";
@@ -77,6 +77,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (nextSync >= 5 && nextSync <= 3600) {
     configSyncIntervalMs = (unsigned long)nextSync * 1000UL;
   }
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+  {
+    long nextSoilFast = doc["soil_fast_interval_s"] | (long)(soilFastIntervalMs / 1000UL);
+    long nextSoilSlow = doc["soil_slow_interval_s"] | (long)(soilSlowIntervalMs / 1000UL);
+    if (nextSoilFast >= 3 && nextSoilFast <= 300)
+      soilFastIntervalMs = (unsigned long)nextSoilFast * 1000UL;
+    if (nextSoilSlow >= 20 && nextSoilSlow <= 3600)
+      soilSlowIntervalMs = (unsigned long)nextSoilSlow * 1000UL;
+  }
+#endif
 #ifdef HAS_DISPLAY
   if (nextDisplay >= 0 && nextDisplay <= 3600) {
     displayTimeoutMs = (unsigned long)nextDisplay * 1000UL;
