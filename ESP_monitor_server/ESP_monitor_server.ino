@@ -475,7 +475,7 @@ HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
 HalisenseData halisenseData = {};
-SoilSensor    soilSensor(Serial2, 14, 13, 27);  // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
+SoilSensor    soilSensor(Serial2, 14, 13, 27);  // RX=GPIO14, TX=GPIO13, DE/RE=GPIO27
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -1288,7 +1288,7 @@ void networkTask(void* pvParameters) {
   }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(1280);
+  mqttClient.setBufferSize(1536);
 #endif
 
   for (;;) {
@@ -1658,7 +1658,7 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[1280];
+      char topic[64], buf[1536];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       size_t payload_len = serializeJson(doc, buf, sizeof(buf));
       if (payload_len >= sizeof(buf)) {

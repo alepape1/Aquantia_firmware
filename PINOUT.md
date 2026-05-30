@@ -83,7 +83,7 @@ Sensor 7-en-1: humedad, temperatura, CE, pH, TDS, N, P, K. Conectado a Serial2 m
 | Perfil      | RX (ESP32) | TX (ESP32) | DE/RE | Notas |
 |------------|:----------:|:----------:|:-----:|-------|
 | METEO      | 13         | 17         | 27    | DE/RE manual (GPIO27) |
-| IRRIGATION | 13         | 14         | —     | DE/RE automático (no conectar) |
+| IRRIGATION | 14         | 13         | 27    | DE/RE en GPIO27 |
 
 > **Conflicto GPIO16:** `TFT_DC = 16` en `Setup25_TTGO_T_Display.h`. No usar para RX.
 
@@ -92,9 +92,11 @@ Adaptador RS485 (MAX485 o similar)
 ┌───────────┐
 │  VCC ─────┼──► 3.3V
 │  GND ─────┼──► GND
-│  DI  ─────┼──► GPIO14  (TX — ESP32 → sensor) [IRRIGATION]
-│  RO  ─────┼──► GPIO13  (RX — sensor → ESP32)
-│  DE/RE  ──┼──► (solo METEO: GPIO27; IRRIGATION: automático, no conectar)
+│  DI  ─────┼──► GPIO17  (TX — ESP32 → sensor) [METEO]
+│         ──┼──► GPIO13  (TX — ESP32 → sensor) [IRRIGATION]
+│  RO  ─────┼──► GPIO13  (RX — sensor → ESP32) [METEO]
+│         ──┼──► GPIO14  (RX — sensor → ESP32) [IRRIGATION]
+│  DE/RE  ──┼──► GPIO27 (ambos perfiles)
 │  A/B ─────┼──► Bus RS485 al sensor Helissense
 └───────────┘
 ```
@@ -128,10 +130,24 @@ Ajustar en `ESP_monitor_server.ino` según el sensor real:
 | LED estado | 23 | Activo-LOW. Mismos estados que METEO + encendido fijo cuando relay activo |
 | I2C SDA | 21 | Sin sensores en v actual |
 | I2C SCL | 22 | Sin sensores en v actual |
-| RS485 Serial2 RX (DI) | 13 | Helissense sensor suelo — RX (ESP32 ← sensor) |
-| RS485 Serial2 TX (RO) | 14 | Helissense sensor suelo — TX (ESP32 → sensor) |
+| RS485 Serial2 RX (RO) | 14 | Helissense sensor suelo — RX (ESP32 ← sensor) |
+| RS485 Serial2 TX (DI) | 13 | Helissense sensor suelo — TX (ESP32 → sensor) |
 
-> Este perfil no tiene sensores meteorológicos ni pantalla. Solo gestiona los 4 relays por MQTT.
+> Este perfil no tiene pantalla. Gestiona los 4 relays por MQTT y lee temperatura/humedad ambiente (AHT20), voltaje/corriente/potencia (INA219) y presión atmosférica (BMP280) por I2C.
+
+### Sensores I2C (SDA=21, SCL=22)
+
+| Sensor | Dirección I2C | Función |
+|--------|:-------------:|---------|
+| AHT20 | 0x38 | Temperatura + humedad ambiente — driver en `aht20_driver.h`, sin librería externa |
+| INA219 | 0x40 | Voltaje de bus, corriente y potencia — driver en `ina219_driver.h`, sin librería externa |
+| BMP280 | 0x76 / 0x77 | Temperatura + presión atmosférica (fallback si AHT20 no responde) |
+
+> **INA219:** configurado para 32 V bus, ±2 A, ADC 12-bit. Resistencia shunt 0.1 Ω (breakout estándar).
+> - `current_lsb` = 0.1 mA/bit, `power_lsb` = 2 mW/bit
+> - Dirección configurable via A0/A1: defecto 0x40 (A0=GND, A1=GND)
+
+---
 
 ### Bitmask de relays
 
@@ -152,17 +168,19 @@ El campo `relay_active` en la telemetría y en los comandos es un bitmask de 4 b
 ```
 ESP32 4-Relay Board
 ┌────────────────────────────┐
-│  GPIO32 ─────────────┼──► IN1 relay 1 (zona riego 1)
-│  GPIO33 ─────────────┼──► IN2 relay 2 (zona riego 2)
-│  GPIO25 ─────────────┼──► IN3 relay 3 (zona riego 3)
-│  GPIO26 ─────────────┼──► IN4 relay 4 (zona riego 4)
-│  GPIO23 ─────────────┼──► LED estado (integrado)
-│  GPIO13 ─────────────┼──► RS485 RO (RX — sensor Helissense → ESP32)
-│  GPIO14 ─────────────┼──► RS485 DI (TX — ESP32 → sensor Helissense)
-│  VCC / GND ──────────┼──► Alimentación 5 V / GND común
+│  GPIO32 ─────────────────┼──► IN1 relay 1 (zona riego 1)
+│  GPIO33 ─────────────────┼──► IN2 relay 2 (zona riego 2)
+│  GPIO25 ─────────────────┼──► IN3 relay 3 (zona riego 3)
+│  GPIO26 ─────────────────┼──► IN4 relay 4 (zona riego 4)
+│  GPIO23 ─────────────────┼──► LED estado (integrado)
+│  GPIO14 ─────────────────┼──► RS485 RO → RX Helissense (sensor → ESP32)
+│  GPIO13 ─────────────────┼──► RS485 DI ← TX Helissense (ESP32 → sensor)
+│  GPIO27 ─────────────────┼──► RS485 DE/RE (control half-duplex)
+│  GPIO21 (SDA) ───────────┼──► SDA → AHT20, INA219, BMP280
+│  GPIO22 (SCL) ───────────┼──► SCL → AHT20, INA219, BMP280
+│  3V3 ────────────────────┼──► VCC sensores I2C / adaptador RS485
+│  VCC / GND ──────────────┼──► Alimentación 5 V / GND común
 └────────────────────────────┘
-
-*Para módulos MAX485 con DE/RE automático, no conectar ni definir pin de control DE/RE.*
 
 Cada relay:
   COM ──► neutro / positivo de la válvula

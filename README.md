@@ -1,6 +1,6 @@
 # Aquantia — Firmware ESP32
 
-**Versión activa:** `0.2.0-beta.3` · **Rama:** `feature/mqtt-alerts` · **Backend compatible:** `v0.1.0+`
+**Versión activa:** `0.2.0-beta.3` · **Rama:** `feat/helissense-sensor` · **Backend compatible:** `v0.1.0+`
 
 Firmware para la estación meteorológica y sistema de detección de fugas/control de riego Aquantia. Compatible con **tres perfiles de hardware** seleccionables en tiempo de compilación.
 
@@ -41,7 +41,7 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 | Perfil | `DEVICE_PROFILE` | Hardware | Relays | Pantalla | Sensores meteo |
 |--------|:----------------:|----------|:------:|:--------:|:--------------:|
 | **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
-| **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | No |
+| **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | AHT20 (T+H), INA219 (V/I/P), BMP280 (T+P, fallback) |
 | **AGROMETEO** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | Sin relays | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
 
 > **Nota:** El perfil AGROMETEO no incluye relays. Publica parámetros agrometeorológicos calculados: `dew_point`, `heat_index` y `abs_humidity`.
@@ -161,7 +161,7 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | `ArduinoJson` | Benoit Blanchon | Todos | Payloads JSON |
 | `PubSubClient` | knolleary | Todos (MQTT) | Cliente MQTT |
 
-HTU2x, HDC1080 y el sensor de luz TSL2584/APDS-9930 se implementan directamente sobre I2C sin librería externa.
+HTU2x, HDC1080, TSL2584/APDS-9930, AHT20 e INA219 se implementan directamente sobre I2C sin librería externa.
 El driver del sensor de presión de tubería XDB401 (familia XGZP6847D) está en `pressure_sensor_i2c.h/.cpp`.
 
 ### Configuración TFT_eSPI (PROFILE_METEO)
@@ -266,6 +266,21 @@ Sincronización entre cores:
 - **`windMux`** (`portMUX_TYPE`): sección crítica de bare-metal para acumuladores vectoriales del viento. Seguro frente a preempción entre loop y sección crítica de snapshot.
 - **`char[16]`** para `pipelineMode` y `pipelineScenario**: elimina carreras de heap entre cores que ocurrían con `String`.
 
+### Potencia de transmisión WiFi
+
+El firmware fija la potencia TX a **18.5 dBm** (`WIFI_POWER_18_5dBm`) tanto en el arranque inicial como en cada reconexión. Valor empíricamente elegido para mejorar la estabilidad en instalaciones con cobertura marginal sin saturar el receptor del AP.
+
+### Reconexión WiFi robustecida
+
+`networkTask` implementa backoff exponencial y recuperación de stack colgado:
+
+| Condición | Acción |
+|-----------|--------|
+| WiFi desconectado | Intento de reconexión con backoff de 500 ms → máx. 30 s |
+| Cada 10 fallos consecutivos | `WiFi.disconnect(true)` + reset completo del stack WiFi |
+| 60 fallos consecutivos (~5 min) | `esp_restart()` — reinicio total del dispositivo |
+| Reconexión exitosa | Backoff reseteado a 500 ms tras 10 s de conexión estable |
+
 ### Seguridad OTA
 
 Al arrancar una actualización OTA:
@@ -303,13 +318,15 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | **MCP9808** | Temperatura exterior | ✓ | — | — |
 | **HTU2x** | Temperatura + humedad | ✓ | — | — |
 | **DHT11** | Temperatura + humedad (secundario) | ✓ | — | — |
+| **AHT20** | Temperatura + humedad ambiente | — | ✓ | — |
 | **HDC1080** | Temperatura + humedad | — | — | ✓ |
 | **MicroPressure** | Presión atmosférica (principal) | ✓ | — | ✓ |
-| **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | — | ✓ |
+| **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | ✓ | ✓ |
 | **TSL2584 / APDS-9930** | Iluminancia | ✓ | — | — |
 | **BH1750** | Iluminancia | — | — | ✓ |
+| **INA219** | Voltaje bus (V), corriente (mA), potencia (mW) | — | ✓ | — |
 | **YL-69** (ADC) | Humedad suelo (fallback si Helissense no responde) | ✓ | — | — |
-| **Helissense RS485** | Humedad + temperatura + CE + pH + TDS + NPK | ✓ | — | — |
+| **Helissense RS485** | Humedad + temperatura + CE + pH + TDS + NPK | ✓ | ✓ | — |
 | **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ | ✓ | ✓ |
 | **Caudalímetro YF-B9** (ISR) | Caudal L/min + litros totales | ✓ | — | ✓ |
 
@@ -413,6 +430,24 @@ Campos presentes en todos los perfiles salvo indicación:
 }
 ```
 
+Campos exclusivos **PROFILE_IRRIGATION** (solo cuando `DEVICE_PROFILE = 2`):
+
+```json
+{
+  "aht20_ok":           true,
+  "ina219_ok":          true,
+  "ina219_bus_voltage": 12.34,
+  "ina219_current_ma":  150.0,
+  "ina219_power_mw":    1850.0
+}
+```
+
+> - `aht20_ok`: `true` cuando el sensor AHT20 respondió correctamente. Si falla, la temperatura/humedad provienen del BMP280 o del simulador.
+> - `ina219_ok`: `true` cuando el INA219 respondió. Si falla, los tres campos se omiten del payload.
+> - `ina219_bus_voltage`: voltaje de bus medido (V), resolución 4 mV.
+> - `ina219_current_ma`: corriente (mA), resolución 0.1 mA (shunt 0.1 Ω).
+> - `ina219_power_mw`: potencia (mW), resolución 2 mW.
+
 Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
 
 ```json
@@ -481,15 +516,30 @@ El firmware publica en `aquantia/<finca_id>/alerts` solo al **cambio de estado**
 
 | `type` | `severity` | Cuándo |
 |--------|-----------|--------|
-| `device_reboot` | info | Al reconectar tras reinicio — el campo `message` incluye el motivo de reset (`encendido`, `reinicio SW`, `panic/crash`, `WDT tarea`, `brownout`, etc.) |
+| `device_reboot` | info | Al reconectar tras reinicio — el campo `message` incluye el motivo de reset (`encendido`, `reinicio SW`, `panic/crash`, `WDT tarea`, `brownout`, etc.) y, si fue WDT, la tarea/fase registrada por `wdt_heartbeat()` |
 | `mqtt_reconnect` | info | Reconexión al broker (no primer arranque) |
 | `leak` | warning | LeakDetector detecta fuga |
 | `burst` | critical | LeakDetector detecta rotura |
 | `obstruction` | warning | LeakDetector detecta obstrucción |
 | `pipeline_ok` | info | Pipeline se recupera a estado normal |
-| `sensor_failure` | warning | Sensor deja de responder (XDB401, MCP9808, BMP280, HTU2x, HDC1080, BH1750, MicroPressure) |
+| `sensor_failure` | warning | Sensor deja de responder (XDB401, MCP9808, BMP280, HTU2x, HDC1080, BH1750, MicroPressure, AHT20, INA219) |
 | `sensor_ok` | info | Sensor se recupera |
 | `low_heap` | warning | Heap libre < 30 KB |
+
+### Cooldown de alertas de sensor
+
+Las alertas `sensor_failure` / `sensor_ok` se disparan **solo al cambio de estado** (edge-triggered). Además, si el sensor permanece en fallo, el firmware re-emite la alerta cada **12 horas** (`SENSOR_ALERT_COOLDOWN = 43 200 000 ms`) para que el operador reciba un recordatorio sin inundar el broker.
+
+### Diagnóstico WDT — `wdt_heartbeat()`
+
+Antes de cada operación bloqueante relevante, el firmware llama a `wdt_heartbeat(taskName, phase)`, que escribe el nombre de la tarea y la fase en **RTC RAM** (persiste a través de reinicios). Si el WDT dispara durante esa operación, el campo `message` de la alerta `device_reboot` incluirá `"WDT tarea: <task>:<phase>"`, facilitando el diagnóstico remoto sin necesidad de monitor serie.
+
+Las fases registradas son:
+
+| Tarea | Fases |
+|-------|-------|
+| `NetworkTask` | *(idle)*, `wifi_reconnect`, `scenario_sync`, `mqtt_connect`, `mqtt_publish` |
+| `loopTask` | *(idle)*, `soil_rs485` |
 
 ---
 

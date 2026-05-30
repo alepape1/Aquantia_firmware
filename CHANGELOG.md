@@ -11,6 +11,42 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/helissense-sensor`
+
+### Added (PROFILE_IRRIGATION)
+- **AHT20 sensor** (I2C 0x38): temperatura y humedad ambiente para el perfil IRRIGATION.
+  Driver directo en `aht20_driver.h`, sin librería externa. En caso de fallo, el firmware
+  hace fallback al BMP280 (temperatura) o a valores simulados.
+  Campos nuevos en telemetría: `aht20_ok` (bool).
+- **INA219 sensor** (I2C 0x40): voltaje de bus, corriente y potencia.
+  Driver directo en `ina219_driver.h`, configurado para 32 V bus / ±2 A / 12-bit ADC,
+  shunt 0.1 Ω. Campos nuevos en telemetría: `ina219_ok`, `ina219_bus_voltage` (V),
+  `ina219_current_ma` (mA), `ina219_power_mw` (mW).
+- **`temperature_source` para IRRIGATION**: devuelve `"AHT20"` cuando el sensor está activo,
+  `"BMP280"` como fallback, o `"SIM"` si ningún sensor responde.
+
+### Fixed
+- **GPIO RX/TX invertidos en PROFILE_IRRIGATION** (Helissense RS485): el constructor
+  `SoilSensor(Serial2, rxPin, txPin, dePin)` tenía los pines en orden incorrecto.
+  Corregido a `SoilSensor(Serial2, 14, 13, 27)` → RX=GPIO14, TX=GPIO13, DE/RE=GPIO27.
+  Actualizado también el comentario en el `.ino` y el PINOUT.md.
+
+### Improved
+- **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de
+  tarea y fase actual en RTC RAM antes de operaciones bloqueantes. Si el WDT dispara,
+  la alerta `device_reboot` incluirá el contexto exacto del bloqueo para diagnóstico remoto.
+- **Cooldown de alertas de sensor** (`SENSOR_ALERT_COOLDOWN = 12 h`): evita que un sensor
+  persistentemente muerto inunde el broker con alertas repetidas. Tras el primer disparo
+  edge-triggered, la alerta se re-emite cada 12 horas mientras el fallo persista.
+- **Potencia WiFi fija a 18.5 dBm** (`WIFI_POWER_18_5dBm`): aplicada en arranque y en cada
+  reconexión para mejorar estabilidad en instalaciones con cobertura marginal.
+- **Reconexión WiFi más robusta**: backoff exponencial (500 ms → 30 s), reset completo del
+  stack WiFi cada 10 fallos, y `esp_restart()` automático tras 60 fallos consecutivos (~5 min).
+
+---
+
+## [Unreleased — feature/aqualeak-profile]
+
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `feature/aqualeak-profile`
 
 ### Changed
