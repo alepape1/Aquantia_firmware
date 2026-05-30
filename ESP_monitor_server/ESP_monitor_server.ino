@@ -457,7 +457,7 @@ HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
 HalisenseData halisenseData = {};
-SoilSensor    soilSensor(Serial2, 13, 14, 27);   // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
+SoilSensor    soilSensor(Serial2, 14, 13, 27);   // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
