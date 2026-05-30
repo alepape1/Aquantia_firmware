@@ -7,6 +7,9 @@
 //           configSyncIntervalMs, irrigationType, leakDetector — globals del sketch.
 // =============================================================================
 
+// Declaración anticipada para evitar errores de visibilidad
+void mqttPublishAlert(const char* type, const char* severity, const char* message);
+
 // Callback para comandos entrantes en aquantia/<finca_id>/cmd
 // Payload esperado: {"relay": 0, "state": true} o {"type":"pipeline_config", ...}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -167,7 +170,7 @@ void mqttPublishRegister() {
 // El backend escucha este topic e inserta en la tabla alerts.
 // payload: { "device_mac", "type", "severity", "message" }
 // severity: "info" | "warning" | "critical"
-static void mqttPublishAlert(const char* type, const char* severity, const char* message) {
+void mqttPublishAlert(const char* type, const char* severity, const char* message) {
   if (!mqttClient.connected()) return;
   StaticJsonDocument<256> doc;
   doc["device_mac"] = WiFi.macAddress();
