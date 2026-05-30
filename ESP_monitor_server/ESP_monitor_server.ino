@@ -252,8 +252,26 @@ const char* mqtt_pass   = MQTT_PASS;
 
 // ── Info de arranque (reset reason + timestamp de primera conexión) ────────────
 #include "esp_system.h"
-static char g_rebootReason[24]    = "desconocido";
+static char g_rebootReason[40]    = "desconocido";
 static char g_lastConnectStr[20]  = "--:--:-- --/--/--";  // HH:MM:SS DD/MM/YY
+
+// Última tarea activa antes de un WDT reset — sobrevive al reset en RTC RAM
+RTC_NOINIT_ATTR static char g_wdtLastTask[16];
+RTC_NOINIT_ATTR static uint32_t g_wdtMagic;  // 0xDEAD1234 → g_wdtLastTask válido
+static constexpr uint32_t WDT_MAGIC = 0xDEAD1234;
+
+// Llamar antes de operaciones bloqueantes para registrar tarea+fase en RTC RAM.
+// Si el WDT dispara durante esa operación, el reboot alert incluirá ambos datos.
+static inline void wdt_heartbeat(const char* taskName, const char* phase = nullptr) {
+  char buf[16];
+  if (phase) {
+    snprintf(buf, sizeof(buf), "%s/%s", taskName, phase);
+    strlcpy(g_wdtLastTask, buf, sizeof(g_wdtLastTask));
+  } else {
+    strlcpy(g_wdtLastTask, taskName, sizeof(g_wdtLastTask));
+  }
+  g_wdtMagic = WDT_MAGIC;
+}
 
 static const char* resetReasonStr(esp_reset_reason_t r) {
   switch (r) {
@@ -457,7 +475,7 @@ HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=GPIO27 (GPIO16=TFT_DC, no usar)
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
 HalisenseData halisenseData = {};
-SoilSensor    soilSensor(Serial2, 14, 13, 27);   // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
+SoilSensor    soilSensor(Serial2, 14, 13, 27);  // RX=GPIO13, TX=GPIO14, DE/RE=GPIO27
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -1274,6 +1292,7 @@ void networkTask(void* pvParameters) {
 #endif
 
   for (;;) {
+    wdt_heartbeat("NetworkTask");
     esp_task_wdt_reset();
     ArduinoOTA.handle();  // siempre primero, alta frecuencia
 
@@ -1283,6 +1302,7 @@ void networkTask(void* pvParameters) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+      wdt_heartbeat("NetworkTask", "wifi_reconnect");
       setLedState(LED_WIFI_CONNECTING);
       wifiStableSince = 0;
       wifiFailCount++;
@@ -1322,6 +1342,7 @@ void networkTask(void* pvParameters) {
 #endif
 
     if (lastScenarioSync == 0 || now - lastScenarioSync >= configSyncIntervalMs) {
+      wdt_heartbeat("NetworkTask", "scenario_sync");
       syncPipelineScenario();
       lastScenarioSync = now;
     }
@@ -1329,6 +1350,7 @@ void networkTask(void* pvParameters) {
 #ifdef USE_MQTT
     // ── Modo MQTT ────────────────────────────────────────────────────────────
     if (!mqttClient.connected()) {
+      wdt_heartbeat("NetworkTask", "mqtt_connect");
       setLedState(LED_MQTT_CONNECTING);
       if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
       esp_task_wdt_reset();
@@ -1547,6 +1569,7 @@ void networkTask(void* pvParameters) {
 
     // Publicar telemetría cada MQTT_SEND_MS
     if (now - lastSendTime >= telemetryIntervalMs) {
+      wdt_heartbeat("NetworkTask", "mqtt_publish");
       takeSnapshot();
       const TelemetrySnapshot& snap = _netSnap;
 
@@ -1717,7 +1740,16 @@ void setup() {
   DLOGLN("\n\n=== MeteoStation BOOT ===");
 
   // Capturar la razón de reinicio lo antes posible
-  strlcpy(g_rebootReason, resetReasonStr(esp_reset_reason()), sizeof(g_rebootReason));
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    strlcpy(g_rebootReason, resetReasonStr(rr), sizeof(g_rebootReason));
+    if ((rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT)
+        && g_wdtMagic == WDT_MAGIC && g_wdtLastTask[0] != '\0') {
+      strncat(g_rebootReason, ":", sizeof(g_rebootReason) - strlen(g_rebootReason) - 1);
+      strncat(g_rebootReason, g_wdtLastTask, sizeof(g_rebootReason) - strlen(g_rebootReason) - 1);
+    }
+    g_wdtMagic = 0;  // invalidar hasta el próximo ciclo
+  }
 
 #ifdef DEBUG_MODE
   DLOGLN("=== DEBUG MODE ACTIVO ===");
@@ -2383,6 +2415,7 @@ void setup() {
 // LOOP — Core 1: sensores + display (sin red)
 // =============================================================================
 void loop() {
+  wdt_heartbeat("loopTask");
   ledTick();  // actualizar LED de estado (no bloqueante)
 
   unsigned long now = millis();
@@ -2914,6 +2947,7 @@ void loop() {
 
     if (now - lastSoilReadMs >= soilInterval) {
       lastSoilReadMs = now;
+      wdt_heartbeat("loopTask", "soil_rs485");
       if (soilSensor.readAllVariables()) {
         halisenseData.ok          = true;
         halisenseData.moisture    = soilSensor.getHumidity();
