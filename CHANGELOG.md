@@ -11,6 +11,73 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/helissense-sensor`
+
+### Added (PROFILE_IRRIGATION)
+- **AHT20 sensor** (I2C 0x38): temperatura y humedad ambiente para el perfil IRRIGATION.
+  Driver directo en `aht20_driver.h`, sin librería externa. En caso de fallo, el firmware
+  hace fallback al BMP280 (temperatura) o a valores simulados.
+  Campos nuevos en telemetría: `aht20_ok` (bool).
+- **INA219 sensor** (I2C 0x40): voltaje de bus, corriente y potencia.
+  Driver directo en `ina219_driver.h`, configurado para 32 V bus / ±2 A / 12-bit ADC,
+  shunt 0.1 Ω. Campos nuevos en telemetría: `ina219_ok`, `ina219_bus_voltage` (V),
+  `ina219_current_ma` (mA), `ina219_power_mw` (mW).
+- **`temperature_source` para IRRIGATION**: devuelve `"AHT20"` cuando el sensor está activo,
+  `"BMP280"` como fallback, o `"SIM"` si ningún sensor responde.
+
+### Fixed
+- **GPIO RX/TX invertidos en PROFILE_IRRIGATION** (Helissense RS485): el constructor
+  `SoilSensor(Serial2, rxPin, txPin, dePin)` tenía los pines en orden incorrecto.
+  Corregido a `SoilSensor(Serial2, 14, 13, 27)` → RX=GPIO14, TX=GPIO13, DE/RE=GPIO27.
+  Actualizado también el comentario en el `.ino` y el PINOUT.md.
+
+### Improved
+- **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de
+  tarea y fase actual en RTC RAM antes de operaciones bloqueantes. Si el WDT dispara,
+  la alerta `device_reboot` incluirá el contexto exacto del bloqueo para diagnóstico remoto.
+- **Cooldown de alertas de sensor** (`SENSOR_ALERT_COOLDOWN = 12 h`): evita que un sensor
+  persistentemente muerto inunde el broker con alertas repetidas. Tras el primer disparo
+  edge-triggered, la alerta se re-emite cada 12 horas mientras el fallo persista.
+- **Potencia WiFi fija a 18.5 dBm** (`WIFI_POWER_18_5dBm`): aplicada en arranque y en cada
+  reconexión para mejorar estabilidad en instalaciones con cobertura marginal.
+- **Reconexión WiFi más robusta**: backoff exponencial (500 ms → 30 s), reset completo del
+  stack WiFi cada 10 fallos, y `esp_restart()` automático tras 60 fallos consecutivos (~5 min).
+
+---
+
+## [Unreleased — feature/aqualeak-profile]
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feature/aqualeak-profile`
+
+### Changed
+- **`PROFILE_AGROMETEO` renombrado a `PROFILE_AQUALEAK`** (`#define PROFILE_AQUALEAK 3`).
+  El perfil mantiene el mismo número (3) para retrocompatibilidad con provisioning NVS.
+  El string `device_profile` en el payload MQTT register y en los logs internos cambia de
+  `"AGROMETEO"` a `"AQUALEAK"`. El Flash Tool GUI actualiza la etiqueta del perfil.
+
+### Added
+- **Relay para AQUALEAK**: `RELAY_COUNT = 1`, GPIO `RELAY_PIN` (GPIO26, Wemos D1 Mini ESP32),
+  activo-HIGH. Idéntica configuración a PROFILE_METEO. Permite controlar una electroválvula
+  de corte directamente desde el dispositivo AquaLeak.
+- **`flow_session_l` en telemetría MQTT**: litros acumulados desde la última apertura del
+  relay (GPIO26). Se resetea automáticamente al transicionar `relay OFF → ON` (nueva sesión
+  de riego). Se publica en el campo `flow_session_l` del payload MQTT telemetría.
+- **`flowSessionReset()`**: función pública para reiniciar el contador de sesión; también
+  llamada internamente al abrir el relay.
+
+### Improved
+- **Precisión del caudalímetro**: timer del caudal migrado de `millis()` (±1 ms) a
+  `micros()` (±1 µs). Reduce el error de cuantización del intervalo `dt` en un factor
+  ×1000, especialmente relevante a caudales bajos (<1 L/min) donde el período llega a
+  varios segundos. El umbral mínimo de intervalo pasa de 500 ms a 500 000 µs (idéntico
+  valor, solo cambio de unidad).
+- **Lectura atómica de contadores de pulsos**: reemplazado `noInterrupts()/interrupts()`
+  por `portENTER_CRITICAL(&_flowMux)/portEXIT_CRITICAL(&_flowMux)` (spinlock IDF).
+  Correcto en contexto dual-core: el ISR se ejecuta en Core 1, `readRealPipelineSensors`
+  también en Core 1 — el spinlock garantiza exclusión sin deshabilitar interrupciones
+  globalmente del sistema.
+- **Spinlock `_flowMux`** declarado junto a los contadores ISR para mantener cohesión.
+
 ---
 
 ## [0.2.0-beta.3] — 2026-05-06

@@ -21,8 +21,11 @@ Dos perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo d
 | Caudalímetro (pulsos ISR) | 32 | INPUT_PULLUP, ISR FALLING (BC547 NPN, señal invertida) |
 | Relay 1 (electroválvula) | 26 | Activo-LOW, JQC-3FF-S-Z |
 | Botón izquierdo (BOOT) | 0 | INPUT_PULLUP, activo LOW |
-| Botón derecho | 35 | INPUT, activo LOW |
+| Botón derecho | 35 | INPUT, activo LOW — sin pull-up interno; debounce 400 ms en firmware |
 | LED onboard | 2 | Activo-LOW. Estados: parpadeo rápido=WiFi buscando, doble parpadeo=MQTT pendiente, latido=idle, triple=TX OK, 1s/1s=error |
+| RS485 Serial2 RX (DI) | **13** | Helissense sensor suelo — **NO usar GPIO16 (= TFT_DC)** |
+| RS485 Serial2 TX (RO) | 17 | Helissense sensor suelo |
+| RS485 DE/RE | 27 | Control half-duplex Helissense |
 
 ### Pantalla TFT — SPI (ST7789 240×135)
 
@@ -53,20 +56,52 @@ Configurada mediante `TFT_eSPI` → `User_Setups/Setup25_TTGO_T_Display.h`. No m
 ```
 LilyGo TTGO T-Display
 ┌────────────────────┐
-│  3V3 ──────────────┼──► VCC sensores I2C / DHT11 / divisor YL-69
+│  3V3 ──────────────┼──► VCC sensores I2C / DHT11 / divisor YL-69 / adaptador RS485
 │  GND ──────────────┼──► GND común
 │  GPIO21 (SDA) ─────┼──► SDA → MCP9808, MicroPressure, HTU2x, TSL2584
 │  GPIO22 (SCL) ─────┼──► SCL → (mismos sensores)
 │  GPIO15 ───────────┼──► DHT11 DATA  (pull-up 4.7kΩ a 3.3V)
 │  GPIO37 ───────────┼──► Anemómetro salida analógica 0–3.3V
 │  GPIO36 ───────────┼──► Veleta salida analógica 0–3.3V
-│  GPIO33 ───────────┼──► YL-69 AO (tras divisor de tensión)
+│  GPIO33 ───────────┼──► YL-69 AO (tras divisor de tensión) — fallback suelo
 │  GPIO32 ───────────┼──► Caudalímetro (colector BC547 NPN)
 │  GPIO26 ───────────┼──► IN del relay (JQC-3FF-S-Z)
 │  GPIO0  ───────────┼──► Botón BOOT (ya integrado en placa)
 │  GPIO35 ───────────┼──► Botón derecho externo
+│  GPIO13 ───────────┼──► RS485 DI → RX Helissense  ← usar GPIO13, NO GPIO16
+│  GPIO17 ───────────┼──► RS485 RO ← TX Helissense
+│  GPIO27 ───────────┼──► RS485 DE/RE (control half-duplex)
+│  GPIO16 ── TFT_DC ─┼   (interno, NO conectar nada aquí)
 └────────────────────┘
 ```
+
+
+### Sensor de suelo RS485 — Helissense (Modbus RTU)
+
+Sensor 7-en-1: humedad, temperatura, CE, pH, TDS, N, P, K. Conectado a Serial2 mediante un adaptador RS485 half-duplex TTL.
+
+| Perfil      | RX (ESP32) | TX (ESP32) | DE/RE | Notas |
+|------------|:----------:|:----------:|:-----:|-------|
+| METEO      | 13         | 17         | 27    | DE/RE manual (GPIO27) |
+| IRRIGATION | 14         | 13         | 27    | DE/RE en GPIO27 |
+
+> **Conflicto GPIO16:** `TFT_DC = 16` en `Setup25_TTGO_T_Display.h`. No usar para RX.
+
+```
+Adaptador RS485 (MAX485 o similar)
+┌───────────┐
+│  VCC ─────┼──► 3.3V
+│  GND ─────┼──► GND
+│  DI  ─────┼──► GPIO17  (TX — ESP32 → sensor) [METEO]
+│         ──┼──► GPIO13  (TX — ESP32 → sensor) [IRRIGATION]
+│  RO  ─────┼──► GPIO13  (RX — sensor → ESP32) [METEO]
+│         ──┼──► GPIO14  (RX — sensor → ESP32) [IRRIGATION]
+│  DE/RE  ──┼──► GPIO27 (ambos perfiles)
+│  A/B ─────┼──► Bus RS485 al sensor Helissense
+└───────────┘
+```
+
+Parámetros de comunicación: **4800 baud, 8N1**, dirección Modbus esclavo `0x01`, registro inicial `0x0000`, 7 registros.
 
 ### Calibración del sensor de suelo (YL-69)
 
@@ -95,8 +130,24 @@ Ajustar en `ESP_monitor_server.ino` según el sensor real:
 | LED estado | 23 | Activo-LOW. Mismos estados que METEO + encendido fijo cuando relay activo |
 | I2C SDA | 21 | Sin sensores en v actual |
 | I2C SCL | 22 | Sin sensores en v actual |
+| RS485 Serial2 RX (RO) | 14 | Helissense sensor suelo — RX (ESP32 ← sensor) |
+| RS485 Serial2 TX (DI) | 13 | Helissense sensor suelo — TX (ESP32 → sensor) |
 
-> Este perfil no tiene sensores meteorológicos ni pantalla. Solo gestiona los 4 relays por MQTT.
+> Este perfil no tiene pantalla. Gestiona los 4 relays por MQTT y lee temperatura/humedad ambiente (AHT20), voltaje/corriente/potencia (INA219) y presión atmosférica (BMP280) por I2C.
+
+### Sensores I2C (SDA=21, SCL=22)
+
+| Sensor | Dirección I2C | Función |
+|--------|:-------------:|---------|
+| AHT20 | 0x38 | Temperatura + humedad ambiente — driver en `aht20_driver.h`, sin librería externa |
+| INA219 | 0x40 | Voltaje de bus, corriente y potencia — driver en `ina219_driver.h`, sin librería externa |
+| BMP280 | 0x76 / 0x77 | Temperatura + presión atmosférica (fallback si AHT20 no responde) |
+
+> **INA219:** configurado para 32 V bus, ±2 A, ADC 12-bit. Resistencia shunt 0.1 Ω (breakout estándar).
+> - `current_lsb` = 0.1 mA/bit, `power_lsb` = 2 mW/bit
+> - Dirección configurable via A0/A1: defecto 0x40 (A0=GND, A1=GND)
+
+---
 
 ### Bitmask de relays
 
@@ -111,18 +162,25 @@ El campo `relay_active` en la telemetría y en los comandos es un bitmask de 4 b
 | `8`  | Relay 4 ON (bit 3) |
 | `15` | Los 4 relays ON |
 
+
 ### Diagrama de conexiones
 
 ```
 ESP32 4-Relay Board
-┌────────────────────┐
-│  GPIO32 ───────────┼──► IN1 relay 1 (zona riego 1)
-│  GPIO33 ───────────┼──► IN2 relay 2 (zona riego 2)
-│  GPIO25 ───────────┼──► IN3 relay 3 (zona riego 3)
-│  GPIO26 ───────────┼──► IN4 relay 4 (zona riego 4)
-│  GPIO23 ───────────┼──► LED estado (integrado)
-│  VCC / GND ────────┼──► Alimentación 5 V / GND común
-└────────────────────┘
+┌────────────────────────────┐
+│  GPIO32 ─────────────────┼──► IN1 relay 1 (zona riego 1)
+│  GPIO33 ─────────────────┼──► IN2 relay 2 (zona riego 2)
+│  GPIO25 ─────────────────┼──► IN3 relay 3 (zona riego 3)
+│  GPIO26 ─────────────────┼──► IN4 relay 4 (zona riego 4)
+│  GPIO23 ─────────────────┼──► LED estado (integrado)
+│  GPIO14 ─────────────────┼──► RS485 RO → RX Helissense (sensor → ESP32)
+│  GPIO13 ─────────────────┼──► RS485 DI ← TX Helissense (ESP32 → sensor)
+│  GPIO27 ─────────────────┼──► RS485 DE/RE (control half-duplex)
+│  GPIO21 (SDA) ───────────┼──► SDA → AHT20, INA219, BMP280
+│  GPIO22 (SCL) ───────────┼──► SCL → AHT20, INA219, BMP280
+│  3V3 ────────────────────┼──► VCC sensores I2C / adaptador RS485
+│  VCC / GND ──────────────┼──► Alimentación 5 V / GND común
+└────────────────────────────┘
 
 Cada relay:
   COM ──► neutro / positivo de la válvula

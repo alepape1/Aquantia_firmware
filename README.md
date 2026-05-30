@@ -1,6 +1,6 @@
 # Aquantia — Firmware ESP32
 
-**Versión activa:** `0.2.0-beta.3` · **Rama:** `feature/mqtt-alerts` · **Backend compatible:** `v0.1.0+`
+**Versión activa:** `0.2.0-beta.3` · **Rama:** `feat/helissense-sensor` · **Backend compatible:** `v0.1.0+`
 
 Firmware para la estación meteorológica y sistema de detección de fugas/control de riego Aquantia. Compatible con **tres perfiles de hardware** seleccionables en tiempo de compilación.
 
@@ -21,6 +21,7 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 - [Modo HTTP legacy](#modo-http-legacy)
 - [Relay y electroválvulas](#relay-y-electroválvulas)
 - [Pantalla TFT](#pantalla-tft)
+- [Sensor de suelo RS485 Helissense](#sensor-de-suelo-rs485-helissense)
 - [Filtros y estabilización](#filtros-y-estabilización)
 - [Simulación de sensores](#simulación-de-sensores)
 - [Sensor de presión de tubería XDB401](#sensor-de-presión-de-tubería-xdb401)
@@ -40,7 +41,7 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 | Perfil | `DEVICE_PROFILE` | Hardware | Relays | Pantalla | Sensores meteo |
 |--------|:----------------:|----------|:------:|:--------:|:--------------:|
 | **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
-| **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | No |
+| **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | AHT20 (T+H), INA219 (V/I/P), BMP280 (T+P, fallback) |
 | **AGROMETEO** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | Sin relays | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
 
 > **Nota:** El perfil AGROMETEO no incluye relays. Publica parámetros agrometeorológicos calculados: `dew_point`, `heat_index` y `abs_humidity`.
@@ -150,6 +151,7 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | Librería | Autor | Perfil | Uso |
 |----------|-------|:------:|-----|
 | `TFT_eSPI` | Bodmer | METEO | Pantalla ST7789 |
+| *(sin librería externa)* | — | METEO | Sensor suelo Helissense — driver RS485 Modbus RTU en `SoilSensor.h/.cpp` |
 | `Adafruit MCP9808 Library` | Adafruit | METEO | Temperatura exterior |
 | `Adafruit BMP280 Library` | Adafruit | METEO, AGROMETEO | Temperatura + presión atmosférica |
 | `SparkFun MicroPressure Library` | SparkFun | METEO, AGROMETEO | Barómetro principal |
@@ -159,7 +161,7 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | `ArduinoJson` | Benoit Blanchon | Todos | Payloads JSON |
 | `PubSubClient` | knolleary | Todos (MQTT) | Cliente MQTT |
 
-HTU2x, HDC1080 y el sensor de luz TSL2584/APDS-9930 se implementan directamente sobre I2C sin librería externa.
+HTU2x, HDC1080, TSL2584/APDS-9930, AHT20 e INA219 se implementan directamente sobre I2C sin librería externa.
 El driver del sensor de presión de tubería XDB401 (familia XGZP6847D) está en `pressure_sensor_i2c.h/.cpp`.
 
 ### Configuración TFT_eSPI (PROFILE_METEO)
@@ -264,6 +266,21 @@ Sincronización entre cores:
 - **`windMux`** (`portMUX_TYPE`): sección crítica de bare-metal para acumuladores vectoriales del viento. Seguro frente a preempción entre loop y sección crítica de snapshot.
 - **`char[16]`** para `pipelineMode` y `pipelineScenario**: elimina carreras de heap entre cores que ocurrían con `String`.
 
+### Potencia de transmisión WiFi
+
+El firmware fija la potencia TX a **18.5 dBm** (`WIFI_POWER_18_5dBm`) tanto en el arranque inicial como en cada reconexión. Valor empíricamente elegido para mejorar la estabilidad en instalaciones con cobertura marginal sin saturar el receptor del AP.
+
+### Reconexión WiFi robustecida
+
+`networkTask` implementa backoff exponencial y recuperación de stack colgado:
+
+| Condición | Acción |
+|-----------|--------|
+| WiFi desconectado | Intento de reconexión con backoff de 500 ms → máx. 30 s |
+| Cada 10 fallos consecutivos | `WiFi.disconnect(true)` + reset completo del stack WiFi |
+| 60 fallos consecutivos (~5 min) | `esp_restart()` — reinicio total del dispositivo |
+| Reconexión exitosa | Backoff reseteado a 500 ms tras 10 s de conexión estable |
+
 ### Seguridad OTA
 
 Al arrancar una actualización OTA:
@@ -289,7 +306,8 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | **20 s** \* | `telemetryIntervalMs` | 1 → 0 | Lee todos los sensores I2C → construye `TelemetrySnapshot` → Core 0 envía MQTT o HTTP | Todos |
 | **20 s** | `PIPELINE_SYNC_MS` | 0 | Sincroniza config pipeline desde el servidor | Todos |
 | **15 s** | `XDB401_RETRY_INTERVAL` | 1 | Reintenta `xdb401_begin()` tras 8 fallos consecutivos de lectura | Todos |
-| **10 min** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones | METEO |
+| **10 min** | `DISPLAY_TIMEOUT_MS` | 1 | Apaga la pantalla TFT si no hay actividad de botones (ajustable vía MQTT `display_timeout_s`) | METEO |
+| **3 s / 20 s** | `SOIL_FAST_MS` / `SOIL_SLOW_MS` | 1 | Muestreo adaptativo del sensor RS485: 3 s durante riego activo y en ventana post-riego (2 min); 20 s en reposo | METEO |
 
 \* `telemetryIntervalMs` puede modificarse en tiempo de ejecución mediante MQTT (`telemetry_interval_s`) o HTTP `/api/pipeline/config`. El valor por defecto (y el usado para sincronizar las lecturas I2C) es **20 s**.
 
@@ -300,12 +318,15 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | **MCP9808** | Temperatura exterior | ✓ | — | — |
 | **HTU2x** | Temperatura + humedad | ✓ | — | — |
 | **DHT11** | Temperatura + humedad (secundario) | ✓ | — | — |
+| **AHT20** | Temperatura + humedad ambiente | — | ✓ | — |
 | **HDC1080** | Temperatura + humedad | — | — | ✓ |
 | **MicroPressure** | Presión atmosférica (principal) | ✓ | — | ✓ |
-| **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | — | ✓ |
+| **BMP280** | Temperatura + presión atmosférica (fallback) | ✓ | ✓ | ✓ |
 | **TSL2584 / APDS-9930** | Iluminancia | ✓ | — | — |
 | **BH1750** | Iluminancia | — | — | ✓ |
-| **YL-69** (ADC) | Humedad suelo | ✓ | — | — |
+| **INA219** | Voltaje bus (V), corriente (mA), potencia (mW) | — | ✓ | — |
+| **YL-69** (ADC) | Humedad suelo (fallback si Helissense no responde) | ✓ | — | — |
+| **Helissense RS485** | Humedad + temperatura + CE + pH + TDS + NPK | ✓ | ✓ | — |
 | **XDB401** (pipeline) | Presión tubería + temperatura agua | ✓ | ✓ | ✓ |
 | **Caudalímetro YF-B9** (ISR) | Caudal L/min + litros totales | ✓ | — | ✓ |
 
@@ -325,10 +346,25 @@ Modo de comunicación principal. Activar definiendo `USE_MQTT` en `secrets.h`.
 
 | Topic | Dirección | Cuándo | Contenido |
 |-------|-----------|--------|-----------|
-| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version |
+| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version, device_profile |
 | `aquantia/<finca_id>/telemetry` | ESP → broker | Cada 20s | JSON con todos los campos de sensores |
 | `aquantia/<finca_id>/alerts` | ESP → broker | Edge-triggered | JSON alerta de sensor/pipeline/heap |
-| `aquantia/<finca_id>/cmd` | broker → ESP | Comando | `{"relay":0,"state":true}` / `{"pipeline_mode":"real"}` / `{"irrigation_type":"drip"}` |
+| `aquantia/<finca_id>/cmd` | broker → ESP | Comando | Ver tabla de comandos más abajo |
+
+### Comandos MQTT (topic `cmd`)
+
+Todos los campos son opcionales — se puede enviar solo el subconjunto que se quiere cambiar. Si se incluye `mac`, solo el dispositivo con esa MAC ejecutará el comando.
+
+| Campo | Tipo | Valores | Efecto |
+|-------|------|---------|--------|
+| `mac` | string | `"FC:B4:67:F3:77:48"` | Filtro por MAC — otros dispositivos ignoran el mensaje |
+| `relay` + `state` | int + bool | `{"relay":0,"state":true}` | Activa/desactiva el relay N (índice 0-based). En transición OFF→ON resetea el contador de sesión de caudal |
+| `pipeline_mode` | string | `"real"` / `"sim"` | Cambia modo pipeline |
+| `pipeline_scenario` | string | `"normal"` / `"leak"` / `"burst"` / `"obstruction"` | Fuerza escenario (solo modo sim) |
+| `irrigation_type` | string | `"sprinkler"` / `"drip"` / `"drip_tape"` / `"micro_sprinkler"` | Cambia perfil de riego y reinicia baseline del LeakDetector |
+| `telemetry_interval_s` | int | 5–3600 | Intervalo de publicación de telemetría (segundos) |
+| `config_sync_interval_s` | int | 5–3600 | Intervalo de sincronización de config desde el servidor (segundos) |
+| `display_timeout_s` | int | 0–3600 | Timeout de apagado de pantalla TFT (solo METEO; 0 = nunca apagar) |
 
 ### Payload telemetría (JSON)
 
@@ -360,9 +396,21 @@ Campos presentes en todos los perfiles salvo indicación:
   "relay_active":             0,
   "relay_count":              1,
   "soil_moisture":            50.0,
+  "halisense_ok":             true,
+  "soil_irrig_mode":          false,
+  "soil_temperature":         19.5,
+  "soil_ec":                  0.35,
+  "soil_ph":                  6.8,
+  "soil_tds":                 175.0,
+  "soil_n":                   42,
+  "soil_p":                   18,
+  "soil_k":                   31,
   "pipeline_pressure":        3.50,
   "pipeline_flow":            5.00,
   "flow_total_l":             12.3,
+  "flow_session_l":           3.5,
+  "flow_irrig_l":             11.8,
+  "flow_leak_l":              0.5,
   "pipeline_scenario":        "normal",
   "pipeline_mode":            "real",
   "pipeline_source":          "real",
@@ -382,6 +430,24 @@ Campos presentes en todos los perfiles salvo indicación:
 }
 ```
 
+Campos exclusivos **PROFILE_IRRIGATION** (solo cuando `DEVICE_PROFILE = 2`):
+
+```json
+{
+  "aht20_ok":           true,
+  "ina219_ok":          true,
+  "ina219_bus_voltage": 12.34,
+  "ina219_current_ma":  150.0,
+  "ina219_power_mw":    1850.0
+}
+```
+
+> - `aht20_ok`: `true` cuando el sensor AHT20 respondió correctamente. Si falla, la temperatura/humedad provienen del BMP280 o del simulador.
+> - `ina219_ok`: `true` cuando el INA219 respondió. Si falla, los tres campos se omiten del payload.
+> - `ina219_bus_voltage`: voltaje de bus medido (V), resolución 4 mV.
+> - `ina219_current_ma`: corriente (mA), resolución 0.1 mA (shunt 0.1 Ω).
+> - `ina219_power_mw`: potencia (mW), resolución 2 mW.
+
 Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
 
 ```json
@@ -392,10 +458,16 @@ Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
 }
 ```
 
+> - `halisense_ok`: `true` cuando el sensor RS485 respondió correctamente en el último ciclo
+> - `soil_irrig_mode`: `true` si el relay estaba activo o se estaba en ventana post-riego durante la lectura
+> - `soil_temperature … soil_k`: solo presentes cuando `halisense_ok = true`; si es `false`, se omiten del payload
 > - `temperature_source`: `"MCP9808"` | `"BMP280"` | `"HDC1080"` | `"SIM"`
 > - `pressure_source`: `"XDB401"` | `"MicroPressure"` | `"BMP280"` | `"SIM"`
 > - `pipeline_source`: `"real"` (presión+caudal reales) | `"real_flow"` (caudal real, presión sim) | `"sim"` | `"fallback"`
 > - `flow_total_l`: litros acumulados desde el último arranque (resolución 100 mL)
+> - `flow_session_l`: litros desde la última apertura de válvula (se resetea en transición OFF→ON del relay)
+> - `flow_irrig_l`: litros acumulados mientras el relay estuvo activo (ciclos de riego)
+> - `flow_leak_l`: litros acumulados mientras el relay estaba cerrado (posibles fugas de fondo)
 > - `xdb401_temperature`: temperatura del fluido medida por el sensor de presión — solo cuando `xdb401_ok = true`
 > - `ts`: timestamp NTP epoch Unix; se omite si el reloj aún no está sincronizado
 
@@ -444,15 +516,30 @@ El firmware publica en `aquantia/<finca_id>/alerts` solo al **cambio de estado**
 
 | `type` | `severity` | Cuándo |
 |--------|-----------|--------|
-| `device_reboot` | info | Al reconectar tras reinicio |
+| `device_reboot` | info | Al reconectar tras reinicio — el campo `message` incluye el motivo de reset (`encendido`, `reinicio SW`, `panic/crash`, `WDT tarea`, `brownout`, etc.) y, si fue WDT, la tarea/fase registrada por `wdt_heartbeat()` |
 | `mqtt_reconnect` | info | Reconexión al broker (no primer arranque) |
 | `leak` | warning | LeakDetector detecta fuga |
 | `burst` | critical | LeakDetector detecta rotura |
 | `obstruction` | warning | LeakDetector detecta obstrucción |
 | `pipeline_ok` | info | Pipeline se recupera a estado normal |
-| `sensor_failure` | warning | Sensor deja de responder (XDB401, MCP9808, BMP280, HTU2x, HDC1080, BH1750, MicroPressure) |
+| `sensor_failure` | warning | Sensor deja de responder (XDB401, MCP9808, BMP280, HTU2x, HDC1080, BH1750, MicroPressure, AHT20, INA219) |
 | `sensor_ok` | info | Sensor se recupera |
 | `low_heap` | warning | Heap libre < 30 KB |
+
+### Cooldown de alertas de sensor
+
+Las alertas `sensor_failure` / `sensor_ok` se disparan **solo al cambio de estado** (edge-triggered). Además, si el sensor permanece en fallo, el firmware re-emite la alerta cada **12 horas** (`SENSOR_ALERT_COOLDOWN = 43 200 000 ms`) para que el operador reciba un recordatorio sin inundar el broker.
+
+### Diagnóstico WDT — `wdt_heartbeat()`
+
+Antes de cada operación bloqueante relevante, el firmware llama a `wdt_heartbeat(taskName, phase)`, que escribe el nombre de la tarea y la fase en **RTC RAM** (persiste a través de reinicios). Si el WDT dispara durante esa operación, el campo `message` de la alerta `device_reboot` incluirá `"WDT tarea: <task>:<phase>"`, facilitando el diagnóstico remoto sin necesidad de monitor serie.
+
+Las fases registradas son:
+
+| Tarea | Fases |
+|-------|-------|
+| `NetworkTask` | *(idle)*, `wifi_reconnect`, `scenario_sync`, `mqtt_connect`, `mqtt_publish` |
+| `loopTask` | *(idle)*, `soil_rs485` |
 
 ---
 
@@ -494,16 +581,22 @@ El campo `relay_active` es un bitmask: bit 0 = relay 1, bit 1 = relay 2, etc.
 
 Solo `PROFILE_METEO`. Resolución **240×135 px** (ST7789). Doble buffer con `TFT_eSprite` → sin parpadeo.
 
+Los botones GPIO0/BOOT y GPIO35 ciclan entre las 4 vistas con debounce de 400 ms. Si la pantalla está apagada, el primer toque la reactiva sin cambiar de vista.
+
 ### Pantallas
 
-| Pantalla | Cuándo se muestra |
-|----------|------------------|
-| **Boot** | Primeros segundos del arranque |
-| **Setup AP** | Sin credenciales WiFi — muestra SSID y contraseña del AP |
-| **Meteo** (vista 1) | Funcionamiento normal — sensores meteorológicos en tiempo real |
-| **Pipeline** (vista 2) | Presión y caudal de tubería — alternar con BTN_LEFT / BTN_RIGHT |
+| Pantalla | `displayView` | Cuándo se muestra |
+|----------|:-------------:|------------------|
+| **Boot** | — | Primeros segundos del arranque |
+| **Setup AP** | — | Sin credenciales WiFi — muestra SSID y contraseña del AP |
+| **Meteo** | 0 | Funcionamiento normal — sensores meteorológicos en tiempo real |
+| **Pipeline** | 1 | Presión y caudal de tubería |
+| **Info** | 2 | Versión de firmware, IP, MAC, uptime |
+| **Suelo** | 3 | Datos del sensor Helissense (humedad, temperatura, pH, NPK) |
 
-### Vista Meteo
+Todas las vistas muestran 4 puntos de navegación en la cabecera (posiciones 110/119/128/137 px). El punto de la vista activa se muestra en blanco; los demás en gris.
+
+### Vista Meteo (vista 0)
 
 ```
 ┌──────────────────────────────────────┐
@@ -519,13 +612,13 @@ Solo `PROFILE_METEO`. Resolución **240×135 px** (ST7789). Doble buffer con `TF
 └──────────────────────────────────────┘
 ```
 
-### Vista Pipeline
+### Vista Pipeline (vista 1)
 
-Accesible pulsando cualquier botón cuando la pantalla está encendida. Dos tarjetas anchas (presión / caudal) más una franja inferior con modo, escenario y temperatura del agua:
+Dos tarjetas anchas (presión / caudal) más una franja inferior con modo, escenario y temperatura del agua:
 
 ```
 ┌──────────────────────────────────────┐
-│ PIPELINE            • ●  WiFi  ●      │  ← puntos: vista activa
+│ PIPELINE          •   WiFi  ●         │  ← punto 2 activo
 ├─────────────────────┬────────────────┤
 │ PRESION             │ CAUDAL         │
 │ 3.50 bar            │ 5.00 L/min     │
@@ -538,7 +631,70 @@ Accesible pulsando cualquier botón cuando la pantalla está encendida. Dos tarj
 
 Cuando el sensor XDB401 no está conectado o `pipeline_mode = sim`, los valores se muestran en naranja con badge `[SIM]` y la línea `Taq` desaparece.
 
-Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (60 s por defecto, configurable vía MQTT `display_timeout_s`).
+### Vista Suelo (vista 3)
+
+Muestra los datos del sensor Helissense RS485. Si el sensor no responde (`halisense_ok = false`), las tarjetas aparecen en rojo con el badge `HALI!`.
+
+```
+┌──────────────────────────────────────┐
+│ SUELO      HALI  WiFi  ●              │  ← HALI verde=OK / rojo=sin respuesta
+├──────────┬──────────┬────────────────┤
+│ HUM.SUELO│ T.SUELO  │ pH             │
+│ 45.2 %   │ 19.5 °C  │ 6.8           │
+├──────────┴──────────┴────────────────┤
+│ N: 42 mg/kg   P: 18 mg/kg   K: 31 mg/kg │
+└──────────────────────────────────────┘
+```
+
+Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de apagado (10 min por defecto, configurable vía MQTT `display_timeout_s`).
+
+---
+
+## Sensor de suelo RS485 Helissense
+
+Solo `PROFILE_METEO`. Sensor Modbus RTU conectado por RS485 half-duplex a `Serial2`.
+
+### Hardware y pines
+
+| Señal | GPIO | Notas |
+|-------|:----:|-------|
+| Serial2 RX (DI del sensor) | **13** | NO usar GPIO16 — es TFT_DC |
+| Serial2 TX (RO del sensor) | 17 | |
+| DE/RE (control half-duplex) | 27 | |
+
+> **Advertencia de hardware:** GPIO16 está asignado a TFT_DC por `Setup25_TTGO_T_Display.h`. Si el RX de RS485 se conecta a GPIO16, TFT_eSPI inyecta transiciones falsas en UART2 que corrompen las lecturas del sensor y provocan que los colores de la pantalla cambien aleatoriamente. Conectar siempre el DI del adaptador RS485 a **GPIO13**.
+
+### Protocolo
+
+Modbus RTU a **4800 baud, 8N1**. El firmware lee 7 registros desde la dirección 0x0000 del esclavo 0x01 con validación CRC-16.
+
+| Registro | Magnitud | Resolución |
+|:--------:|----------|:----------:|
+| 0 | Temperatura del suelo (°C) | ÷10 |
+| 1 | Humedad del suelo (%) | ÷10 |
+| 2 | CE — conductividad eléctrica (µS/cm → dS/m ÷1000, TDS ppm ×0.5) | — |
+| 3 | pH | ÷10 |
+| 4 | Nitrógeno N (mg/kg) | directo |
+| 5 | Fósforo P (mg/kg) | directo |
+| 6 | Potasio K (mg/kg) | directo |
+
+### Modo de operación y fallback
+
+- Si Helissense responde (`halisense_ok = true`): `soilMoisture` se toma de `soil_moisture` del sensor RS485.
+- Si Helissense **no responde** (`halisense_ok = false`): `soilMoisture` se toma del sensor analógico YL-69 (ADC GPIO33) como fallback.
+- El firmware marca `soil_irrig_mode = true` cuando algún relay está activo o se está en ventana post-riego; este flag indica que la lectura puede estar sesgada por el agua de riego reciente.
+
+### Muestreo adaptativo
+
+El sensor no se lee a intervalo fijo. El firmware ajusta la frecuencia según el estado del riego para capturar la evolución de la humedad en tiempo real:
+
+| Estado | Intervalo | Constante |
+|--------|----------:|-----------|
+| Reposo (válvula cerrada, fuera de ventana) | 20 s | `SOIL_SLOW_MS` |
+| Riego activo (relay ON) | 3 s | `SOIL_FAST_MS` |
+| Ventana post-riego (2 min tras cerrar) | 3 s | `SOIL_FAST_MS` |
+
+Al detectar el flanco OFF del relay se inicia la ventana post-riego (`soilPostIrrigEndMs`). Si el riego se reactiva antes de expirar, la ventana se cancela y el intervalo sigue siendo 3 s. Pasados 2 min (`SOIL_POST_IRRIG_MS = 120 000 ms`) sin nuevo riego, el intervalo vuelve a 20 s.
 
 ---
 
@@ -712,6 +868,13 @@ El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`
 | `pipeline_flow_ok` | bool | Caudalímetro real activo |
 | `pipeline_source` | string | `real` / `real_flow` / `sim` / `fallback` |
 | `flow_total_l` | float | Litros acumulados desde arranque (resolución ±100 mL) |
+| `flow_session_l` | float | Litros desde la última apertura de válvula (resetea en OFF→ON) |
+| `flow_irrig_l` | float | Litros acumulados con relay activo (riego) |
+| `flow_leak_l` | float | Litros acumulados con relay cerrado (posible fuga de fondo) |
+
+> **Nota sobre contadores de pulsos:** los cuatro contadores de caudal se acumulan internamente como `uint32_t` (pulsos) para evitar pérdida de precisión float en largos periodos. El backend puede pedir su reset enviando `reset_flow_counters: true` en la respuesta de `/api/pipeline/config`; el firmware los borra y responde con un ACK a `POST /api/flow/reset-ack?mac=<MAC>`.
+
+> **Cambio de perfil:** al cambiar `irrigation_type` (vía MQTT o HTTP), el LeakDetector reinicia su baseline EMA automáticamente, descartando el entrenamiento previo e iniciando un nuevo warm-up de 20 muestras.
 
 ---
 
@@ -721,6 +884,8 @@ El tipo se configura vía MQTT (`irrigation_type`) o HTTP `/api/pipeline/config`
 |----------|--------|
 | DHT11 lecturas inestables ocasionalmente | Conocido — valorar reemplazar por DHT22 o SHT31 |
 | Temperatura agua XDB401 puede reflejar T ambiente si la tubería está seca | Esperado — documentar en dashboard |
+| **GPIO16 (TFT_DC) no debe usarse como RX de Serial2** | **Resuelto** — Serial2 RX movido a GPIO13. Requiere reconectar el hilo DI del adaptador RS485 de GPIO16 a GPIO13 en el hardware. |
+| GPIO35 sin pull-up interno puede provocar ciclo de vistas espontáneo | **Resuelto** — debounce de 400 ms en la detección de flanco de botón |
 
 ---
 
