@@ -3434,9 +3434,15 @@ void loop() {
 
     // ── Datos variables ──────────────────────────────────────────────────────
     unsigned long up = millis() / 1000;
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+    DLOGF("[STATUS] %luh%02lum%02lus  Heap:%ld B  CSQ:%d\n",
+      up / 3600, (up % 3600) / 60, up % 60,
+      (long)ESP.getFreeHeap(), modemSIM.getSignalQuality());
+#else
     DLOGF("[STATUS] %luh%02lum%02lus  Heap:%ld B  RSSI:%d dBm\n",
       up / 3600, (up % 3600) / 60, up % 60,
       (long)ESP.getFreeHeap(), WiFi.RSSI());
+#endif
 
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
     DLOGF("[DATOS ] HDC:T=%.1f C  H=%.1f%%  BMP:T=%.1f C  P=%.2f kPa  BH:%.1f lx\n",
@@ -3459,8 +3465,13 @@ void loop() {
       sim_pipeline_pressure, sim_pipeline_flow, pipelineSource.c_str(), pipelineScenario);
 
     // ── Alertas de estado — solo imprime si hay algo anómalo ─────────────────
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+    if (!modemSIM.isGprsConnected())
+      DLOGLN("[WARN  ] GPRS DESCONECTADO");
+#else
     if (WiFi.status() != WL_CONNECTED)
       DLOGLN("[WARN  ] WiFi DESCONECTADO");
+#endif
 #if defined(USE_MQTT)
     if (!mqttClient.connected())
       DLOGLN("[WARN  ] MQTT DESCONECTADO");
