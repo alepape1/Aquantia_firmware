@@ -342,7 +342,7 @@ static TinyGsmClientSecure gsmTLSClient(modemSIM);
 static TinyGsmClient       gsmTCPClient(modemSIM);
 // Algunos firmwares SIM7000 mapean SSL al ctx=0 y otros al ctx=1.
 // Empezamos en 1 por compatibilidad histórica y rotamos automáticamente en timeout MQTT.
-static uint8_t             _gsmTlsCtx = 1;
+static uint8_t             _gsmTlsCtx = 0;  // TinyGSM SIM7000G usa ctx=0 internamente
 // ── Cache de estado GSM para lectura segura desde Core 1 ─────────────────────
 // TinyGSM NO es thread-safe: NUNCA llamar a modemSIM.* desde loop() (Core 1)
 // mientras NetworkTask (Core 0) pueda estar usando Serial1.
@@ -1753,8 +1753,9 @@ void networkTask(void* pvParameters) {
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
         mqttConnectFails++;
-        // Timeout de CONNECT en SIM7000 puede venir de contexto TLS o PDP inestable.
-        if (mqtt_port == 8883 && mqttClient.state() == -4) {
+        // Timeout o fallo TCP en SIM7000 puede venir de contexto TLS o PDP inestable.
+        // state=-4 = timeout; state=-1 = TCP no conectó (ctx TLS mal aplicado)
+        if (mqtt_port == 8883 && (mqttClient.state() == -4 || mqttClient.state() == -1)) {
           _gsmTlsCtx = (_gsmTlsCtx == 1) ? 0 : 1;
           gsmTlsConfigured = false;
           mqttConnectFails = 0;
