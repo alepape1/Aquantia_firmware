@@ -1229,7 +1229,7 @@ static void prepareGsmTLSClient(uint8_t /*unused*/ = 1) {
   // El handshake BearSSL sobre 2G/LTE-M puede tardar 20-40 s; margen amplio.
   gsmTLSClient.setTimeout(75000);
   DLOGF("[TLS] SSLClient configurado (BearSSL ESP32, SNI=auto, trust anchors=%d)\n",
-        mqtt_server, TAs_NUM);
+        TAs_NUM);
 }
 
 // Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
@@ -2056,90 +2056,113 @@ void networkTask(void* pvParameters) {
       takeSnapshot();
       const TelemetrySnapshot& snap = _netSnap;
 
-      // Redondeo para reducir tamaño del payload MQTT
-      auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
-      auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
+      auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };
+      auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };
 
-      // Payload ampliado con métricas explícitas del BMP280 e INA219 (IRRIGATION).
-      StaticJsonDocument<1280> doc;
-      doc["temperature"]           = r2(snap.tempMCP);
-      doc["pressure"]              = r2(snap.pressure);
-      doc["temperature_barometer"] = r2(snap.tempDHT);
-      doc["humidity"]              = r2(snap.humidity);
-      doc["bmp280_ok"]             = bmp_ok && (bmp_temp_ok || bmp_pressure_ok);
-      if (!isnan(snap.bmpTemp))     doc["bmp280_temperature"] = r2(snap.bmpTemp);
-      if (!isnan(snap.bmpPressure)) doc["bmp280_pressure"] = r2(snap.bmpPressure);
-      doc["windSpeed"]             = r2(snap.windSpeed);
-      doc["windDirection"]         = r1(snap.windDir);
-      doc["light"]                 = r1(snap.light);
-      doc["dht_temperature"]       = r1(snap.tempDHT11);
-      doc["dht_humidity"]          = r1(snap.humDHT11);
-      doc["rssi"]                  = snap.rssi;
-      doc["free_heap"]             = snap.heap;
-      doc["uptime_s"]              = snap.uptime;
-      doc["relay_active"]          = snap.relayMask;
-      doc["soil_moisture"]         = r1(snap.soil);
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
- || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-      doc["halisense_ok"]          = snap.halisenseOk;
-      doc["soil_irrig_mode"]       = snap.soilIrrigMode;
-      if (snap.halisenseOk) {
-        doc["soil_temperature"]    = r1(snap.soilTemp);
-        doc["soil_ec"]             = r2(snap.soilEc);
-        doc["soil_ph"]             = r1(snap.soilPh);
-        doc["soil_tds"]            = r1(snap.soilTds);
-        doc["soil_n"]              = snap.soilN;
-        doc["soil_p"]              = snap.soilP;
-        doc["soil_k"]              = snap.soilK;
-      }
-#endif
-      doc["pipeline_pressure"]     = r2(snap.pipePressure);
-      doc["pipeline_flow"]         = r2(snap.pipeFlow);
-      doc["flow_total_l"]          = roundf(snap.flowTotalL   * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
-      doc["pipeline_scenario"]     = pipelineScenario;
-      doc["pipeline_mode"]         = pipelineMode;
-      doc["pipeline_source"]       = pipelineSource;
-      doc["irrigation_type"]       = irrigTypeToStr(irrigationType);
-      doc["leak_detect_trained"]   = leakDetector.hasBaseline();
-      doc["pipeline_pressure_ok"]  = pipelinePressureOk;
-      doc["pipeline_flow_ok"]      = pipelineFlowOk;
-      doc["leak_baseline_pressure"] = r2(leakDetector.baselinePressure());
-      doc["leak_baseline_flow"]     = r2(leakDetector.baselineFlow());
-      doc["xdb401_ok"]             = xdb401_ok;
-      if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
-      doc["mac_address"]           = getDeviceMacAddress(); // eFuse — idéntico en WiFi y cellular
-#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-      doc["ip_address"]            = modemSIM.localIP().toString();
-      doc["network"]               = "cellular";
-#else
-      doc["ip_address"]            = WiFi.localIP().toString();
-#endif
-      doc["relay_count"]           = RELAY_COUNT;
-      doc["firmware_version"]      = FIRMWARE_VERSION;
-#if DEVICE_PROFILE == PROFILE_AQUALEAK
-      // Parámetros calculados agroambientales — solo PROFILE_AQUALEAK
-      if (!isnan(snap.dewPoint))   doc["dew_point"]    = r1(snap.dewPoint);
-#endif
-#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-      doc["aht20_ok"]  = aht20_ok;
-      doc["ina219_ok"] = ina219_ok;
-      if (!isnan(snap.inaPower))   doc["ina219_power_mw"]    = r1(snap.inaPower);
-#endif
-      // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
-      // El backend lo usa como timestamp real de la medición en lugar de NOW().
-      {
-        time_t ntp_ts = time(nullptr);
-        if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
-      }
-
-      char topic[64], buf[1280];
+      char topic[64];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
-      size_t payload_len = serializeJson(doc, buf, sizeof(buf));
-      if (payload_len >= sizeof(buf)) {
-        DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n",
-                      (unsigned)payload_len, (unsigned)sizeof(buf));
+      size_t payload_len;
+      bool ok;
+
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+      // ── GSM slim payload: ~350 B (sin campos estáticos, diagnósticos ni deprecados) ──
+      {
+        StaticJsonDocument<512> doc;
+        doc["temperature"]       = r2(snap.tempMCP);
+        doc["humidity"]          = r2(snap.humidity);
+        doc["pressure"]          = r2(snap.pressure);
+        doc["windSpeed"]         = r2(snap.windSpeed);
+        doc["windDirection"]     = r1(snap.windDir);
+        doc["light"]             = r1(snap.light);
+        doc["soil_moisture"]     = r1(snap.soil);
+        doc["pipeline_pressure"] = r2(snap.pipePressure);
+        doc["pipeline_flow"]     = r2(snap.pipeFlow);
+        doc["flow_total_l"]      = roundf(snap.flowTotalL * 10.0f) / 10.0f;
+        doc["relay_active"]      = snap.relayMask;
+        doc["rssi"]              = snap.rssi;
+        doc["mac_address"]       = getDeviceMacAddress();
+        if (snap.halisenseOk) {
+          doc["soil_temperature"] = r1(snap.soilTemp);
+          doc["soil_ec"]          = r2(snap.soilEc);
+          doc["soil_ph"]          = r1(snap.soilPh);
+          doc["soil_n"]           = snap.soilN;
+          doc["soil_p"]           = snap.soilP;
+          doc["soil_k"]           = snap.soilK;
+        }
+        if (!isnan(snap.inaPower)) doc["ina219_power_mw"] = r1(snap.inaPower);
+        { time_t _ts = time(nullptr); if (_ts > 1000000000L) doc["ts"] = (long)_ts; }
+        char buf[512];
+        payload_len = serializeJson(doc, buf, sizeof(buf));
+        if (payload_len >= sizeof(buf))
+          DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n", (unsigned)payload_len, (unsigned)sizeof(buf));
+        ok = mqttClient.publish(topic, buf, false);
       }
-      bool ok = mqttClient.publish(topic, buf, false);
+#else
+      // ── Full payload (WiFi / debug) ───────────────────────────────────────────
+      {
+        StaticJsonDocument<1024> doc;
+        doc["temperature"]           = r2(snap.tempMCP);
+        doc["pressure"]              = r2(snap.pressure);
+        doc["humidity"]              = r2(snap.humidity);
+        doc["bmp280_ok"]             = bmp_ok && (bmp_temp_ok || bmp_pressure_ok);
+        if (!isnan(snap.bmpTemp))     doc["bmp280_temperature"] = r2(snap.bmpTemp);
+        if (!isnan(snap.bmpPressure)) doc["bmp280_pressure"]    = r2(snap.bmpPressure);
+        doc["windSpeed"]             = r2(snap.windSpeed);
+        doc["windDirection"]         = r1(snap.windDir);
+        doc["light"]                 = r1(snap.light);
+        doc["rssi"]                  = snap.rssi;
+        doc["free_heap"]             = snap.heap;
+        doc["uptime_s"]              = snap.uptime;
+        doc["relay_active"]          = snap.relayMask;
+        doc["soil_moisture"]         = r1(snap.soil);
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+        doc["halisense_ok"]          = snap.halisenseOk;
+        doc["soil_irrig_mode"]       = snap.soilIrrigMode;
+        if (snap.halisenseOk) {
+          doc["soil_temperature"]    = r1(snap.soilTemp);
+          doc["soil_ec"]             = r2(snap.soilEc);
+          doc["soil_ph"]             = r1(snap.soilPh);
+          doc["soil_tds"]            = r1(snap.soilTds);
+          doc["soil_n"]              = snap.soilN;
+          doc["soil_p"]              = snap.soilP;
+          doc["soil_k"]              = snap.soilK;
+        }
+#endif
+        doc["pipeline_pressure"]     = r2(snap.pipePressure);
+        doc["pipeline_flow"]         = r2(snap.pipeFlow);
+        doc["flow_total_l"]          = roundf(snap.flowTotalL * 10.0f) / 10.0f;
+        doc["pipeline_scenario"]     = pipelineScenario;
+        doc["pipeline_mode"]         = pipelineMode;
+        doc["pipeline_source"]       = pipelineSource;
+        doc["irrigation_type"]       = irrigTypeToStr(irrigationType);
+        doc["leak_detect_trained"]   = leakDetector.hasBaseline();
+        doc["pipeline_pressure_ok"]  = pipelinePressureOk;
+        doc["pipeline_flow_ok"]      = pipelineFlowOk;
+        doc["leak_baseline_pressure"] = r2(leakDetector.baselinePressure());
+        doc["leak_baseline_flow"]     = r2(leakDetector.baselineFlow());
+        doc["xdb401_ok"]             = xdb401_ok;
+        if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
+        doc["mac_address"]           = getDeviceMacAddress();
+        doc["ip_address"]            = WiFi.localIP().toString();
+        doc["relay_count"]           = RELAY_COUNT;
+        doc["firmware_version"]      = FIRMWARE_VERSION;
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
+        if (!isnan(snap.dewPoint))   doc["dew_point"] = r1(snap.dewPoint);
+#endif
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+        doc["aht20_ok"]  = aht20_ok;
+        doc["ina219_ok"] = ina219_ok;
+        if (!isnan(snap.inaPower))   doc["ina219_power_mw"] = r1(snap.inaPower);
+#endif
+        { time_t _ts = time(nullptr); if (_ts > 1000000000L) doc["ts"] = (long)_ts; }
+        char buf[1024];
+        payload_len = serializeJson(doc, buf, sizeof(buf));
+        if (payload_len >= sizeof(buf))
+          DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n", (unsigned)payload_len, (unsigned)sizeof(buf));
+        ok = mqttClient.publish(topic, buf, false);
+      }
+#endif // DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+
       setLedState(ok ? LED_TX_OK : LED_TX_ERROR);
       DLOGF("[MQTT] TX %s (%u B)\n"
             "  T:%.1f°C(%s)  H:%.0f%%(%s)  P:%.2fkPa(%s)\n"
