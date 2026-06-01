@@ -2080,6 +2080,8 @@ void networkTask(void* pvParameters) {
         doc["flow_total_l"]      = roundf(snap.flowTotalL * 10.0f) / 10.0f;
         doc["relay_active"]      = snap.relayMask;
         doc["rssi"]              = snap.rssi;
+        doc["free_heap"]         = snap.heap;
+        doc["uptime_s"]          = snap.uptime;
         doc["mac_address"]       = getDeviceMacAddress();
         if (snap.halisenseOk) {
           doc["soil_temperature"] = r1(snap.soilTemp);

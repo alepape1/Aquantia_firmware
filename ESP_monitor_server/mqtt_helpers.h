@@ -189,7 +189,7 @@ bool mqttConnect() {
 
 // Publicar datos de registro al arranque (una sola vez)
 void mqttPublishRegister() {
-  StaticJsonDocument<320> doc;
+  StaticJsonDocument<400> doc;
   doc["device_serial"]    = device_serial_get();   // AQ-{MAC} — identidad hardware
   doc["mac_address"]      = getDeviceMacAddress(); // "FC:B4:67:F3:77:48" — mismo en WiFi y cellular
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
@@ -202,6 +202,8 @@ void mqttPublishRegister() {
   doc["chip_revision"]    = (int)ESP.getChipRevision();
   doc["cpu_freq_mhz"]     = (int)ESP.getCpuFreqMHz();
   doc["flash_size_mb"]    = (int)(ESP.getFlashChipSize() / 1048576);
+  doc["sketch_size_kb"]   = (int)(ESP.getSketchSize() / 1024);
+  doc["free_sketch_kb"]   = (int)(ESP.getFreeSketchSpace() / 1024);
   doc["sdk_version"]      = ESP.getSdkVersion();
   doc["relay_count"]      = RELAY_COUNT;
   doc["firmware_version"] = FIRMWARE_VERSION;
