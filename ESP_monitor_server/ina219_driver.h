@@ -9,7 +9,7 @@
 //   Reg Cal     (0x05): 0x1000  → current_lsb = 0.1 mA/bit, power_lsb = 2 mW/bit
 // =============================================================================
 
-#if DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 
 #define INA219_ADDR      0x40   // A0=GND, A1=GND
 #define INA219_REG_CFG   0x00
@@ -75,4 +75,4 @@ static float ina219_readPower_mW() {
   return (float)(uint16_t)raw * 2.0f;  // unsigned, 2 mW/bit
 }
 
-#endif  // PROFILE_IRRIGATION
+#endif  // PROFILE_IRRIGATION || PROFILE_AQUA_SMART_REMOTE

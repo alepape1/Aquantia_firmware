@@ -14,13 +14,20 @@
 
 #ifndef ESP8266  // todo este archivo es solo ESP32
 
+// PROFILE_AQUA_SMART_REMOTE usa TinyGSM (sin WiFi): no incluir WiFi.h
+// para evitar que el driver WiFi inicialice señales internas del modem (GPIO 85)
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 #include <WiFi.h>
+#endif
 #include <esp_mac.h>
 
 #ifndef DEV_MODE
 #include <Preferences.h>
+// WebServer + DNSServer solo para perfiles WiFi — AQUA_SMART_REMOTE usa cellular
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 #include <WebServer.h>
 #include <DNSServer.h>
+#endif
 
 // ── Buffers globales de credenciales ─────────────────────────────────────────
 char prov_ssid[64]       = "";

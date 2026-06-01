@@ -30,6 +30,9 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
   `SoilSensor(Serial2, rxPin, txPin, dePin)` tenía los pines en orden incorrecto.
   Corregido a `SoilSensor(Serial2, 14, 13, 27)` → RX=GPIO14, TX=GPIO13, DE/RE=GPIO27.
   Actualizado también el comentario en el `.ino` y el PINOUT.md.
+- **Caudalímetro en PROFILE_AQUA_SMART_REMOTE**: GPIO34 es solo entrada en la T-SIM7000 y
+  no soporta pull-up interna. Se cambió la inicialización a `INPUT` para evitar el error
+  `gpio_pullup_en(...)` al arrancar.
 
 ### Improved
 - **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de

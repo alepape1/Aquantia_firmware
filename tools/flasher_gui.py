@@ -85,6 +85,7 @@ FQBN_BY_PROFILE = {
     "1": "esp32:esp32:lilygo_t_display",   # METEO — LilyGo TTGO T-Display
     "2": "esp32:esp32:esp32",              # IRRIGATION — ESP32 genérico
     "3": "esp32:esp32:esp32",              # AQUALEAK — ESP32 genérico
+    "4": "esp32:esp32:esp32",              # AQUA_SMART_REMOTE — LilyGO T-SIM7000G
 }
 
 BACKEND_URL = "https://meteo.aquantialab.com"
@@ -116,7 +117,11 @@ PROFILES = {
     "METEO  — 1 relay  (pantalla TFT)": "1",
     "IRRIGATION — 4 relays (sin pantalla)": "2",
     "AQUALEAK — 1 relay + caudalimetro (BH1750+HDC1080+BMP280)": "3",
+    "AQUA_SMART_REMOTE — 4 relays + SIM7000G celular (Onomondo)": "4",
 }
+
+# Perfiles que NO tienen ArduinoOTA (sin WiFi)
+PROFILES_NO_OTA = {"4"}
 
 DEFAULT_PROFILE_LABEL = "METEO  — 1 relay  (pantalla TFT)"
 DEFAULT_PROFILE = PROFILES[DEFAULT_PROFILE_LABEL]
@@ -124,6 +129,7 @@ BOARD_LABEL_BY_PROFILE = {
     "1": "LilyGo T-Display",
     "2": "ESP32 genérico",
     "3": "ESP32 genérico",
+    "4": "LilyGO T-SIM7000G",
 }
 
 
@@ -799,7 +805,7 @@ class FlasherApp(tk.Tk):
                                   values=list(PROFILES.keys()),
                                   state="readonly", width=38)
         profile_cb.grid(row=1, column=1, sticky="ew", **PAD)
-        profile_cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_binary_status())
+        profile_cb.bind("<<ComboboxSelected>>", lambda _: (self._refresh_binary_status(), self._update_mode_ui()))
 
         # ── Rama + versión ──
         tk.Label(self, text="Origen:",
@@ -1435,6 +1441,15 @@ class FlasherApp(tk.Tk):
         """Busca dispositivos OTA en la red local (en background)."""
         if self._busy:
             return
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+        if profile in PROFILES_NO_OTA:
+            messagebox.showinfo(
+                "OTA no disponible",
+                "El perfil AQUA_SMART_REMOTE usa conectividad celular (SIM7000G).\n"
+                "ArduinoOTA requiere WiFi — no aplicable a este perfil.\n\n"
+                "Para actualizar firmware: usa Flash USB con el cable serie."
+            )
+            return
         self._btn_discover_ota.config(state="disabled")
         self._ota_devices_cb["values"] = []
         self._ota_devices_var.set("")
@@ -1609,6 +1624,7 @@ class FlasherApp(tk.Tk):
 
     def _update_mode_ui(self):
         dev = self._dev_mode_var.get()
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
         if dev:
             self._btn_dev.config(relief="sunken",  bg="#2d6a9f", fg="white")
             self._btn_prod.config(relief="raised", bg="#e0e0e0", fg="black")
@@ -1616,7 +1632,14 @@ class FlasherApp(tk.Tk):
         else:
             self._btn_dev.config(relief="raised",  bg="#e0e0e0", fg="black")
             self._btn_prod.config(relief="sunken", bg="#8b4513", fg="white")
-            self._mode_lbl.config(text="Portal SoftAP + NVS + token de fábrica", fg="#f0a000")
+            if profile in PROFILES_NO_OTA:
+                self._mode_lbl.config(
+                    text="NVS + token de fábrica (sin SoftAP — conectividad celular)", fg="#f0a000"
+                )
+            else:
+                self._mode_lbl.config(
+                    text="Portal SoftAP + NVS + token de fábrica", fg="#f0a000"
+                )
 
     # ── Lógica principal ──────────────────────────────────────────────────────
 
@@ -1819,6 +1842,15 @@ class FlasherApp(tk.Tk):
 
     def _flash_ota(self):
         if self._busy:
+            return
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+        if profile in PROFILES_NO_OTA:
+            messagebox.showinfo(
+                "OTA no disponible",
+                "El perfil AQUA_SMART_REMOTE usa conectividad celular (SIM7000G).\n"
+                "ArduinoOTA requiere WiFi — no aplicable a este perfil.\n\n"
+                "Para actualizar firmware: usa Flash USB con el cable serie."
+            )
             return
         ip = self._ip_var.get().strip()
         if not ip:
@@ -2105,6 +2137,25 @@ class FlasherApp(tk.Tk):
         offset_hex = f"0x{nvs_part['offset']:05X}"
         size_hex   = f"0x{nvs_part['size']:05X}"
         size_kb    = nvs_part['size'] // 1024
+        profile    = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+        is_cellular = profile in PROFILES_NO_OTA
+
+        if is_cellular:
+            erases_note = (
+                "Esto eliminará:\n"
+                "  • Token MQTT de fábrica\n"
+                "  • Serial number almacenado\n\n"
+                "El dispositivo arrancará sin credenciales (celular activo).\n"
+                "Vuelve a provisionar con 'Provisionar fábrica'.\n\n"
+            )
+        else:
+            erases_note = (
+                "Esto eliminará:\n"
+                "  • Credenciales WiFi configuradas\n"
+                "  • Token MQTT de fábrica\n"
+                "  • Serial number almacenado\n\n"
+                "El dispositivo arrancará en modo SoftAP la próxima vez.\n\n"
+            )
 
         confirmed = messagebox.askyesno(
             "Confirmar borrado NVS",
@@ -2113,11 +2164,7 @@ class FlasherApp(tk.Tk):
             f"  Nombre:  {nvs_part['name']}\n"
             f"  Offset:  {offset_hex}\n"
             f"  Tamaño:  {size_hex}  ({size_kb} KB)\n\n"
-            "Esto eliminará:\n"
-            "  • Credenciales WiFi configuradas\n"
-            "  • Token MQTT de fábrica\n"
-            "  • Serial number almacenado\n\n"
-            "El dispositivo arrancará en modo SoftAP la próxima vez.\n\n"
+            + erases_note +
             f"Puerto: {port}",
             icon="warning",
         )
@@ -2130,11 +2177,11 @@ class FlasherApp(tk.Tk):
         # Fase 3 — borrado real (background)
         threading.Thread(
             target=self._erase_nvs_run,
-            args=(port, nvs_part["offset"], nvs_part["size"]),
+            args=(port, nvs_part["offset"], nvs_part["size"], is_cellular),
             daemon=True,
         ).start()
 
-    def _erase_nvs_run(self, port, offset, size):
+    def _erase_nvs_run(self, port, offset, size, is_cellular=False):
         """Fase 3 — ejecuta esptool erase_region con los valores reales del chip."""
         try:
             self._start_progress("indeterminate")
@@ -2152,8 +2199,13 @@ class FlasherApp(tk.Tk):
             self._stop_progress(ok)
             if ok:
                 self._log_line("\n✓  NVS borrada correctamente.", "#4ec9b0")
-                self._log_line("   El dispositivo arrancará en modo SoftAP la próxima vez.", "#888")
-                self._set_status("NVS borrada — configura WiFi por SoftAP o re-provisiona")
+                if is_cellular:
+                    self._log_line("   El dispositivo arrancará sin credenciales (conectividad celular activa).", "#888")
+                    self._log_line("   Vuelve a provisionar con 'Provisionar fábrica'.", "#888")
+                    self._set_status("NVS borrada — re-provisiona con 'Provisionar fábrica'")
+                else:
+                    self._log_line("   El dispositivo arrancará en modo SoftAP la próxima vez.", "#888")
+                    self._set_status("NVS borrada — configura WiFi por SoftAP o re-provisiona")
             else:
                 self._log_line("\n✗  Error al borrar NVS.", "#f44747")
                 self._log_line("   Asegúrate de que el dispositivo está en modo bootloader.", "#888")

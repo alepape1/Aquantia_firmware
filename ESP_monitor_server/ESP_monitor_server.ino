@@ -83,7 +83,7 @@
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
   #define FLOW_K_FACTOR   660   // YF-B4 — usar mismo valor calibrado que METEO hasta nueva calibración
 #elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  #define FLOW_PIN         34   // Caudalímetro — GPIO34, ADC1_CH6, solo entrada
+  #define FLOW_PIN         34   // Caudalímetro — GPIO34, ADC1_CH6, solo entrada; requiere pull-up externo
   #define FLOW_K_FACTOR   660   // YF-B4 — mismo valor que IRRIGATION hasta calibración propia
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
@@ -967,7 +967,7 @@ struct TelemetrySnapshot {
   bool  halisenseOk;
   bool  soilIrrigMode;  // true si la lectura fue tomada en riego o ventana post-riego
 #endif
-#if DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   float inaVbus, inaCurrent, inaPower;  // INA219
 #endif
 } _netSnap;
@@ -1070,7 +1070,9 @@ static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000)
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 static void prepareGsmTLSClient() {
-  gsmTLSClient.setCACert(MQTT_CA_CERT_PEM);
+  // TLS en SIM7000G se configura en el modem vía AT+CSSLCFG (no via client API).
+  // TinyGSM 0.12.0 no expone setCACert en TinyGsmClientSecure para SIM7000SSL.
+  // La CA se sube al modem mediante AT+CFSINIT/AT+CFSWFILE si se requiere verificación estricta.
 }
 
 // Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
@@ -1137,6 +1139,8 @@ static bool parseRelayBitmask(const String& response, int& bitmaskOut) {
   return true;
 }
 
+// HTTP-only helpers — no disponible en AQUA_SMART_REMOTE (conectividad celular, sin HTTPClient)
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 void postDeviceInfo() {
   JsonDocument doc;
   doc["chip_model"]    = ESP.getChipModel();
@@ -1343,6 +1347,7 @@ bool httpPost(const String& url, const String& body) {
   http.end();
   return (code == 200 || code == 201);
 }
+#endif  // DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 
 // =============================================================================
 // PANTALLA TFT (solo ESP32)
@@ -2094,8 +2099,13 @@ void setup() {
 #endif
 
 #if defined(FLOW_PIN)
-  // Caudalímetro: pull-up interno activo (BC547 NPN invierte señal → FALLING = pulso)
+  // GPIO 34-39 son input-only en ESP32 — sin pull-up interno; el circuito BC547 provee el pull-up externo.
+  // METEO (GPIO32) y AQUALEAK (GPIO17) sí soportan pull-up interno.
+  #if FLOW_PIN >= 34
+  pinMode(FLOW_PIN, INPUT);
+  #else
   pinMode(FLOW_PIN, INPUT_PULLUP);
+  #endif
   _flowLastCalcUs = micros();
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowPulseISR, FALLING);
   DLOGF("Caudalimetro GPIO%d configurado (ISR FALLING, K=%d pulsos/L)\n",
