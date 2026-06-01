@@ -6,5 +6,6 @@ Esta wiki documenta el firmware del sistema Aquantia para ESP32.
 - [Instalación](Instalacion)
 - [Uso](Uso)
 - [Sensores soportados](Sensores)
+- [TLS / Certificados MQTT](TLS)
 - [Solución de problemas](FAQ)
 - [Referencias técnicas](Referencias)

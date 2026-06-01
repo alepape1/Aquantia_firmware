@@ -496,9 +496,20 @@ El backend acepta **dos tipos de credenciales**:
 
 Si el broker no puede alcanzar el backend, deniega todas las conexiones.
 
-### TLS — certificado ISRG Root X1
+### TLS — arquitectura por perfil
 
-La verificación TLS usa el certificado raíz de Let's Encrypt almacenado en `mqtt_cert.h` como `PROGMEM`. No consume RAM dinámica. El CN del broker (`meteo.aquantialab.com`) se verifica automáticamente — no se usa `setInsecure()`.
+El firmware implementa TLS de forma diferente según el perfil de hardware:
+
+| Perfil | Librería TLS | Fuente de confianza | Cómo funciona |
+|--------|-------------|---------------------|---------------|
+| WiFi (`DEFAULT` / `IRRIGATION`) | `WiFiClientSecure` (mbedTLS) | `mqtt_cert.h` — bundle PEM (R13 + ISRG Root X1) | `setCACert()` antes de conectar |
+| SIM (`AQUA_SMART_REMOTE`) | `SSLClient` (BearSSL en ESP32) | `trust_anchors.h` — struct BearSSL | Handshake TLS en el MCU sobre TCP plano |
+
+**Por qué dos métodos:** El firmware SIM7000G R1529 no soporta `AT+CSSLCFG="authmode"` ni `AT+CSSLCFG="cacert"`, por lo que el stack SSL hardware del modem no puede verificar CA. BearSSL corre completamente en el ESP32 sobre un socket TCP normal del SIM7000G.
+
+**Raíz de confianza:** Let's Encrypt ISRG Root X1 — fingerprint SHA-256 `96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6`. Expira 2035 — normalmente no necesita renovación manual.
+
+Para regenerar los archivos de certificado si cambia la CA raíz, ver [`tools/gen_trust_anchor.py`](tools/gen_trust_anchor.py) y la [wiki de TLS](wiki/TLS.md).
 
 ---
 
