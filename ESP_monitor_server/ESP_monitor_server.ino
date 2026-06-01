@@ -1150,6 +1150,14 @@ static void prepareGsmTLSClient() {
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: authmode no confirmado");
 
+  // SNI para brokers detrás de balanceadores / frontends TLS con virtual hosting.
+  // Algunos enlaces GSM fallan con un handshake genérico si el servidor espera SNI.
+  char sniCmd[128];
+  snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",1,\"%s\"", mqtt_server);
+  modemSIM.sendAT(sniCmd);
+  if (modemSIM.waitResponse(3000L) != 1)
+    DLOGLN("[TLS] WARN: sni no confirmado");
+
   // Asociar el fichero de CA cert al contexto SSL 0
   modemSIM.sendAT(GF("+CSSLCFG=\"cacert\",1,\"mqtt_ca.pem\""));
   if (modemSIM.waitResponse(3000L) != 1)
@@ -1158,6 +1166,9 @@ static void prepareGsmTLSClient() {
   // Timeout de negociación TLS: 60 s (2G puede tardar 20-40 s en el handshake)
   modemSIM.sendAT(GF("+CSSLCFG=\"negotiatetime\",1,60"));
   modemSIM.waitResponse(3000L);
+
+  // El handshake TLS del módem puede superar con holgura los 10 s si hay latencia GSM.
+  gsmTLSClient.setTimeout(75000);
 
   DLOGLN("[TLS] SSL SIM7000G configurado (TLS1.2, authmode=1, cacert=mqtt_ca.pem)");
 }

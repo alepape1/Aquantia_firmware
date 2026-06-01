@@ -33,6 +33,9 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 - **Caudalímetro en PROFILE_AQUA_SMART_REMOTE**: GPIO34 es solo entrada en la T-SIM7000 y
   no soporta pull-up interna. Se cambió la inicialización a `INPUT` para evitar el error
   `gpio_pullup_en(...)` al arrancar.
+- **MQTT TLS en SIM7000G**: se añadió configuración SNI para `meteo.aquantialab.com` y un
+  timeout más largo en el cliente TLS del módem para completar el handshake sobre enlaces
+  GSM con latencia alta.
 
 ### Improved
 - **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de
