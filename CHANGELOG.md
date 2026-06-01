@@ -44,6 +44,9 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 - **Sondeo celular SIM7000G con cadencia controlada**: `NetworkTask` deja de ejecutar
   consultas AT/GPRS en cada iteración de 10 ms y pasa a un polling cada 2 s (o inmediato
   si GPRS cae). Reduce la interferencia sobre sockets TLS/MQTT y evita reconexiones espurias.
+- **Diagnóstico MQTT celular sin consultas AT extra**: los logs de estado de red durante
+  reconexión usan cache (`_gprsConnectedFlag`, `_simCsqCache`) en lugar de preguntar al
+  módem en caliente. Reduce comandos AT durante `connect()` y caídas tras `loop()`.
 - **Cooldown de alertas de sensor** (`SENSOR_ALERT_COOLDOWN = 12 h`): evita que un sensor
   persistentemente muerto inunde el broker con alertas repetidas. Tras el primer disparo
   edge-triggered, la alerta se re-emite cada 12 horas mientras el fallo persista.

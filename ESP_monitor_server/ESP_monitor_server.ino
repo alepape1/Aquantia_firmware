@@ -1520,10 +1520,15 @@ void networkTask(void* pvParameters) {
 
 #ifdef USE_MQTT
   static unsigned long mqttRetryDelayMs = 2000;
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  static bool gsmTlsConfigured = false;
+  static int  mqttConnectFails = 0;
+#endif
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (mqtt_port == 8883) {
     prepareGsmTLSClient();
+    gsmTlsConfigured = true;
     mqttClient.setClient(gsmTLSClient);
     DLOGF("[MQTT] Broker TLS (GSM): %s:%d\n", mqtt_server, mqtt_port);
   } else {
@@ -1577,6 +1582,9 @@ void networkTask(void* pvParameters) {
         wifiFailCount++;
         _gprsConnectedFlag = false;
         _simCsqCache = 0;
+#ifdef USE_MQTT
+        if (mqtt_port == 8883) gsmTlsConfigured = false;
+#endif
         DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
         if (wifiFailCount >= 30) {
           DLOGLN("[SIM] 30 fallos AT consecutivos — reiniciando ESP");
@@ -1603,6 +1611,9 @@ void networkTask(void* pvParameters) {
         bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
         _gprsConnectedFlag = gprsOk;
         _simCsqCache = modemSIM.getSignalQuality();
+      #ifdef USE_MQTT
+        if (mqtt_port == 8883) gsmTlsConfigured = gprsOk ? false : gsmTlsConfigured;
+      #endif
         DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
               gprsOk ? "OK" : "FAIL", _simCsqCache);
         if (!gprsOk) {
@@ -1690,14 +1701,16 @@ void networkTask(void* pvParameters) {
       DLOGF("[MQTT] Desconectado — state=%d  retryMs=%lu\n",
             mqttClient.state(), mqttRetryDelayMs);
   #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-      DLOGF("[MQTT] Estado red antes de conectar: isNet=%d  isGPRS=%d  CSQ=%d\n",
-            (int)modemSIM.isNetworkConnected(),
-            (int)modemSIM.isGprsConnected(),
-            modemSIM.getSignalQuality());
+    DLOGF("[MQTT] Estado red antes de conectar: isGPRS=%d  CSQ=%d\n",
+      (int)_gprsConnectedFlag,
+      _simCsqCache);
   #endif
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-      if (mqtt_port == 8883) prepareGsmTLSClient();
+  if (mqtt_port == 8883 && !gsmTlsConfigured) {
+    prepareGsmTLSClient();
+    gsmTlsConfigured = true;
+  }
 #else
       if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
 #endif
@@ -1707,11 +1720,18 @@ void networkTask(void* pvParameters) {
         DLOGF("[MQTT] Connect FAIL — state=%d  broker=%s:%d  user=%s\n",
               mqttClient.state(), mqtt_server, mqtt_port, mqtt_user);
   #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-        DLOGF("[MQTT] Estado red tras fallo: isNet=%d  isGPRS=%d  CSQ=%d\n",
-              (int)modemSIM.isNetworkConnected(),
-              (int)modemSIM.isGprsConnected(),
-              modemSIM.getSignalQuality());
+      DLOGF("[MQTT] Estado red tras fallo: isGPRS=%d  CSQ=%d\n",
+        (int)_gprsConnectedFlag,
+        _simCsqCache);
   #endif
+#endif
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+        mqttConnectFails++;
+        // Si fallan varios CONNECT seguidos, forzar reprovisión del contexto TLS.
+        if (mqtt_port == 8883 && mqttConnectFails >= 3) {
+          gsmTlsConfigured = false;
+          mqttConnectFails = 0;
+        }
 #endif
         vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
         if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
@@ -1719,6 +1739,9 @@ void networkTask(void* pvParameters) {
       }
       setLedState(LED_IDLE);
       mqttRetryDelayMs = 2000;
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+      mqttConnectFails = 0;
+#endif
       if (!deviceInfoSent) {
         mqttPublishRegister();
         deviceInfoSent = true;
@@ -1753,11 +1776,10 @@ void networkTask(void* pvParameters) {
         DLOGF("[MQTT] Detectada desconexión tras loop() — state=%d  uptime=%lus\n",
               mqttClient.state(), millis() / 1000);
   #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-        DLOGF("[SIM] Estado tras caída MQTT: isNet=%d  isGPRS=%d  CSQ=%d  IP=%s\n",
-              (int)modemSIM.isNetworkConnected(),
-              (int)modemSIM.isGprsConnected(),
-              modemSIM.getSignalQuality(),
-              modemSIM.localIP().toString().c_str());
+      DLOGF("[SIM] Estado tras caída MQTT: isGPRS=%d  CSQ=%d  IP=%s\n",
+        (int)_gprsConnectedFlag,
+        _simCsqCache,
+        modemSIM.localIP().toString().c_str());
   #endif
       }
     }
