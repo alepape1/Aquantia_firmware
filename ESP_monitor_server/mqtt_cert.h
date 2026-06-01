@@ -1,9 +1,13 @@
-// mqtt_cert.h — bundle CA para TLS contra meteo.aquantialab.com
-// Incluye la intermedia R13 y la raíz ISRG Root X1 de Let's Encrypt.
+﻿// mqtt_cert.h — bundle CA para TLS contra meteo.aquantialab.com
+// Incluye la intermedia R13 y la raiz ISRG Root X1 de Let's Encrypt.
+// Certs descargados de la cadena real del broker (meteo.aquantialab.com:8883)
+// y del repositorio oficial de Let's Encrypt (isrgrootx1.pem).
 //
-// Nota: algunas builds de ESP32/mbedTLS son sensibles a PEM con saltos
-// de línea extra al inicio. Por eso el bundle se mantiene sin línea en blanco
-// previa al BEGIN CERTIFICATE.
+// ISRG Root X1 SHA-256: 96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:
+//                       CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6
+//
+// Path WiFi (prepareSecureClient): setCACert(MQTT_CA_CERT_PEM)
+// Path SIM (SSLClient): trust_anchors.h  -- este archivo NO se usa para SIM.
 
 #pragma once
 
@@ -42,7 +46,7 @@ TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
 cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
 WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
 ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
-MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoBggIBAK3oJHP0FDfzm54rVygc
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
 h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
 0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
 A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW

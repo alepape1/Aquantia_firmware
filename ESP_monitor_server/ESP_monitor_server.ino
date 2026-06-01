@@ -37,9 +37,13 @@
 
 // ── Plataforma: ESP32 ─────────────────────────────────────────────────────────
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  // AQUA_SMART_REMOTE usa conectividad celular — sin WiFi
-  #define TINY_GSM_MODEM_SIM7000SSL
+  // AQUA_SMART_REMOTE usa conectividad celular — sin WiFi.
+  // SIM7000SSL no se usa: el stack SSL hardware del R1529 no soporta authmode/cacert.
+  // TLS lo gestiona el ESP32 (BearSSL via SSLClient) sobre TCP plano.
+  #define TINY_GSM_MODEM_SIM7000
   #include <TinyGsmClient.h>
+  #include <SSLClient.h>
+  #include "trust_anchors.h"
 #else
   #include "WiFi.h"
   #include <HTTPClient.h>
@@ -340,11 +344,11 @@ bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 #ifdef USE_MQTT
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 static TinyGsm             modemSIM(Serial1);
-static TinyGsmClientSecure gsmTLSClient(modemSIM);
-static TinyGsmClient       gsmTCPClient(modemSIM);
-// Algunos firmwares SIM7000 mapean SSL al ctx=0 y otros al ctx=1.
-// Empezamos en 1 por compatibilidad histórica y rotamos automáticamente en timeout MQTT.
-static uint8_t             _gsmTlsCtx = 0;  // TinyGSM SIM7000G usa ctx=0 internamente
+static TinyGsmClient  gsmTCPClient(modemSIM, 0);  // TCP puro (puerto 1883 / base para TLS)
+static TinyGsmClient  _gsmTCPBase (modemSIM, 1);  // canal independiente para SSLClient
+// BearSSL en el ESP32: TLS gestionado por el MCU, no por el SIM7000G.
+// A0 = pin analógico flotante para semilla de entropía.
+static SSLClient      gsmTLSClient(&_gsmTCPBase, TAs, TAs_NUM, A0);
 // ── Cache de estado GSM para lectura segura desde Core 1 ─────────────────────
 // TinyGSM NO es thread-safe: NUNCA llamar a modemSIM.* desde loop() (Core 1)
 // mientras NetworkTask (Core 0) pueda estar usando Serial1.
@@ -1218,52 +1222,14 @@ static void sim7000g_uploadCACert() {
   modemSIM.waitResponse(3000L);
 }
 
-static void prepareGsmTLSClient(uint8_t sslCtx = 1) {
-  // TLS en SIM7000G se configura mediante AT+CSSLCFG + CA cert en su FS interno.
-  // TinyGSM 0.12.0 no expone setCACert() para SIM7000SSL.
-  // Flujo: subir cert bundle (R13 + ISRG Root X1) → configurar contexto SSL.
-  // En SIM7000 hay variantes que usan ctx=0 y otras ctx=1; se permite alternar.
-
-  DLOGF("[TLS] Configurando SSL en SIM7000G (ctx=%u)...\n", (unsigned)sslCtx);
-
-  // TLS 1.2 (único soportado de forma fiable en SIM7000G R1529)
-  char sslCmd[96];
-  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"sslversion\",%u,3", (unsigned)sslCtx);
-  modemSIM.sendAT(sslCmd);
-  if (modemSIM.waitResponse(3000L) != 1)
-    DLOGLN("[TLS] WARN: sslversion no confirmado");
-
-  // No validar timestamp del cert contra RTC del módulo (RTC puede estar sin sincronizar)
-  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"ignorertctime\",%u,1", (unsigned)sslCtx);
-  modemSIM.sendAT(sslCmd);
-  if (modemSIM.waitResponse(3000L) != 1)
-    DLOGLN("[TLS] WARN: ignorertctime no confirmado");
-
-  // Prueba temporal: desactivar verificación de CA para aislar fallos de handshake.
-  // Si MQTT conecta así, el problema está en la validación del certificado.
-  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"authmode\",%u,0", (unsigned)sslCtx);
-  modemSIM.sendAT(sslCmd);
-  if (modemSIM.waitResponse(3000L) != 1)
-    DLOGLN("[TLS] WARN: authmode no confirmado");
-
-  // SNI para brokers detrás de balanceadores / frontends TLS con virtual hosting.
-  // Algunos enlaces GSM fallan con un handshake genérico si el servidor espera SNI.
-  char sniCmd[128];
-  snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",%u,\"%s\"", (unsigned)sslCtx, mqtt_server);
-  modemSIM.sendAT(sniCmd);
-  if (modemSIM.waitResponse(3000L) != 1)
-    DLOGLN("[TLS] WARN: sni no confirmado");
-
-  // Timeout de negociación TLS: 60 s (2G puede tardar 20-40 s en el handshake)
-  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"negotiatetime\",%u,60", (unsigned)sslCtx);
-  modemSIM.sendAT(sslCmd);
-  modemSIM.waitResponse(3000L);
-
-  // El handshake TLS del módem puede superar con holgura los 10 s si hay latencia GSM.
+static void prepareGsmTLSClient(uint8_t /*unused*/ = 1) {
+  // TLS gestionado por BearSSL en el ESP32 (SSLClient sobre TinyGsmClient TCP).
+  // El SIM7000G R1529 no soporta AT+CSSLCFG="authmode"/"cacert" — stack hardware descartado.
+  gsmTLSClient.setHostname(mqtt_server);  // SNI: indica el host al servidor TLS
+  // El handshake BearSSL sobre 2G/LTE-M puede tardar 20-40 s; margen amplio.
   gsmTLSClient.setTimeout(75000);
-
-  DLOGF("[TLS] SSL SIM7000G configurado (ctx=%u, TLS1.2, authmode=0, sin CA)\n",
-        (unsigned)sslCtx);
+  DLOGF("[TLS] SSLClient configurado (BearSSL ESP32, SNI=%s, trust anchors=%d)\n",
+        mqtt_server, TAs_NUM);
 }
 
 // Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
@@ -1638,17 +1604,14 @@ void networkTask(void* pvParameters) {
 #ifdef USE_MQTT
   static unsigned long mqttRetryDelayMs = 2000;
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  static bool gsmTlsConfigured = false;
   static int  mqttConnectFails = 0;
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (mqtt_port == 8883) {
-    prepareGsmTLSClient(_gsmTlsCtx);
-    gsmTlsConfigured = true;
+    prepareGsmTLSClient();
     mqttClient.setClient(gsmTLSClient);
-    DLOGF("[MQTT] Broker TLS (GSM): %s:%d  sslCtx=%u\n",
-          mqtt_server, mqtt_port, (unsigned)_gsmTlsCtx);
+    DLOGF("[MQTT] Broker TLS (BearSSL): %s:%d\n", mqtt_server, mqtt_port);
   } else {
     mqttClient.setClient(gsmTCPClient);
     DLOGF("[MQTT] Broker sin TLS (GSM): %s:%d\n", mqtt_server, mqtt_port);
@@ -1822,10 +1785,7 @@ void networkTask(void* pvParameters) {
   #endif
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  if (mqtt_port == 8883) {
-    // Always prepare TLS before each connect attempt—ensures SSL context is active
-    prepareGsmTLSClient(_gsmTlsCtx);
-  }
+  if (mqtt_port == 8883) prepareGsmTLSClient();
 #else
       if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
 #endif
@@ -1842,15 +1802,9 @@ void networkTask(void* pvParameters) {
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
         mqttConnectFails++;
-        // Timeout o fallo TCP en SIM7000 puede venir de contexto TLS o PDP inestable.
-        // state=-4 = timeout; state=-1 = TCP no conectó (ctx TLS mal aplicado)
+        // TLS BearSSL: state=-4 (timeout) o -1 (fallo TCP) → refresh PDP y reintentar.
         if (mqtt_port == 8883 && (mqttClient.state() == -4 || mqttClient.state() == -1)) {
-          _gsmTlsCtx = (_gsmTlsCtx == 1) ? 0 : 1;
-          gsmTlsConfigured = false;
           mqttConnectFails = 0;
-          DLOGF("[TLS] MQTT timeout (-4) — cambiando SSL ctx a %u para reintento\n",
-                (unsigned)_gsmTlsCtx);
-
           if (_gprsConnectedFlag) {
             DLOGLN("[SIM] Refresh PDP tras timeout MQTT (gprsDisconnect/gprsConnect)");
             modemSIM.gprsDisconnect();
@@ -1860,11 +1814,6 @@ void networkTask(void* pvParameters) {
             _simCsqCache = modemSIM.getSignalQuality();
             DLOGF("[SIM] PDP refresh → %s  CSQ:%d\n", gprsOk ? "OK" : "FAIL", _simCsqCache);
           }
-        }
-        // Si fallan varios CONNECT seguidos, forzar reprovisión del contexto TLS.
-        if (mqtt_port == 8883 && mqttConnectFails >= 3) {
-          gsmTlsConfigured = false;
-          mqttConnectFails = 0;
         }
 #endif
         vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
