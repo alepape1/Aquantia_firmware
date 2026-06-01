@@ -51,6 +51,11 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
   SSL parametrizable y el firmware alterna automáticamente entre `sslCtx=1` y `sslCtx=0`
   cuando `mqttClient.connect()` falla con `CONNECTION_TIMEOUT (-4)`. Esto permite validar
   en campo diferencias de mapeo de contexto TLS entre revisiones de módem/firmware.
+- **Arranque SIM7000 más robusto**: se añade espera activa de `SIM_READY` (hasta 30 s)
+  antes del primer `gprsConnect()`, para reducir estados PDP inestables justo tras boot.
+- **Recuperación PDP tras timeout MQTT**: cuando hay `CONNECTION_TIMEOUT (-4)` con GPRS
+  activo, se ejecuta refresh del contexto PDP (`gprsDisconnect()` + `gprsConnect()`) antes
+  del siguiente intento MQTT.
 
 ### Improved
 - **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de

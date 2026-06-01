@@ -1200,6 +1200,23 @@ static bool sim7000g_powerOn() {
   String info = modemSIM.getModemInfo();
   DLOGF("[SIM] Modem: %s\n", info.c_str());
 
+  // Esperar a que la SIM esté realmente lista antes de abrir contexto PDP.
+  // Evita gprsConnect tempranos que parecen OK pero quedan inestables.
+  {
+    unsigned long simT0 = millis();
+    int simStatus = modemSIM.getSimStatus();
+    while (simStatus != SIM_READY && (millis() - simT0) < 30000UL) {
+      DLOGF("[SIM] Esperando SIM READY... status=%d\n", simStatus);
+      delay(1000);
+      simStatus = modemSIM.getSimStatus();
+    }
+    if (simStatus == SIM_READY) {
+      DLOGLN("[SIM] SIM READY");
+    } else {
+      DLOGF("[SIM] WARN: SIM no lista tras 30s (status=%d) — continuando\n", simStatus);
+    }
+  }
+
   // Onomondo es una SIM data-only: AT+CREG (red voz) puede quedarse en
   // RegStat=2 indefinidamente aunque GPRS funcione (AT+CGREG=1/5 OK).
   // Solución: ignorar CREG y conectar GPRS directamente con reintentos.
@@ -1736,14 +1753,24 @@ void networkTask(void* pvParameters) {
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
         mqttConnectFails++;
-  // timeout de CONNECT en SIM7000 suele indicar contexto SSL erróneo.
-  if (mqtt_port == 8883 && mqttClient.state() == -4) {
-    _gsmTlsCtx = (_gsmTlsCtx == 1) ? 0 : 1;
-    gsmTlsConfigured = false;
-    mqttConnectFails = 0;
-    DLOGF("[TLS] MQTT timeout (-4) — cambiando SSL ctx a %u para reintento\n",
-    (unsigned)_gsmTlsCtx);
-  }
+        // Timeout de CONNECT en SIM7000 puede venir de contexto TLS o PDP inestable.
+        if (mqtt_port == 8883 && mqttClient.state() == -4) {
+          _gsmTlsCtx = (_gsmTlsCtx == 1) ? 0 : 1;
+          gsmTlsConfigured = false;
+          mqttConnectFails = 0;
+          DLOGF("[TLS] MQTT timeout (-4) — cambiando SSL ctx a %u para reintento\n",
+                (unsigned)_gsmTlsCtx);
+
+          if (_gprsConnectedFlag) {
+            DLOGLN("[SIM] Refresh PDP tras timeout MQTT (gprsDisconnect/gprsConnect)");
+            modemSIM.gprsDisconnect();
+            vTaskDelay(pdMS_TO_TICKS(600));
+            bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
+            _gprsConnectedFlag = gprsOk;
+            _simCsqCache = modemSIM.getSignalQuality();
+            DLOGF("[SIM] PDP refresh → %s  CSQ:%d\n", gprsOk ? "OK" : "FAIL", _simCsqCache);
+          }
+        }
         // Si fallan varios CONNECT seguidos, forzar reprovisión del contexto TLS.
         if (mqtt_port == 8883 && mqttConnectFails >= 3) {
           gsmTlsConfigured = false;
