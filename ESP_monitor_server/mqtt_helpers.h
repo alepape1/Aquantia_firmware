@@ -122,6 +122,17 @@ bool mqttConnect() {
   mac_no_colon.replace(":", "");
   snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // SIM7000G: cerrar socket previo y limpiar buffer UART antes de CONNECT.
+  // Evita que restos de URC/AT bloqueen la lectura del CONNACK en PubSubClient.
+  if (mqtt_port == 8883) {
+    gsmTLSClient.stop();
+  } else {
+    gsmTCPClient.stop();
+  }
+  modemSIM.streamClear();
+#endif
+
 #ifdef DEBUG_MODE
   DLOGF("[MQTT] Intentando conectar — broker=%s:%d  clientId=%s  user=%s  pass=%s\n",
         mqtt_server, mqtt_port, client_id, mqtt_user,

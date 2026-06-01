@@ -340,6 +340,9 @@ bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 static TinyGsm             modemSIM(Serial1);
 static TinyGsmClientSecure gsmTLSClient(modemSIM);
 static TinyGsmClient       gsmTCPClient(modemSIM);
+// Algunos firmwares SIM7000 mapean SSL al ctx=0 y otros al ctx=1.
+// Empezamos en 1 por compatibilidad histórica y rotamos automáticamente en timeout MQTT.
+static uint8_t             _gsmTlsCtx = 1;
 // ── Cache de estado GSM para lectura segura desde Core 1 ─────────────────────
 // TinyGSM NO es thread-safe: NUNCA llamar a modemSIM.* desde loop() (Core 1)
 // mientras NetworkTask (Core 0) pueda estar usando Serial1.
@@ -1123,47 +1126,52 @@ static void sim7000g_uploadCACert() {
   modemSIM.waitResponse(3000L);
 }
 
-static void prepareGsmTLSClient() {
+static void prepareGsmTLSClient(uint8_t sslCtx = 1) {
   // TLS en SIM7000G se configura mediante AT+CSSLCFG + CA cert en su FS interno.
   // TinyGSM 0.12.0 no expone setCACert() para SIM7000SSL.
-  // Flujo: subir cert bundle (R13 + ISRG Root X1) → configurar contexto SSL 0.
-  // SIMCom suele numerar el primer contexto TLS como 1; todos los CSSLCFG deben
-  // apuntar al mismo índice para que el cert quede realmente asociado.
+  // Flujo: subir cert bundle (R13 + ISRG Root X1) → configurar contexto SSL.
+  // En SIM7000 hay variantes que usan ctx=0 y otras ctx=1; se permite alternar.
 
-  DLOGLN("[TLS] Configurando SSL en SIM7000G...");
+  DLOGF("[TLS] Configurando SSL en SIM7000G (ctx=%u)...\n", (unsigned)sslCtx);
 
   // TLS 1.2 (único soportado de forma fiable en SIM7000G R1529)
-  modemSIM.sendAT(GF("+CSSLCFG=\"sslversion\",1,3"));
+  char sslCmd[96];
+  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"sslversion\",%u,3", (unsigned)sslCtx);
+  modemSIM.sendAT(sslCmd);
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: sslversion no confirmado");
 
   // No validar timestamp del cert contra RTC del módulo (RTC puede estar sin sincronizar)
-  modemSIM.sendAT(GF("+CSSLCFG=\"ignorertctime\",1,1"));
+  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"ignorertctime\",%u,1", (unsigned)sslCtx);
+  modemSIM.sendAT(sslCmd);
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: ignorertctime no confirmado");
 
   // Prueba temporal: desactivar verificación de CA para aislar fallos de handshake.
   // Si MQTT conecta así, el problema está en la validación del certificado.
-  modemSIM.sendAT(GF("+CSSLCFG=\"authmode\",1,0"));
+  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"authmode\",%u,0", (unsigned)sslCtx);
+  modemSIM.sendAT(sslCmd);
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: authmode no confirmado");
 
   // SNI para brokers detrás de balanceadores / frontends TLS con virtual hosting.
   // Algunos enlaces GSM fallan con un handshake genérico si el servidor espera SNI.
   char sniCmd[128];
-  snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",1,\"%s\"", mqtt_server);
+  snprintf(sniCmd, sizeof(sniCmd), "+CSSLCFG=\"sni\",%u,\"%s\"", (unsigned)sslCtx, mqtt_server);
   modemSIM.sendAT(sniCmd);
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: sni no confirmado");
 
   // Timeout de negociación TLS: 60 s (2G puede tardar 20-40 s en el handshake)
-  modemSIM.sendAT(GF("+CSSLCFG=\"negotiatetime\",1,60"));
+  snprintf(sslCmd, sizeof(sslCmd), "+CSSLCFG=\"negotiatetime\",%u,60", (unsigned)sslCtx);
+  modemSIM.sendAT(sslCmd);
   modemSIM.waitResponse(3000L);
 
   // El handshake TLS del módem puede superar con holgura los 10 s si hay latencia GSM.
   gsmTLSClient.setTimeout(75000);
 
-  DLOGLN("[TLS] SSL SIM7000G configurado (TLS1.2, authmode=0, sin CA)");
+  DLOGF("[TLS] SSL SIM7000G configurado (ctx=%u, TLS1.2, authmode=0, sin CA)\n",
+        (unsigned)sslCtx);
 }
 
 // Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
@@ -1527,10 +1535,11 @@ void networkTask(void* pvParameters) {
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (mqtt_port == 8883) {
-    prepareGsmTLSClient();
+    prepareGsmTLSClient(_gsmTlsCtx);
     gsmTlsConfigured = true;
     mqttClient.setClient(gsmTLSClient);
-    DLOGF("[MQTT] Broker TLS (GSM): %s:%d\n", mqtt_server, mqtt_port);
+    DLOGF("[MQTT] Broker TLS (GSM): %s:%d  sslCtx=%u\n",
+          mqtt_server, mqtt_port, (unsigned)_gsmTlsCtx);
   } else {
     mqttClient.setClient(gsmTCPClient);
     DLOGF("[MQTT] Broker sin TLS (GSM): %s:%d\n", mqtt_server, mqtt_port);
@@ -1708,7 +1717,7 @@ void networkTask(void* pvParameters) {
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (mqtt_port == 8883 && !gsmTlsConfigured) {
-    prepareGsmTLSClient();
+    prepareGsmTLSClient(_gsmTlsCtx);
     gsmTlsConfigured = true;
   }
 #else
@@ -1727,6 +1736,14 @@ void networkTask(void* pvParameters) {
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
         mqttConnectFails++;
+  // timeout de CONNECT en SIM7000 suele indicar contexto SSL erróneo.
+  if (mqtt_port == 8883 && mqttClient.state() == -4) {
+    _gsmTlsCtx = (_gsmTlsCtx == 1) ? 0 : 1;
+    gsmTlsConfigured = false;
+    mqttConnectFails = 0;
+    DLOGF("[TLS] MQTT timeout (-4) — cambiando SSL ctx a %u para reintento\n",
+    (unsigned)_gsmTlsCtx);
+  }
         // Si fallan varios CONNECT seguidos, forzar reprovisión del contexto TLS.
         if (mqtt_port == 8883 && mqttConnectFails >= 3) {
           gsmTlsConfigured = false;
@@ -2161,7 +2178,8 @@ void setup() {
   DLOGLN("=== DEBUG MODE ACTIVO ===");
   DLOGF("[TEST] Perfil  : %s (%d)\n",
     (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_AQUALEAK) ? "AQUALEAK" : "IRRIGATION", DEVICE_PROFILE);
+    (DEVICE_PROFILE == PROFILE_AQUALEAK) ? "AQUALEAK" :
+    (DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE) ? "AQUA_SMART_REMOTE" : "IRRIGATION", DEVICE_PROFILE);
   DLOGF("[TEST] Relays  : %d\n", RELAY_COUNT);
   DLOGF("[TEST] Display : %s\n",
 #ifdef HAS_DISPLAY
@@ -2690,6 +2708,12 @@ void setup() {
   if (!simOk) {
     DLOGLN("[ASR] WARN: sin GPRS al arranque — networkTask reintentará");
   }
+#ifdef USE_MQTT
+  // Inicializar cache de estado celular antes de arrancar NetworkTask para que
+  // los logs de Core 1 no muestren CSQ=0/GPRS=DOWN durante el setup inicial TLS.
+  _gprsConnectedFlag = simOk;
+  _simCsqCache = simOk ? modemSIM.getSignalQuality() : 0;
+#endif
 
 #if defined(USE_MQTT)
   #ifndef DEV_MODE
@@ -2905,8 +2929,8 @@ void setup() {
     (DEVICE_PROFILE == PROFILE_AQUALEAK)          ? "AQUALEAK" :
     (DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE) ? "AQUA_SMART_REMOTE" : "IRRIGATION", RELAY_COUNT);
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  DLOGF("[TEST] GSM/GPRS : %s\n",
-    modemSIM.isGprsConnected() ? modemSIM.localIP().toString().c_str() : "SIN CONEXION");
+  DLOGF("[TEST] GSM/GPRS : %s (CSQ:%d)\n",
+    _gprsConnectedFlag ? "OK" : "SIN CONEXION", (int)_simCsqCache);
 #else
   DLOGF("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
