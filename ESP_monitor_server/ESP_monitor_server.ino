@@ -1127,6 +1127,8 @@ static void prepareGsmTLSClient() {
   // TLS en SIM7000G se configura mediante AT+CSSLCFG + CA cert en su FS interno.
   // TinyGSM 0.12.0 no expone setCACert() para SIM7000SSL.
   // Flujo: subir cert bundle (R13 + ISRG Root X1) → configurar contexto SSL 0.
+  // SIMCom suele numerar el primer contexto TLS como 1; todos los CSSLCFG deben
+  // apuntar al mismo índice para que el cert quede realmente asociado.
 
   DLOGLN("[TLS] Configurando SSL en SIM7000G...");
 
@@ -1134,7 +1136,7 @@ static void prepareGsmTLSClient() {
   sim7000g_uploadCACert();
 
   // TLS 1.2 (único soportado de forma fiable en SIM7000G R1529)
-  modemSIM.sendAT(GF("+CSSLCFG=\"sslversion\",0,3"));
+  modemSIM.sendAT(GF("+CSSLCFG=\"sslversion\",1,3"));
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: sslversion no confirmado");
 
@@ -1149,7 +1151,7 @@ static void prepareGsmTLSClient() {
     DLOGLN("[TLS] WARN: authmode no confirmado");
 
   // Asociar el fichero de CA cert al contexto SSL 0
-  modemSIM.sendAT(GF("+CSSLCFG=\"cacert\",0,\"mqtt_ca.pem\""));
+  modemSIM.sendAT(GF("+CSSLCFG=\"cacert\",1,\"mqtt_ca.pem\""));
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: cacert no confirmado");
 
