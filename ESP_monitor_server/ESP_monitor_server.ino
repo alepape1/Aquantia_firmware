@@ -1,8 +1,4 @@
 ﻿// MeteoStation — Firmware v3
-}
-#endif  // DEBUG_MODE
-}
-// MeteoStation — Firmware v3
 // ESP32 (con pantalla ST7789 240×135)
 // Sensores: MCP9808, BMP280, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
