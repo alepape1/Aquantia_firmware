@@ -123,14 +123,10 @@ bool mqttConnect() {
   snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  // SIM7000G: cerrar socket previo y limpiar buffer UART antes de CONNECT.
-  // Evita que restos de URC/AT bloqueen la lectura del CONNACK en PubSubClient.
-  if (mqtt_port == 8883) {
-    gsmTLSClient.stop();
-  } else {
-    gsmTCPClient.stop();
-  }
-  modemSIM.streamClear();
+  // No forzar stop() antes de cada CONNECT.
+  // En SIM7000SSL puede dejar sockets semicolgados en el módem y generar
+  // reconexiones con "already connected, closing old connection" en broker.
+  // Dejamos que PubSubClient/TinyGSM gestionen el ciclo del socket.
 #endif
 
 #ifdef DEBUG_MODE
@@ -140,11 +136,20 @@ bool mqttConnect() {
   unsigned long _t0 = millis();
 #endif
 
-  mqttClient.setKeepAlive(60);
+  // keepAlive: en 2G el handshake TLS + CONNACK tarda ~90 s. Con keepalive=60
+  // el broker (timeout = 1.5×keepalive = 90 s) desconecta antes de que el ESP
+  // pueda enviar el primer PINGREQ. Con 180 s el broker espera 270 s → margen
+  // suficiente para el setup inicial y las publicaciones lentas sobre 2G.
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  // 2G TLS handshake puede tardar 20-40 s — evitar CONNECTION_TIMEOUT (-4)
-  mqttClient.setSocketTimeout(75);
+  mqttClient.setKeepAlive(180);
+#else
+  mqttClient.setKeepAlive(60);
 #endif
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // Dejar margen para TLS handshake + CONNECT/CONNACK en enlace 2G.
+  mqttClient.setSocketTimeout(30);
+#endif
+
   bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
 
 #ifdef DEBUG_MODE

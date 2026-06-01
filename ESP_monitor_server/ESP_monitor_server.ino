@@ -1608,9 +1608,6 @@ void networkTask(void* pvParameters) {
         wifiFailCount++;
         _gprsConnectedFlag = false;
         _simCsqCache = 0;
-#ifdef USE_MQTT
-        if (mqtt_port == 8883) gsmTlsConfigured = false;
-#endif
         DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
         if (wifiFailCount >= 30) {
           DLOGLN("[SIM] 30 fallos AT consecutivos — reiniciando ESP");
@@ -1638,7 +1635,7 @@ void networkTask(void* pvParameters) {
         _gprsConnectedFlag = gprsOk;
         _simCsqCache = modemSIM.getSignalQuality();
       #ifdef USE_MQTT
-        if (mqtt_port == 8883) gsmTlsConfigured = gprsOk ? false : gsmTlsConfigured;
+        if (gprsOk) mqttConnectFails = 0;  // Reset MQTT fail counter when GPRS reconnects
       #endif
         DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
               gprsOk ? "OK" : "FAIL", _simCsqCache);
@@ -1733,9 +1730,9 @@ void networkTask(void* pvParameters) {
   #endif
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  if (mqtt_port == 8883 && !gsmTlsConfigured) {
+  if (mqtt_port == 8883) {
+    // Always prepare TLS before each connect attempt—ensures SSL context is active
     prepareGsmTLSClient(_gsmTlsCtx);
-    gsmTlsConfigured = true;
   }
 #else
       if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
