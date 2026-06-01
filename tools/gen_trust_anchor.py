@@ -42,10 +42,13 @@ def rsa_trust_anchor(cert: x509.Certificate, idx: int) -> str:
     lines.append(f"""#define TA{idx} {{ \\
   {{ (unsigned char *)TA{idx}_DN, sizeof TA{idx}_DN }}, \\
   BR_X509_TA_CA, \\
-  {{ .rsa = {{ \\
-    (unsigned char *)TA{idx}_RSA_N, sizeof TA{idx}_RSA_N, \\
-    (unsigned char *)TA{idx}_RSA_E, sizeof TA{idx}_RSA_E, \\
-  }} }}, \\
+  {{ \\
+    BR_KEYTYPE_RSA, \\
+    {{ .rsa = {{ \\
+      (unsigned char *)TA{idx}_RSA_N, sizeof TA{idx}_RSA_N, \\
+      (unsigned char *)TA{idx}_RSA_E, sizeof TA{idx}_RSA_E, \\
+    }} }} \\
+  }} \\
 }}
 """)
     return "\n".join(lines)

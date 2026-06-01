@@ -348,7 +348,7 @@ static TinyGsmClient  gsmTCPClient(modemSIM, 0);  // TCP puro (puerto 1883 / bas
 static TinyGsmClient  _gsmTCPBase (modemSIM, 1);  // canal independiente para SSLClient
 // BearSSL en el ESP32: TLS gestionado por el MCU, no por el SIM7000G.
 // A0 = pin analógico flotante para semilla de entropía.
-static SSLClient      gsmTLSClient(&_gsmTCPBase, TAs, TAs_NUM, A0);
+static SSLClient      gsmTLSClient(_gsmTCPBase, TAs, TAs_NUM, A0);
 // ── Cache de estado GSM para lectura segura desde Core 1 ─────────────────────
 // TinyGSM NO es thread-safe: NUNCA llamar a modemSIM.* desde loop() (Core 1)
 // mientras NetworkTask (Core 0) pueda estar usando Serial1.
@@ -1225,10 +1225,10 @@ static void sim7000g_uploadCACert() {
 static void prepareGsmTLSClient(uint8_t /*unused*/ = 1) {
   // TLS gestionado por BearSSL en el ESP32 (SSLClient sobre TinyGsmClient TCP).
   // El SIM7000G R1529 no soporta AT+CSSLCFG="authmode"/"cacert" — stack hardware descartado.
-  gsmTLSClient.setHostname(mqtt_server);  // SNI: indica el host al servidor TLS
+  // SNI se pasa automáticamente en connect(host, port) — no existe setHostname() en SSLClient.
   // El handshake BearSSL sobre 2G/LTE-M puede tardar 20-40 s; margen amplio.
   gsmTLSClient.setTimeout(75000);
-  DLOGF("[TLS] SSLClient configurado (BearSSL ESP32, SNI=%s, trust anchors=%d)\n",
+  DLOGF("[TLS] SSLClient configurado (BearSSL ESP32, SNI=auto, trust anchors=%d)\n",
         mqtt_server, TAs_NUM);
 }
 
