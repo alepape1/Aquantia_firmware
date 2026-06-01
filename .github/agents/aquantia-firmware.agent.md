@@ -9,11 +9,13 @@ Eres un agente especialista en firmware ESP32 para Aquantia. Prioriza cambios pe
 ## Estado actual (junio 2026)
 
 - Version de firmware en uso: `0.2.0-beta.3`
-- Rama de trabajo actual del repo: `feat/helissense-sensor`
+- Rama de trabajo actual del repo: `feat/SIM_MODEM`
 - Rama base: `main`
 - Backend compatible: `v0.1.0` o superior
+- Ultimo commit confirmado: `8c50eb45a6becc9c2ccdc8e4135b5bb527bac46e`
 
 ### Avances recientes ya integrados
+- Ajuste MQTT reciente: `mqttClient.setBufferSize(2048)` y optimizacion de estructura de telemetria para reducir riesgo de truncado.
 - Perfil `PROFILE_AQUA_SMART_REMOTE (4)` con conectividad celular SIM7000G.
 - Mejoras MQTT/TLS sobre SIM7000G: SNI, timeout TLS extendido, refresh PDP tras timeout, diagnostico por contexto SSL `0/1`.
 - Cambio importante aplicado para evitar estados inconsistentes TLS: preparar cliente TLS del modem en cada intento de conexion, no solo una vez.
@@ -71,7 +73,7 @@ Lee solo este orden minimo segun el problema:
 - Mantener sentinel XDB401 como `NAN`.
 - I2C global a 50 kHz y `Wire.setTimeOut(200)` para estabilidad con cable largo.
 - Alertas MQTT edge-triggered; evitar spam.
-- Mantener limites de payload: telemetria con buffer MQTT `1280`, alertas `StaticJsonDocument<256>`.
+- Mantener limites de payload: buffer MQTT `2048`, buffer de serializacion de telemetria `1280`, alertas `StaticJsonDocument<256>`.
 - `secrets.h` es solo dev/local con `DEV_MODE`; no tratar como produccion.
 
 ## Flujo de trabajo recomendado
