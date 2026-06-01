@@ -1573,7 +1573,7 @@ void networkTask(void* pvParameters) {
 #endif
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(1536);
+  mqttClient.setBufferSize(2048);
 #endif
 
   for (;;) {
@@ -2020,23 +2020,16 @@ void networkTask(void* pvParameters) {
       auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
 
       // Payload ampliado con métricas explícitas del BMP280 e INA219 (IRRIGATION).
-      StaticJsonDocument<1536> doc;
+      StaticJsonDocument<1280> doc;
       doc["temperature"]           = r2(snap.tempMCP);
       doc["pressure"]              = r2(snap.pressure);
       doc["temperature_barometer"] = r2(snap.tempDHT);
       doc["humidity"]              = r2(snap.humidity);
-      doc["temperature_source"]    = temperatureSourceName();
-      doc["pressure_source"]       = pressureSourceName();
       doc["bmp280_ok"]             = bmp_ok && (bmp_temp_ok || bmp_pressure_ok);
       if (!isnan(snap.bmpTemp))     doc["bmp280_temperature"] = r2(snap.bmpTemp);
       if (!isnan(snap.bmpPressure)) doc["bmp280_pressure"] = r2(snap.bmpPressure);
-      // Nuevo: incluir ambas presiones explícitamente
-      doc["pressure_micro"] = r2(snap.pressure);        // MicroPressure (SparkFun)
-      doc["pressure_bmp280"] = r2(snap.bmpPressure);    // BMP280
       doc["windSpeed"]             = r2(snap.windSpeed);
       doc["windDirection"]         = r1(snap.windDir);
-      doc["windSpeedFiltered"]     = r2(snap.windSpeedFilt);
-      doc["windDirectionFiltered"] = r1(snap.avgWindDir);
       doc["light"]                 = r1(snap.light);
       doc["dht_temperature"]       = r1(snap.tempDHT11);
       doc["dht_humidity"]          = r1(snap.humDHT11);
@@ -2062,9 +2055,6 @@ void networkTask(void* pvParameters) {
       doc["pipeline_pressure"]     = r2(snap.pipePressure);
       doc["pipeline_flow"]         = r2(snap.pipeFlow);
       doc["flow_total_l"]          = roundf(snap.flowTotalL   * 10.0f) / 10.0f;  // 1 decimal → 100 mL resolución
-      doc["flow_session_l"]        = roundf(snap.flowSessionL * 10.0f) / 10.0f;  // litros desde última apertura de válvula
-      doc["flow_irrig_l"]          = roundf(snap.flowIrrigL   * 10.0f) / 10.0f;  // litros acumulados con relay ON (riego)
-      doc["flow_leak_l"]           = roundf(snap.flowLeakL    * 10.0f) / 10.0f;  // litros acumulados con relay OFF (fuga)
       doc["pipeline_scenario"]     = pipelineScenario;
       doc["pipeline_mode"]         = pipelineMode;
       doc["pipeline_source"]       = pipelineSource;
@@ -2074,7 +2064,6 @@ void networkTask(void* pvParameters) {
       doc["pipeline_flow_ok"]      = pipelineFlowOk;
       doc["leak_baseline_pressure"] = r2(leakDetector.baselinePressure());
       doc["leak_baseline_flow"]     = r2(leakDetector.baselineFlow());
-      doc["leak_warmup_progress"]   = leakDetector.warmupProgress();
       doc["xdb401_ok"]             = xdb401_ok;
       if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
       doc["mac_address"]           = getDeviceMacAddress(); // eFuse — idéntico en WiFi y cellular
@@ -2089,14 +2078,10 @@ void networkTask(void* pvParameters) {
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
       // Parámetros calculados agroambientales — solo PROFILE_AQUALEAK
       if (!isnan(snap.dewPoint))   doc["dew_point"]    = r1(snap.dewPoint);
-      if (!isnan(snap.heatIndex))  doc["heat_index"]   = r1(snap.heatIndex);
-      if (!isnan(snap.absHum))     doc["abs_humidity"] = r2(snap.absHum);
 #endif
 #if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       doc["aht20_ok"]  = aht20_ok;
       doc["ina219_ok"] = ina219_ok;
-      if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"] = r2(snap.inaVbus);
-      if (!isnan(snap.inaCurrent)) doc["ina219_current_ma"]  = r1(snap.inaCurrent);
       if (!isnan(snap.inaPower))   doc["ina219_power_mw"]    = r1(snap.inaPower);
 #endif
       // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
@@ -2106,7 +2091,7 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[1536];
+      char topic[64], buf[1280];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       size_t payload_len = serializeJson(doc, buf, sizeof(buf));
       if (payload_len >= sizeof(buf)) {
