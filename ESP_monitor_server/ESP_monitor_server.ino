@@ -1132,9 +1132,6 @@ static void prepareGsmTLSClient() {
 
   DLOGLN("[TLS] Configurando SSL en SIM7000G...");
 
-  // Subir CA cert al FS del módulo si no está ya presente
-  sim7000g_uploadCACert();
-
   // TLS 1.2 (único soportado de forma fiable en SIM7000G R1529)
   modemSIM.sendAT(GF("+CSSLCFG=\"sslversion\",1,3"));
   if (modemSIM.waitResponse(3000L) != 1)
@@ -1145,8 +1142,9 @@ static void prepareGsmTLSClient() {
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: ignorertctime no confirmado");
 
-  // authmode=1: verificar servidor con el CA cert que acabamos de subir
-  modemSIM.sendAT(GF("+CSSLCFG=\"authmode\",1,1"));
+  // Prueba temporal: desactivar verificación de CA para aislar fallos de handshake.
+  // Si MQTT conecta así, el problema está en la validación del certificado.
+  modemSIM.sendAT(GF("+CSSLCFG=\"authmode\",1,0"));
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: authmode no confirmado");
 
@@ -1158,11 +1156,6 @@ static void prepareGsmTLSClient() {
   if (modemSIM.waitResponse(3000L) != 1)
     DLOGLN("[TLS] WARN: sni no confirmado");
 
-  // Asociar el fichero de CA cert al contexto SSL 0
-  modemSIM.sendAT(GF("+CSSLCFG=\"cacert\",1,\"mqtt_ca.pem\""));
-  if (modemSIM.waitResponse(3000L) != 1)
-    DLOGLN("[TLS] WARN: cacert no confirmado");
-
   // Timeout de negociación TLS: 60 s (2G puede tardar 20-40 s en el handshake)
   modemSIM.sendAT(GF("+CSSLCFG=\"negotiatetime\",1,60"));
   modemSIM.waitResponse(3000L);
@@ -1170,7 +1163,7 @@ static void prepareGsmTLSClient() {
   // El handshake TLS del módem puede superar con holgura los 10 s si hay latencia GSM.
   gsmTLSClient.setTimeout(75000);
 
-  DLOGLN("[TLS] SSL SIM7000G configurado (TLS1.2, authmode=1, cacert=mqtt_ca.pem)");
+  DLOGLN("[TLS] SSL SIM7000G configurado (TLS1.2, authmode=0, sin CA)");
 }
 
 // Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
