@@ -340,6 +340,12 @@ bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 static TinyGsm             modemSIM(Serial1);
 static TinyGsmClientSecure gsmTLSClient(modemSIM);
 static TinyGsmClient       gsmTCPClient(modemSIM);
+// ── Cache de estado GSM para lectura segura desde Core 1 ─────────────────────
+// TinyGSM NO es thread-safe: NUNCA llamar a modemSIM.* desde loop() (Core 1)
+// mientras NetworkTask (Core 0) pueda estar usando Serial1.
+// NetworkTask actualiza estas variables; loop() solo las lee.
+static volatile int  _simCsqCache       = 0;   // último CSQ conocido (0-31, 99=inválido)
+static volatile bool _gprsConnectedFlag = false; // true cuando GPRS está activo
 #else
 static WiFiClient       mqttTCPClient;
 static WiFiClientSecure mqttTLSClient;
@@ -1069,10 +1075,89 @@ static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000)
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+// Escribe el CA cert bundle en el sistema de ficheros interno del SIM7000G.
+// Solo se ejecuta si el fichero no existe ya (AT+CFSGFIS lo detecta).
+// El SIM7000G acepta PEM completo (cadena R13 + ISRG Root X1).
+static void sim7000g_uploadCACert() {
+  const char* fname = "mqtt_ca.pem";
+  size_t certLen = strlen(MQTT_CA_CERT_PEM);
+
+  // Comprobar si el fichero ya existe con el tamaño correcto
+  modemSIM.sendAT(GF("+CFSGFIS=3,\"mqtt_ca.pem\""));
+  String resp = "";
+  if (modemSIM.waitResponse(3000L, resp) == 1 && resp.indexOf(String(certLen)) != -1) {
+    DLOGLN("[TLS] CA cert ya existe en SIM7000G — omitiendo subida");
+    return;
+  }
+
+  DLOGF("[TLS] Subiendo CA cert al SIM7000G (%u B)...\n", (unsigned)certLen);
+
+  // Inicializar sistema de ficheros
+  modemSIM.sendAT(GF("+CFSINIT"));
+  modemSIM.waitResponse(3000L);
+
+  // Escribir fichero: AT+CFSWFILE=3,"nombre",0,<tamaño>,<timeout_ms>
+  // Después enviar el contenido PEM en crudo (sin comillas, sin escape)
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "+CFSWFILE=3,\"%s\",0,%u,5000", fname, (unsigned)certLen);
+  modemSIM.sendAT(cmd);
+
+  // El módulo responde "DOWNLOAD" indicando que está listo para recibir datos
+  if (modemSIM.waitResponse(5000L, GF("DOWNLOAD")) != 1) {
+    DLOGLN("[TLS] ERROR: SIM7000G no aceptó CFSWFILE");
+    modemSIM.sendAT(GF("+CFSTERM"));
+    modemSIM.waitResponse(3000L);
+    return;
+  }
+
+  // Enviar el PEM en crudo por Serial1
+  modemSIM.stream.print(MQTT_CA_CERT_PEM);
+  if (modemSIM.waitResponse(10000L) != 1) {
+    DLOGLN("[TLS] ERROR: fallo al escribir CA cert");
+  } else {
+    DLOGLN("[TLS] CA cert subido OK");
+  }
+
+  // Cerrar sistema de ficheros
+  modemSIM.sendAT(GF("+CFSTERM"));
+  modemSIM.waitResponse(3000L);
+}
+
 static void prepareGsmTLSClient() {
-  // TLS en SIM7000G se configura en el modem vía AT+CSSLCFG (no via client API).
-  // TinyGSM 0.12.0 no expone setCACert en TinyGsmClientSecure para SIM7000SSL.
-  // La CA se sube al modem mediante AT+CFSINIT/AT+CFSWFILE si se requiere verificación estricta.
+  // TLS en SIM7000G se configura mediante AT+CSSLCFG + CA cert en su FS interno.
+  // TinyGSM 0.12.0 no expone setCACert() para SIM7000SSL.
+  // Flujo: subir cert bundle (R13 + ISRG Root X1) → configurar contexto SSL 0.
+
+  DLOGLN("[TLS] Configurando SSL en SIM7000G...");
+
+  // Subir CA cert al FS del módulo si no está ya presente
+  sim7000g_uploadCACert();
+
+  // TLS 1.2 (único soportado de forma fiable en SIM7000G R1529)
+  modemSIM.sendAT(GF("+CSSLCFG=\"sslversion\",0,3"));
+  if (modemSIM.waitResponse(3000L) != 1)
+    DLOGLN("[TLS] WARN: sslversion no confirmado");
+
+  // No validar timestamp del cert contra RTC del módulo (RTC puede estar sin sincronizar)
+  modemSIM.sendAT(GF("+CSSLCFG=\"ignorertctime\",1,1"));
+  if (modemSIM.waitResponse(3000L) != 1)
+    DLOGLN("[TLS] WARN: ignorertctime no confirmado");
+
+  // authmode=1: verificar servidor con el CA cert que acabamos de subir
+  modemSIM.sendAT(GF("+CSSLCFG=\"authmode\",1,1"));
+  if (modemSIM.waitResponse(3000L) != 1)
+    DLOGLN("[TLS] WARN: authmode no confirmado");
+
+  // Asociar el fichero de CA cert al contexto SSL 0
+  modemSIM.sendAT(GF("+CSSLCFG=\"cacert\",0,\"mqtt_ca.pem\""));
+  if (modemSIM.waitResponse(3000L) != 1)
+    DLOGLN("[TLS] WARN: cacert no confirmado");
+
+  // Timeout de negociación TLS: 60 s (2G puede tardar 20-40 s en el handshake)
+  modemSIM.sendAT(GF("+CSSLCFG=\"negotiatetime\",1,60"));
+  modemSIM.waitResponse(3000L);
+
+  DLOGLN("[TLS] SSL SIM7000G configurado (TLS1.2, authmode=1, cacert=mqtt_ca.pem)");
 }
 
 // Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
@@ -1101,22 +1186,30 @@ static bool sim7000g_powerOn() {
   String info = modemSIM.getModemInfo();
   DLOGF("[SIM] Modem: %s\n", info.c_str());
 
-  // Esperar registro en red celular (max 60 s)
-  DLOGLN("[SIM] Esperando registro en red...");
-  if (!modemSIM.waitForNetwork(60000L)) {
-    DLOGLN("[SIM] ERROR: sin cobertura o SIM no registrada");
-    return false;
-  }
-  DLOGF("[SIM] Red OK — operador: %s  RSSI: %d\n",
-        modemSIM.getOperator().c_str(), modemSIM.getSignalQuality());
+  // Onomondo es una SIM data-only: AT+CREG (red voz) puede quedarse en
+  // RegStat=2 indefinidamente aunque GPRS funcione (AT+CGREG=1/5 OK).
+  // Solución: ignorar CREG y conectar GPRS directamente con reintentos.
+  // Esperamos 5 s a que el modem estabilice el contexto PDP tras el boot.
+  DLOGLN("[SIM] SIM data-only — intentando GPRS directo (sin esperar CREG)...");
+  delay(5000);
 
-  // Conectar GPRS con APN Onomondo (sin usuario ni contraseña)
-  DLOGF("[SIM] Conectando GPRS (APN=%s)...\n", GSM_APN);
-  if (!modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS)) {
-    DLOGLN("[SIM] ERROR: fallo al conectar GPRS");
-    return false;
+  bool gprsOk = false;
+  for (int attempt = 1; attempt <= 3 && !gprsOk; attempt++) {
+    int csq = modemSIM.getSignalQuality();
+    int regCs   = modemSIM.getRegistrationStatus();   // AT+CREG (voz)
+    DLOGF("[SIM] Intento GPRS %d/3 — CSQ:%d  CREG:%d  APN:%s\n",
+          attempt, csq, regCs, GSM_APN);
+    gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
+    DLOGF("[SIM] gprsConnect %d/3 → %s\n", attempt, gprsOk ? "OK" : "FAIL");
+    if (!gprsOk) delay(5000);
   }
-  DLOGF("[SIM] GPRS OK — IP local: %s\n", modemSIM.localIP().toString().c_str());
+
+  if (!gprsOk) {
+    DLOGLN("[SIM] ERROR: no se pudo activar contexto GPRS en 3 intentos");
+    return false;  // networkTask lo reintentará
+  }
+  DLOGF("[SIM] GPRS OK — IP local: %s  CSQ:%d\n",
+        modemSIM.localIP().toString().c_str(), modemSIM.getSignalQuality());
   return true;
 }
 #endif
@@ -1396,7 +1489,14 @@ void networkTask(void* pvParameters) {
   // esp_task_wdt_init() devuelve ESP_ERR_INVALID_STATE si ya está inicializado
   // y el timeout corto del sistema permanecería activo — usar reconfigure como fallback.
   {
+    // PROFILE_AQUA_SMART_REMOTE: waitForNetwork puede tardar hasta 90 s en
+    // roaming Onomondo (2G). El WDT debe ser mayor que ese timeout.
+    // Para otros perfiles 30 s es suficiente (WiFi reconnect << 30 s).
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+    esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 120000, .idle_core_mask = 0, .trigger_panic = true };
+#else
     esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
+#endif
     if (esp_task_wdt_init(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
       esp_task_wdt_reconfigure(&wdt_cfg);
     }
@@ -1452,30 +1552,60 @@ void networkTask(void* pvParameters) {
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-    // ── Conectividad celular: verificar red GSM y GPRS ─────────────────────
-    if (!modemSIM.isNetworkConnected()) {
-      wdt_heartbeat("NetworkTask", "gsm_network_wait");
+    // ── Conectividad celular — SIM data-only (Onomondo) ─────────────────────
+    // AT+CREG (red voz/SMS) no llega nunca a 1/5 con SIMs data-only.
+    // La única check válida es si el modem responde AT y si el contexto
+    // PDP GPRS está activo (AT+CGACT?). Se omite waitForNetwork() por CREG
+    // y se conduce toda la reconexión a través de gprsConnect().
+    if (!modemSIM.testAT()) {
+      // Modem no responde en absoluto — fallo grave
+      wdt_heartbeat("NetworkTask", "gsm_at_check");
       setLedState(LED_WIFI_CONNECTING);
       wifiFailCount++;
-      if (wifiFailCount >= 60) {
-        // ~5 min sin red celular — reiniciar dispositivo
+      DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
+      if (wifiFailCount >= 30) {
+        DLOGLN("[SIM] 30 fallos AT consecutivos — reiniciando ESP");
         esp_restart();
       }
-      if (!modemSIM.waitForNetwork(10000L, true)) {
-        vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
-        if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
-        continue;
-      }
+      vTaskDelay(pdMS_TO_TICKS(5000));
+      continue;
     }
     if (!modemSIM.isGprsConnected()) {
       wdt_heartbeat("NetworkTask", "gprs_connect");
       setLedState(LED_WIFI_CONNECTING);
-      if (!modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS)) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
+      wifiFailCount++;
+      int csq    = modemSIM.getSignalQuality();
+      int creg   = modemSIM.getRegistrationStatus();
+      DLOGF("[SIM] GPRS inactivo — CSQ:%d  CREG:%d  failCount:%d  APN:%s\n",
+            csq, creg, wifiFailCount, GSM_APN);
+      if (wifiFailCount >= 60) {
+        DLOGLN("[SIM] 60 fallos consecutivos sin GPRS — reiniciando ESP");
+        esp_restart();
+      }
+      bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
+      DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
+            gprsOk ? "OK" : "FAIL", modemSIM.getSignalQuality());
+      if (!gprsOk) {
+        vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+        if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
         continue;
       }
       DLOGF("[SIM] GPRS reconectado — IP: %s\n", modemSIM.localIP().toString().c_str());
     }
+    // Actualizar cache de estado — única escritura permitida de Core 0 hacia Core 1
+    _gprsConnectedFlag = modemSIM.isGprsConnected();
+    _simCsqCache       = modemSIM.getSignalQuality();
+#ifdef DEBUG_MODE
+    // Reportar estado GPRS una vez por ciclo cuando todo está bien
+    static unsigned long _lastGprsReport = 0;
+    if (millis() - _lastGprsReport >= 30000) {
+      _lastGprsReport = millis();
+      DLOGF("[SIM] GPRS OK — IP:%s  CSQ:%d  Op:%s\n",
+            modemSIM.localIP().toString().c_str(),
+            _simCsqCache,
+            modemSIM.getOperator().c_str());
+    }
+#endif
     wifiFailCount = 0;
     wifiRetryDelayMs = 500;
 #else
@@ -1536,6 +1666,16 @@ void networkTask(void* pvParameters) {
     if (!mqttClient.connected()) {
       wdt_heartbeat("NetworkTask", "mqtt_connect");
       setLedState(LED_MQTT_CONNECTING);
+#ifdef DEBUG_MODE
+      DLOGF("[MQTT] Desconectado — state=%d  retryMs=%lu\n",
+            mqttClient.state(), mqttRetryDelayMs);
+  #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+      DLOGF("[MQTT] Estado red antes de conectar: isNet=%d  isGPRS=%d  CSQ=%d\n",
+            (int)modemSIM.isNetworkConnected(),
+            (int)modemSIM.isGprsConnected(),
+            modemSIM.getSignalQuality());
+  #endif
+#endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       if (mqtt_port == 8883) prepareGsmTLSClient();
 #else
@@ -1543,6 +1683,16 @@ void networkTask(void* pvParameters) {
 #endif
       esp_task_wdt_reset();
       if (!mqttConnect()) {
+#ifdef DEBUG_MODE
+        DLOGF("[MQTT] Connect FAIL — state=%d  broker=%s:%d  user=%s\n",
+              mqttClient.state(), mqtt_server, mqtt_port, mqtt_user);
+  #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+        DLOGF("[MQTT] Estado red tras fallo: isNet=%d  isGPRS=%d  CSQ=%d\n",
+              (int)modemSIM.isNetworkConnected(),
+              (int)modemSIM.isGprsConnected(),
+              modemSIM.getSignalQuality());
+  #endif
+#endif
         vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
         if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
         continue;
@@ -1573,6 +1723,25 @@ void networkTask(void* pvParameters) {
       }
     }
     mqttClient.loop();
+
+#ifdef DEBUG_MODE
+    // Detectar desconexiones inesperadas de MQTT justo después de loop()
+    if (!mqttClient.connected()) {
+      static unsigned long _lastMqttDropLog = 0;
+      if (millis() - _lastMqttDropLog >= 2000) {
+        _lastMqttDropLog = millis();
+        DLOGF("[MQTT] Detectada desconexión tras loop() — state=%d  uptime=%lus\n",
+              mqttClient.state(), millis() / 1000);
+  #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+        DLOGF("[SIM] Estado tras caída MQTT: isNet=%d  isGPRS=%d  CSQ=%d  IP=%s\n",
+              (int)modemSIM.isNetworkConnected(),
+              (int)modemSIM.isGprsConnected(),
+              modemSIM.getSignalQuality(),
+              modemSIM.localIP().toString().c_str());
+  #endif
+      }
+    }
+#endif
 
     // ── Alarmas MQTT — solo al cambio de estado (no spamear cada ciclo) ──────
     {
@@ -3435,9 +3604,11 @@ void loop() {
     // ── Datos variables ──────────────────────────────────────────────────────
     unsigned long up = millis() / 1000;
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-    DLOGF("[STATUS] %luh%02lum%02lus  Heap:%ld B  CSQ:%d\n",
+    // Usar cache — NO llamar a modemSIM.* desde Core 1 (race condition con NetworkTask)
+    DLOGF("[STATUS] %luh%02lum%02lus  Heap:%ld B  CSQ:%d  GPRS:%s\n",
       up / 3600, (up % 3600) / 60, up % 60,
-      (long)ESP.getFreeHeap(), modemSIM.getSignalQuality());
+      (long)ESP.getFreeHeap(), (int)_simCsqCache,
+      _gprsConnectedFlag ? "OK" : "DOWN");
 #else
     DLOGF("[STATUS] %luh%02lum%02lus  Heap:%ld B  RSSI:%d dBm\n",
       up / 3600, (up % 3600) / 60, up % 60,
@@ -3466,7 +3637,8 @@ void loop() {
 
     // ── Alertas de estado — solo imprime si hay algo anómalo ─────────────────
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-    if (!modemSIM.isGprsConnected())
+    // Usar flag cache — NO llamar a modemSIM.* desde Core 1
+    if (!_gprsConnectedFlag)
       DLOGLN("[WARN  ] GPRS DESCONECTADO");
 #else
     if (WiFi.status() != WL_CONNECTED)

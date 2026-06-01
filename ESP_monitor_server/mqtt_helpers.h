@@ -122,8 +122,43 @@ bool mqttConnect() {
   mac_no_colon.replace(":", "");
   snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
 
+#ifdef DEBUG_MODE
+  DLOGF("[MQTT] Intentando conectar — broker=%s:%d  clientId=%s  user=%s  pass=%s\n",
+        mqtt_server, mqtt_port, client_id, mqtt_user,
+        (mqtt_pass && strlen(mqtt_pass) > 0) ? "[SET]" : "[EMPTY]");
+  unsigned long _t0 = millis();
+#endif
+
   mqttClient.setKeepAlive(60);
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // 2G TLS handshake puede tardar 20-40 s — evitar CONNECTION_TIMEOUT (-4)
+  mqttClient.setSocketTimeout(75);
+#endif
   bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
+
+#ifdef DEBUG_MODE
+  DLOGF("[MQTT] connect() tardó %lums → %s  state=%d\n",
+        millis() - _t0, ok ? "OK" : "FAIL", mqttClient.state());
+  // Decodificar el código de retorno PubSubClient
+  // -4=TIMEOUT -3=LOST -2=FAILED -1=DISCONNECTED 1=BAD_PROTOCOL
+  // 2=BAD_CLIENT_ID 3=UNAVAILABLE 4=BAD_CREDENTIALS 5=UNAUTHORIZED
+  if (!ok) {
+    const char* _mqttStateStr = "UNKNOWN";
+    switch (mqttClient.state()) {
+      case -4: _mqttStateStr = "CONNECTION_TIMEOUT";     break;
+      case -3: _mqttStateStr = "CONNECTION_LOST";        break;
+      case -2: _mqttStateStr = "CONNECT_FAILED";         break;
+      case -1: _mqttStateStr = "DISCONNECTED";           break;
+      case  1: _mqttStateStr = "BAD_PROTOCOL";           break;
+      case  2: _mqttStateStr = "BAD_CLIENT_ID";          break;
+      case  3: _mqttStateStr = "SERVER_UNAVAILABLE";     break;
+      case  4: _mqttStateStr = "BAD_CREDENTIALS";        break;
+      case  5: _mqttStateStr = "NOT_AUTHORIZED";         break;
+    }
+    DLOGF("[MQTT] Estado: %s (%d)\n", _mqttStateStr, mqttClient.state());
+  }
+#endif
+
   if (ok) {
     char cmd_topic[64];
     snprintf(cmd_topic, sizeof(cmd_topic), "aquantia/%s/cmd", finca_id);
