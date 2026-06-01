@@ -1563,48 +1563,62 @@ void networkTask(void* pvParameters) {
     // La única check válida es si el modem responde AT y si el contexto
     // PDP GPRS está activo (AT+CGACT?). Se omite waitForNetwork() por CREG
     // y se conduce toda la reconexión a través de gprsConnect().
-    if (!modemSIM.testAT()) {
-      // Modem no responde en absoluto — fallo grave
-      wdt_heartbeat("NetworkTask", "gsm_at_check");
-      setLedState(LED_WIFI_CONNECTING);
-      wifiFailCount++;
-      DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
-      if (wifiFailCount >= 30) {
-        DLOGLN("[SIM] 30 fallos AT consecutivos — reiniciando ESP");
-        esp_restart();
-      }
-      vTaskDelay(pdMS_TO_TICKS(5000));
-      continue;
-    }
-    if (!modemSIM.isGprsConnected()) {
-      wdt_heartbeat("NetworkTask", "gprs_connect");
-      setLedState(LED_WIFI_CONNECTING);
-      wifiFailCount++;
-      int csq    = modemSIM.getSignalQuality();
-      int creg   = modemSIM.getRegistrationStatus();
-      DLOGF("[SIM] GPRS inactivo — CSQ:%d  CREG:%d  failCount:%d  APN:%s\n",
-            csq, creg, wifiFailCount, GSM_APN);
-      if (wifiFailCount >= 60) {
-        DLOGLN("[SIM] 60 fallos consecutivos sin GPRS — reiniciando ESP");
-        esp_restart();
-      }
-      bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
-      DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
-            gprsOk ? "OK" : "FAIL", modemSIM.getSignalQuality());
-      if (!gprsOk) {
-        vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
-        if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
+    // No consultar AT en cada iteración (10 ms): puede desestabilizar sockets TLS.
+    // Se limita el sondeo a una cadencia fija y se reutiliza cache entre sondeos.
+    static unsigned long _lastCellPollMs = 0;
+    bool doCellPoll = (millis() - _lastCellPollMs >= 2000UL) || !_gprsConnectedFlag;
+    if (doCellPoll) {
+      _lastCellPollMs = millis();
+
+      if (!modemSIM.testAT()) {
+        // Modem no responde en absoluto — fallo grave
+        wdt_heartbeat("NetworkTask", "gsm_at_check");
+        setLedState(LED_WIFI_CONNECTING);
+        wifiFailCount++;
+        _gprsConnectedFlag = false;
+        _simCsqCache = 0;
+        DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
+        if (wifiFailCount >= 30) {
+          DLOGLN("[SIM] 30 fallos AT consecutivos — reiniciando ESP");
+          esp_restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
         continue;
       }
-      DLOGF("[SIM] GPRS reconectado — IP: %s\n", modemSIM.localIP().toString().c_str());
+
+      _gprsConnectedFlag = modemSIM.isGprsConnected();
+      if (!_gprsConnectedFlag) {
+        wdt_heartbeat("NetworkTask", "gprs_connect");
+        setLedState(LED_WIFI_CONNECTING);
+        wifiFailCount++;
+        int csq  = modemSIM.getSignalQuality();
+        int creg = modemSIM.getRegistrationStatus();
+        _simCsqCache = csq;
+        DLOGF("[SIM] GPRS inactivo — CSQ:%d  CREG:%d  failCount:%d  APN:%s\n",
+              csq, creg, wifiFailCount, GSM_APN);
+        if (wifiFailCount >= 60) {
+          DLOGLN("[SIM] 60 fallos consecutivos sin GPRS — reiniciando ESP");
+          esp_restart();
+        }
+        bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
+        _gprsConnectedFlag = gprsOk;
+        _simCsqCache = modemSIM.getSignalQuality();
+        DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
+              gprsOk ? "OK" : "FAIL", _simCsqCache);
+        if (!gprsOk) {
+          vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+          if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
+          continue;
+        }
+        DLOGF("[SIM] GPRS reconectado — IP: %s\n", modemSIM.localIP().toString().c_str());
+      } else {
+        _simCsqCache = modemSIM.getSignalQuality();
+      }
     }
-    // Actualizar cache de estado — única escritura permitida de Core 0 hacia Core 1
-    _gprsConnectedFlag = modemSIM.isGprsConnected();
-    _simCsqCache       = modemSIM.getSignalQuality();
 #ifdef DEBUG_MODE
     // Reportar estado GPRS una vez por ciclo cuando todo está bien
     static unsigned long _lastGprsReport = 0;
-    if (millis() - _lastGprsReport >= 30000) {
+    if (_gprsConnectedFlag && millis() - _lastGprsReport >= 30000) {
       _lastGprsReport = millis();
       DLOGF("[SIM] GPRS OK — IP:%s  CSQ:%d  Op:%s\n",
             modemSIM.localIP().toString().c_str(),

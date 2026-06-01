@@ -41,6 +41,9 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 - **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de
   tarea y fase actual en RTC RAM antes de operaciones bloqueantes. Si el WDT dispara,
   la alerta `device_reboot` incluirá el contexto exacto del bloqueo para diagnóstico remoto.
+- **Sondeo celular SIM7000G con cadencia controlada**: `NetworkTask` deja de ejecutar
+  consultas AT/GPRS en cada iteración de 10 ms y pasa a un polling cada 2 s (o inmediato
+  si GPRS cae). Reduce la interferencia sobre sockets TLS/MQTT y evita reconexiones espurias.
 - **Cooldown de alertas de sensor** (`SENSOR_ALERT_COOLDOWN = 12 h`): evita que un sensor
   persistentemente muerto inunde el broker con alertas repetidas. Tras el primer disparo
   edge-triggered, la alerta se re-emite cada 12 horas mientras el fallo persista.
