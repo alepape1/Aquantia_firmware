@@ -1,5 +1,9 @@
 # Credenciales y secretos — nunca subir al repositorio
 secrets.h
+ESP_monitor_server/secrets - copia.h
+ESP_monitor_server/secrets*.local.h
+ESP_monitor_server/secrets*backup*.h
+ESP_monitor_server/secrets*copy*.h
 
 # Binarios compilados del firmware
 ESP_monitor_server/build/

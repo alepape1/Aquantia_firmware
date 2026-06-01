@@ -144,6 +144,8 @@
 #endif
 #include <ArduinoJson.h>
 #include <math.h>
+// Nota de flasheo: la configuracion activa sale solo de "secrets.h".
+// Archivos de respaldo (p. ej. "secrets - copia.h") no forman parte del build.
 #include "secrets.h"
 
 // Certificado TLS reutilizado por HTTPS y MQTT.
@@ -385,9 +387,93 @@ static uint8_t bmp280_addr = 0x00;
 bool tsl_ok   = false;
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
 static uint8_t       xdb401_failures  = 0;       // fallos consecutivos de lectura
+static uint8_t       xdb401_recovery_failures = 0; // fallos consecutivos de recuperación
 static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar reinit
 static constexpr uint8_t  XDB401_MAX_FAILURES  = 8;    // más tolerante con cable largo (~1 m)
 static constexpr uint32_t XDB401_RETRY_INTERVAL = 15000UL;  // reintento más rápido tras recovery
+static constexpr uint8_t  XDB401_MAX_RECOVERY_FAILURES = 4;  // varios intentos antes de enfriamiento
+static constexpr uint32_t XDB401_RECOVERY_COOLDOWN = 300000UL; // 5 min
+
+static constexpr uint8_t  SENSOR_RECOVERY_MAX_FAILURES = 4;
+static constexpr uint32_t SENSOR_RECOVERY_RETRY_INTERVAL = 15000UL;
+static constexpr uint32_t SENSOR_RECOVERY_COOLDOWN = 300000UL;
+
+static void sensorRecoveryMarkSuccess(uint8_t& recoveryFailures, unsigned long& retryAt) {
+  recoveryFailures = 0;
+  retryAt = 0;
+}
+
+static void sensorRecoveryMarkFailure(const char* sensorTag,
+                                      uint8_t& recoveryFailures,
+                                      unsigned long& retryAt) {
+  if (recoveryFailures < 255) recoveryFailures++;
+
+  if (recoveryFailures >= SENSOR_RECOVERY_MAX_FAILURES) {
+    retryAt = millis() + SENSOR_RECOVERY_COOLDOWN;
+    recoveryFailures = 0;
+    DLOGF("[%s] Recuperacion fallida repetida — enfriamiento %lus antes de nuevo intento\n",
+          sensorTag,
+          (unsigned long)SENSOR_RECOVERY_COOLDOWN / 1000UL);
+  } else {
+    retryAt = millis() + SENSOR_RECOVERY_RETRY_INTERVAL;
+  }
+}
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK \
+ || DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+static uint8_t       bmp_recovery_failures = 0;
+static unsigned long bmp_retry_at = 0;
+#endif
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK
+static uint8_t       micropressure_recovery_failures = 0;
+static unsigned long micropressure_retry_at = 0;
+#endif
+
+#if DEVICE_PROFILE == PROFILE_METEO
+static uint8_t       mcp_recovery_failures = 0;
+static unsigned long mcp_retry_at = 0;
+static uint8_t       htu_recovery_failures = 0;
+static unsigned long htu_retry_at = 0;
+#endif
+
+#if DEVICE_PROFILE == PROFILE_AQUALEAK
+static uint8_t       hdc_recovery_failures = 0;
+static unsigned long hdc_retry_at = 0;
+static uint8_t       bh1750_recovery_failures = 0;
+static unsigned long bh1750_retry_at = 0;
+#endif
+
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+static uint8_t       aht20_recovery_failures = 0;
+static unsigned long aht20_retry_at = 0;
+static uint8_t       ina219_recovery_failures = 0;
+static unsigned long ina219_retry_at = 0;
+#endif
+
+#if DEVICE_PROFILE != PROFILE_AQUALEAK
+static uint8_t       tsl_recovery_failures = 0;
+static unsigned long tsl_retry_at = 0;
+#endif
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+static uint8_t       soil_rs485_recovery_failures = 0;
+static unsigned long soil_rs485_retry_at = 0;
+#endif
+
+static void xdb401_schedule_retry_after_recovery_fail() {
+  if (xdb401_recovery_failures < 255) xdb401_recovery_failures++;
+
+  if (xdb401_recovery_failures >= XDB401_MAX_RECOVERY_FAILURES) {
+    xdb401_retry_at = millis() + XDB401_RECOVERY_COOLDOWN;
+    xdb401_recovery_failures = 0;  // reiniciar ciclo tras aplicar cooldown largo
+    DLOGF("[XDB401] Recuperacion fallida repetida — enfriamiento %lus antes de nuevo intento\n",
+          (unsigned long)XDB401_RECOVERY_COOLDOWN / 1000UL);
+  } else {
+    xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
+  }
+}
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK \
  || DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
@@ -732,12 +818,13 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
         if (xdb401_read(_p0, _t0)) {
           xdb401_ok         = true;
           xdb401_failures   = 0;
+          xdb401_recovery_failures = 0;
           pressureBar       = _p0;
           xdb401Temperature = _t0;
           DLOGLN("[XDB401] Reconectado tras fallo");
         }
       }
-      if (!xdb401_ok) xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
+      if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
     }
     if (xdb401_ok) {
       float p, tc;
@@ -745,6 +832,7 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
         pressureBar       = p;
         xdb401Temperature = tc;
         xdb401_failures   = 0;
+        xdb401_recovery_failures = 0;
       } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
         xdb401_ok       = false;
         xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
@@ -787,12 +875,13 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
       if (xdb401_read(_p0, _t0)) {
         xdb401_ok         = true;
         xdb401_failures   = 0;
+        xdb401_recovery_failures = 0;
         pressureBar       = _p0;
         xdb401Temperature = _t0;
         DLOGLN("[XDB401] Reconectado tras fallo");
       }
     }
-    if (!xdb401_ok) xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
+    if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
   }
   if (xdb401_ok) {
     float p, tc;
@@ -800,6 +889,7 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
       pressureBar       = p;
       xdb401Temperature = tc;
       xdb401_failures   = 0;
+      xdb401_recovery_failures = 0;
     } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
       xdb401_ok        = false;
       xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
@@ -816,13 +906,14 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
       if (xdb401_read(_p0, _t0)) {
         xdb401_ok         = true;
         xdb401_failures   = 0;
+        xdb401_recovery_failures = 0;
         pressureBar       = _p0;
         xdb401Temperature = _t0;
         DLOGLN("[XDB401] Reconectado tras fallo");
         return true;
       }
     }
-    if (!xdb401_ok) xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
+    if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
   }
   if (xdb401_ok) {
     float p, tc;
@@ -831,6 +922,7 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
       xdb401Temperature = tc;
       flowLpm           = 0.0f;
       xdb401_failures   = 0;
+      xdb401_recovery_failures = 0;
       return true;
     } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
       xdb401_ok        = false;
@@ -3061,9 +3153,14 @@ void loop() {
 #if DEVICE_PROFILE == PROFILE_METEO
     // BMP280 — leer siempre para mandar sus datos explícitos por telemetría
     // Reintento de reinit si el sensor falló en ciclo anterior (cada telemetryIntervalMs = 20 s)
-    if (!bmp_ok) {
+    if (!bmp_ok && now >= bmp_retry_at) {
       bmp_ok = beginBMP280();
-      if (bmp_ok) DLOGLN("[BMP280] Reconectado tras fallo");
+      if (bmp_ok) {
+        sensorRecoveryMarkSuccess(bmp_recovery_failures, bmp_retry_at);
+        DLOGLN("[BMP280] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("BMP280", bmp_recovery_failures, bmp_retry_at);
+      }
     }
     bmp_temp_ok = false;
     bmp_pressure_ok = false;
@@ -3086,9 +3183,15 @@ void loop() {
 
     // Temperatura exterior — prioridad MCP9808, fallback BMP280
     // Reintento de reinit si el sensor falló en ciclo anterior
-    if (!mcp_ok) {
+    if (!mcp_ok && now >= mcp_retry_at) {
       mcp_ok = tempsensor.begin(0x19);
-      if (mcp_ok) { tempsensor.setResolution(3); DLOGLN("[MCP9808] Reconectado tras fallo"); }
+      if (mcp_ok) {
+        sensorRecoveryMarkSuccess(mcp_recovery_failures, mcp_retry_at);
+        tempsensor.setResolution(3);
+        DLOGLN("[MCP9808] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("MCP9808", mcp_recovery_failures, mcp_retry_at);
+      }
     }
     temp_ok = false;
     if (mcp_ok) {
@@ -3111,9 +3214,14 @@ void loop() {
 
     // Barómetro — prioridad MicroPressure, fallback BMP280
     // Reintento de reinit si el sensor falló en ciclo anterior
-    if (!micropressure_ok) {
+    if (!micropressure_ok && now >= micropressure_retry_at) {
       micropressure_ok = barometer.begin();
-      if (micropressure_ok) DLOGLN("[MicroPressure] Reconectado tras fallo");
+      if (micropressure_ok) {
+        sensorRecoveryMarkSuccess(micropressure_recovery_failures, micropressure_retry_at);
+        DLOGLN("[MicroPressure] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("MicroPressure", micropressure_recovery_failures, micropressure_retry_at);
+      }
     }
     bar_ok = false;
     if (micropressure_ok) {
@@ -3136,9 +3244,14 @@ void loop() {
 #if DEVICE_PROFILE == PROFILE_METEO
     // HTU2x — omitido en IRRIGATION y AGROMETEO
     // Reintento de reinit si el sensor falló en ciclo anterior
-    if (!htu_ok) {
+    if (!htu_ok && now >= htu_retry_at) {
       htu_ok = htu_begin();
-      if (htu_ok) DLOGLN("[HTU2x] Reconectado tras fallo");
+      if (htu_ok) {
+        sensorRecoveryMarkSuccess(htu_recovery_failures, htu_retry_at);
+        DLOGLN("[HTU2x] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("HTU2x", htu_recovery_failures, htu_retry_at);
+      }
     }
     if (htu_ok) {
       float t = htu_readTemp();
@@ -3183,19 +3296,43 @@ void loop() {
     // operar en modo continuo sin necesidad de esperar la conversión inicial cada vez.
     // Recovery — reinicializar sensores que fallaron en el ciclo anterior
     if (qwiic_ps_ok) {
-      if (!micropressure_ok) micropressure_ok = barometer.begin();
-      if (!bmp_ok) {
-        bmp_ok = beginBMP280();
-        if (bmp_ok) bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                                       Adafruit_BMP280::SAMPLING_X2,
-                                       Adafruit_BMP280::SAMPLING_X16,
-                                       Adafruit_BMP280::FILTER_X16,
-                                       Adafruit_BMP280::STANDBY_MS_500);
+      if (!micropressure_ok && now >= micropressure_retry_at) {
+        micropressure_ok = barometer.begin();
+        if (micropressure_ok) {
+          sensorRecoveryMarkSuccess(micropressure_recovery_failures, micropressure_retry_at);
+        } else {
+          sensorRecoveryMarkFailure("MicroPressure", micropressure_recovery_failures, micropressure_retry_at);
+        }
       }
-      if (!hdc_ok)     hdc_ok     = hdc1080_init();
-      if (!bh1750_ok) {
+      if (!bmp_ok && now >= bmp_retry_at) {
+        bmp_ok = beginBMP280();
+        if (bmp_ok) {
+          sensorRecoveryMarkSuccess(bmp_recovery_failures, bmp_retry_at);
+          bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                             Adafruit_BMP280::SAMPLING_X2,
+                             Adafruit_BMP280::SAMPLING_X16,
+                             Adafruit_BMP280::FILTER_X16,
+                             Adafruit_BMP280::STANDBY_MS_500);
+        } else {
+          sensorRecoveryMarkFailure("BMP280", bmp_recovery_failures, bmp_retry_at);
+        }
+      }
+      if (!hdc_ok && now >= hdc_retry_at) {
+        hdc_ok = hdc1080_init();
+        if (hdc_ok) {
+          sensorRecoveryMarkSuccess(hdc_recovery_failures, hdc_retry_at);
+        } else {
+          sensorRecoveryMarkFailure("HDC1080", hdc_recovery_failures, hdc_retry_at);
+        }
+      }
+      if (!bh1750_ok && now >= bh1750_retry_at) {
         bh1750_ok = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-        if (bh1750_ok) delay(180);  // esperar primera conversión solo si se reinicia
+        if (bh1750_ok) {
+          sensorRecoveryMarkSuccess(bh1750_recovery_failures, bh1750_retry_at);
+          delay(180);  // esperar primera conversión solo si se reinicia
+        } else {
+          sensorRecoveryMarkFailure("BH1750", bh1750_recovery_failures, bh1750_retry_at);
+        }
       }
     }
 
@@ -3286,15 +3423,18 @@ void loop() {
     // ── IRRIGATION: BMP280 + AHT20 + INA219 ─────────────────────────────────
 
     // BMP280 — temperatura + presión atmosférica
-    if (!bmp_ok) {
+    if (!bmp_ok && now >= bmp_retry_at) {
       bmp_ok = beginBMP280();
       if (bmp_ok) {
+        sensorRecoveryMarkSuccess(bmp_recovery_failures, bmp_retry_at);
         bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
                           Adafruit_BMP280::SAMPLING_X2,
                           Adafruit_BMP280::SAMPLING_X16,
                           Adafruit_BMP280::FILTER_X16,
                           Adafruit_BMP280::STANDBY_MS_500);
         DLOGLN("[BMP280] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("BMP280", bmp_recovery_failures, bmp_retry_at);
       }
     }
     bmp_temp_ok = bmp_pressure_ok = false;
@@ -3313,9 +3453,14 @@ void loop() {
     if (!bmp_pressure_ok) { bar_ok = false; pressure = sim_pressure; }
 
     // AHT20 — temperatura y humedad
-    if (!aht20_ok) {
+    if (!aht20_ok && now >= aht20_retry_at) {
       aht20_ok = aht20_begin();
-      if (aht20_ok) DLOGLN("[AHT20] Reconectado tras fallo");
+      if (aht20_ok) {
+        sensorRecoveryMarkSuccess(aht20_recovery_failures, aht20_retry_at);
+        DLOGLN("[AHT20] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("AHT20", aht20_recovery_failures, aht20_retry_at);
+      }
     }
     if (aht20_ok) {
       float t = NAN, h = NAN;
@@ -3335,9 +3480,14 @@ void loop() {
     }
 
     // INA219 — voltaje / corriente / potencia
-    if (!ina219_ok) {
+    if (!ina219_ok && now >= ina219_retry_at) {
       ina219_ok = ina219_begin();
-      if (ina219_ok) DLOGLN("[INA219] Reconectado tras fallo");
+      if (ina219_ok) {
+        sensorRecoveryMarkSuccess(ina219_recovery_failures, ina219_retry_at);
+        DLOGLN("[INA219] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("INA219", ina219_recovery_failures, ina219_retry_at);
+      }
     }
     if (ina219_ok) {
       float v = ina219_readBusVoltage();
@@ -3357,15 +3507,18 @@ void loop() {
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
     // ── AQUA_SMART_REMOTE: BMP280 + AHT20 + INA219 ──────────────────────────
 
-    if (!bmp_ok) {
+    if (!bmp_ok && now >= bmp_retry_at) {
       bmp_ok = beginBMP280();
       if (bmp_ok) {
+        sensorRecoveryMarkSuccess(bmp_recovery_failures, bmp_retry_at);
         bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
                           Adafruit_BMP280::SAMPLING_X2,
                           Adafruit_BMP280::SAMPLING_X16,
                           Adafruit_BMP280::FILTER_X16,
                           Adafruit_BMP280::STANDBY_MS_500);
         DLOGLN("[BMP280] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("BMP280", bmp_recovery_failures, bmp_retry_at);
       }
     }
     bmp_temp_ok = bmp_pressure_ok = false;
@@ -3383,9 +3536,14 @@ void loop() {
     }
     if (!bmp_pressure_ok) { bar_ok = false; pressure = sim_pressure; }
 
-    if (!aht20_ok) {
+    if (!aht20_ok && now >= aht20_retry_at) {
       aht20_ok = aht20_begin();
-      if (aht20_ok) DLOGLN("[AHT20] Reconectado tras fallo");
+      if (aht20_ok) {
+        sensorRecoveryMarkSuccess(aht20_recovery_failures, aht20_retry_at);
+        DLOGLN("[AHT20] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("AHT20", aht20_recovery_failures, aht20_retry_at);
+      }
     }
     if (aht20_ok) {
       float t = NAN, h = NAN;
@@ -3404,9 +3562,14 @@ void loop() {
       humidity = sim_humidity;
     }
 
-    if (!ina219_ok) {
+    if (!ina219_ok && now >= ina219_retry_at) {
       ina219_ok = ina219_begin();
-      if (ina219_ok) DLOGLN("[INA219] Reconectado tras fallo");
+      if (ina219_ok) {
+        sensorRecoveryMarkSuccess(ina219_recovery_failures, ina219_retry_at);
+        DLOGLN("[INA219] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("INA219", ina219_recovery_failures, ina219_retry_at);
+      }
     }
     if (ina219_ok) {
       float v = ina219_readBusVoltage();
@@ -3425,6 +3588,15 @@ void loop() {
 
 #if DEVICE_PROFILE != PROFILE_AQUALEAK
     // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750)
+    if (!tsl_ok && now >= tsl_retry_at) {
+      tsl_ok = tsl_begin();
+      if (tsl_ok) {
+        sensorRecoveryMarkSuccess(tsl_recovery_failures, tsl_retry_at);
+        DLOGLN("[TSL2584] Reconectado tras fallo");
+      } else {
+        sensorRecoveryMarkFailure("TSL2584", tsl_recovery_failures, tsl_retry_at);
+      }
+    }
     if (tsl_ok) {
       float lux = tsl_readLux();
       if (lux >= 0.0f) {
@@ -3596,7 +3768,10 @@ void loop() {
     if (now - lastSoilReadMs >= soilInterval) {
       lastSoilReadMs = now;
       wdt_heartbeat("loopTask", "soil_rs485");
-      if (soilSensor.readAllVariables()) {
+      if (now < soil_rs485_retry_at) {
+        halisenseData.ok = false;
+      } else if (soilSensor.readAllVariables()) {
+        sensorRecoveryMarkSuccess(soil_rs485_recovery_failures, soil_rs485_retry_at);
         halisenseData.ok          = true;
         halisenseData.moisture    = soilSensor.getHumidity();
         halisenseData.temperature = soilSensor.getTemperature();
@@ -3614,6 +3789,7 @@ void loop() {
               relayOn ? "RIEGO" : (soilPostIrrigEndMs != 0 ? "POST-RIEGO" : "REPOSO"));
       } else {
         halisenseData.ok = false;
+        sensorRecoveryMarkFailure("SOIL", soil_rs485_recovery_failures, soil_rs485_retry_at);
         DLOGLN("[SOIL] Sin respuesta del sensor RS485");
       }
     }

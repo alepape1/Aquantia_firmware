@@ -58,6 +58,11 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
   del siguiente intento MQTT.
 
 ### Improved
+- **Backoff global de recuperación de sensores**: cuando un sensor entra en fallo,
+  el firmware evita reintentos continuos en cada ciclo. Tras 4 intentos de recuperación
+  fallidos, aplica un enfriamiento de 5 minutos antes del siguiente intento.
+  Aplicado a XDB401, BMP280, MCP9808, MicroPressure, HTU2x, HDC1080, BH1750,
+  AHT20, INA219, TSL2584/APDS y Soil RS485.
 - **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de
   tarea y fase actual en RTC RAM antes de operaciones bloqueantes. Si el WDT dispara,
   la alerta `device_reboot` incluirá el contexto exacto del bloqueo para diagnóstico remoto.
