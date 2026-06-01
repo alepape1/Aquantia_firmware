@@ -59,6 +59,19 @@ const char* device_serial_get() {
   return _device_serial;
 }
 
+// Devuelve la MAC WiFi STA en formato "FC:B4:67:F3:77:48".
+// Usa el eFuse directamente — funciona aunque WiFi no esté inicializado.
+// Usar siempre esta función (no WiFi.macAddress()) para que PROFILE_AQUA_SMART_REMOTE
+// envíe el mismo identificador que los perfiles WiFi: la API lo indexa por MAC.
+static String getDeviceMacAddress() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
 #ifndef DEV_MODE
 // ── NVS ──────────────────────────────────────────────────────────────────────
 
@@ -306,7 +319,14 @@ static const char _PROV_SAVED_HTML[] PROGMEM = R"rawliteral(
  * Inicia el modo SoftAP con captive portal y espera a que el usuario
  * introduzca las credenciales. Al guardar, llama a ESP.restart().
  * Esta función NO retorna bajo operación normal.
+ * En PROFILE_AQUA_SMART_REMOTE no se llama (sin WiFi — conectividad celular).
  */
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+void provisioning_start_ap() {
+  // No-op: AQUA_SMART_REMOTE usa SIM celular, no requiere portal WiFi
+  DLOGLN("[PROV] provisioning_start_ap() omitido — perfil usa conectividad celular");
+}
+#else
 void provisioning_start_ap() {
   String macStr = WiFi.macAddress();  // "AA:BB:CC:DD:EE:FF"
   char ap_ssid[32];
@@ -423,6 +443,7 @@ void provisioning_start_ap() {
     yield();
   }
 }
+#endif  // DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 
 // ── Factory reset por pulsación larga de GPIO0 ───────────────────────────────
 

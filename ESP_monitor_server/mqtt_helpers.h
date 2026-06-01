@@ -19,8 +19,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String targetMac = doc["mac"] | "";
   targetMac.trim();
   targetMac.toUpperCase();
-  String selfMac = WiFi.macAddress();
-  selfMac.trim();
+  String selfMac = getDeviceMacAddress();
   selfMac.toUpperCase();
   if (targetMac.length() > 0 && targetMac != selfMac) return;
 
@@ -117,14 +116,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // Conectar al broker y suscribirse al topic de comandos
 bool mqttConnect() {
   char client_id[48];
-  String mac_no_colon = WiFi.macAddress();
+  // Client ID = "aquantia-{MAC sin colons}" — idéntico en WiFi y cellular.
+  // getDeviceMacAddress() lee el eFuse: funciona sin WiFi inicializado.
+  String mac_no_colon = getDeviceMacAddress();
   mac_no_colon.replace(":", "");
-
-  if (mac_no_colon.length() >= 12) {
-    snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
-  } else {
-    snprintf(client_id, sizeof(client_id), "aquantia-%s", device_serial_get());
-  }
+  snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
 
   mqttClient.setKeepAlive(60);
   bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
@@ -143,9 +139,14 @@ bool mqttConnect() {
 // Publicar datos de registro al arranque (una sola vez)
 void mqttPublishRegister() {
   StaticJsonDocument<320> doc;
-  doc["device_serial"]    = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
-  doc["mac_address"]      = WiFi.macAddress();
+  doc["device_serial"]    = device_serial_get();   // AQ-{MAC} — identidad hardware
+  doc["mac_address"]      = getDeviceMacAddress(); // "FC:B4:67:F3:77:48" — mismo en WiFi y cellular
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  doc["ip_address"]       = modemSIM.localIP().toString();
+  doc["network"]          = "cellular";
+#else
   doc["ip_address"]       = WiFi.localIP().toString();
+#endif
   doc["chip_model"]       = ESP.getChipModel();
   doc["chip_revision"]    = (int)ESP.getChipRevision();
   doc["cpu_freq_mhz"]     = (int)ESP.getCpuFreqMHz();
@@ -154,8 +155,9 @@ void mqttPublishRegister() {
   doc["relay_count"]      = RELAY_COUNT;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["device_profile"]   =
-    (DEVICE_PROFILE == PROFILE_METEO)      ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_IRRIGATION) ? "IRRIGATION" : "AQUALEAK";
+    (DEVICE_PROFILE == PROFILE_METEO)             ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_IRRIGATION)        ? "IRRIGATION" :
+    (DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE) ? "AQUA_SMART_REMOTE" : "AQUALEAK";
 
   char topic[64], buf[768];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
@@ -173,7 +175,7 @@ void mqttPublishRegister() {
 void mqttPublishAlert(const char* type, const char* severity, const char* message) {
   if (!mqttClient.connected()) return;
   StaticJsonDocument<256> doc;
-  doc["device_mac"] = WiFi.macAddress();
+  doc["device_mac"] = getDeviceMacAddress();
   doc["type"]       = type;
   doc["severity"]   = severity;
   doc["message"]    = message;

@@ -12,7 +12,8 @@
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
-#define PROFILE_AQUALEAK   3   // ECU AquaLeak — 1 relay para válvula, sensores CJMCU-14 (BH1750+HDC1080+BMP280)
+#define PROFILE_AQUALEAK          3   // ECU AquaLeak — 1 relay para válvula, sensores CJMCU-14 (BH1750+HDC1080+BMP280)
+#define PROFILE_AQUA_SMART_REMOTE 4   // ECU remota — LilyGO T-SIM7000G + SIM Onomondo (idéntico a IRRIGATION + celular)
 
 #ifndef DEVICE_PROFILE
   #define DEVICE_PROFILE PROFILE_METEO
@@ -35,10 +36,16 @@
 #endif
 
 // ── Plataforma: ESP32 ─────────────────────────────────────────────────────────
-#include "WiFi.h"
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoOTA.h>
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // AQUA_SMART_REMOTE usa conectividad celular — sin WiFi
+  #define TINY_GSM_MODEM_SIM7000SSL
+  #include <TinyGsmClient.h>
+#else
+  #include "WiFi.h"
+  #include <HTTPClient.h>
+  #include <WiFiClientSecure.h>
+  #include <ArduinoOTA.h>
+#endif
 #include "driver/rtc_io.h"
 #include "esp_task_wdt.h"
 #define I2C_SDA        21
@@ -75,6 +82,9 @@
   //   YF-B4   → 240 p/L  (F = 4.0·Q Hz)  ← nominal datasheet
   //   YF-B9   → 288 p/L  (F = 4.8·Q Hz)
   #define FLOW_K_FACTOR   660   // YF-B4 — usar mismo valor calibrado que METEO hasta nueva calibración
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  #define FLOW_PIN         34   // Caudalímetro — GPIO34, ADC1_CH6, solo entrada
+  #define FLOW_K_FACTOR   660   // YF-B4 — mismo valor que IRRIGATION hasta calibración propia
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   #define HAS_DISPLAY
@@ -107,6 +117,14 @@
   #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
   // IRRIGATION: RS485 Helissense + INA219 + AHT20 + BMP280
+  #include <Wire.h>
+  #include <Adafruit_BMP280.h>
+  #include "SoilSensor.h"
+  #include "halisense_sensor.h"
+  #include "aht20_driver.h"
+  #include "ina219_driver.h"
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // AQUA_SMART_REMOTE: mismo sensor suite que IRRIGATION + conectividad celular SIM7000G
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include "SoilSensor.h"
@@ -155,6 +173,27 @@
   #endif
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN_1, RELAY_PIN_2,
                                                    RELAY_PIN_3, RELAY_PIN_4};
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // LilyGO T-SIM7000G — pines libres (sin conflicto con modem UART ni SD card)
+  #define RELAY_COUNT 4
+  #define RELAY_PIN_1  32
+  #define RELAY_PIN_2  33
+  #define RELAY_PIN_3  16
+  #define RELAY_PIN_4  17
+  static const uint8_t RELAY_PINS[RELAY_COUNT] = {32, 33, 16, 17};
+  // ── Modem SIM7000G ──────────────────────────────────────────────────────────
+  #define MODEM_TX_PIN      27   // Serial1 AT → modem
+  #define MODEM_RX_PIN      26   // Serial1 AT ← modem
+  #define MODEM_DTR_PIN     25   // Mantiene modem despierto (LOW)
+  #define MODEM_PWRKEY_PIN   4   // Secuencia power-on (pulso 1000 ms)
+  #define MODEM_LED_PIN     12   // LED onboard (activo-LOW)
+  // ── RS485 Helissense — pines libres, SD card intacta (2/13/14/15) ─────────
+  #define ASR_RS485_RX_PIN  18   // GPIO libre
+  #define ASR_RS485_TX_PIN  19   // GPIO libre
+  #define ASR_RS485_DERE    23   // GPIO libre
+  // ── ADC — tensión batería y panel solar ────────────────────────────────────
+  #define BOARD_BAT_ADC_PIN   35
+  #define BOARD_SOLAR_ADC_PIN 36
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   // AQUALEAK: 1 relay para válvula de corte electroválvula — GPIO RELAY_PIN (Wemos D1 Mini ESP32)
   #define RELAY_COUNT 1
@@ -195,6 +234,8 @@ const char* mqtt_pass   = MQTT_PASS;
   const int ledPin = -1;   // LilyGo T-Display no tiene LED onboard
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
   const int ledPin = 23;
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  const int ledPin = MODEM_LED_PIN;   // GPIO12, activo-LOW
 #else
   const int ledPin = 2;
 #endif
@@ -237,6 +278,8 @@ const char* mqtt_pass   = MQTT_PASS;
   QWIIC_POWER            qwiic_ps;
   SparkFun_MicroPressure barometer;
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
+  Adafruit_BMP280        bmp280;
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   Adafruit_BMP280        bmp280;
 #endif
 
@@ -293,8 +336,14 @@ static const char* resetReasonStr(esp_reset_reason_t r) {
 bool relayActive[RELAY_COUNT > 0 ? RELAY_COUNT : 1] = {};
 
 #ifdef USE_MQTT
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+static TinyGsm             modemSIM(Serial1);
+static TinyGsmClientSecure gsmTLSClient(modemSIM);
+static TinyGsmClient       gsmTCPClient(modemSIM);
+#else
 static WiFiClient       mqttTCPClient;
 static WiFiClientSecure mqttTLSClient;
+#endif
 static PubSubClient     mqttClient;
 #endif
 
@@ -319,6 +368,10 @@ static uint8_t bmp280_addr = 0x00;
 bool aht20_ok  = false;   // AHT20  — temperatura y humedad ambiente (I2C 0x38)
 bool ina219_ok = false;   // INA219 — voltaje / corriente / potencia  (I2C 0x40)
 static uint8_t bmp280_addr = 0x00;
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+bool aht20_ok  = false;   // AHT20  — temperatura y humedad ambiente (I2C 0x38)
+bool ina219_ok = false;   // INA219 — voltaje / corriente / potencia  (I2C 0x40)
+static uint8_t bmp280_addr = 0x00;
 #endif
 bool tsl_ok   = false;
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
@@ -327,7 +380,8 @@ static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar re
 static constexpr uint8_t  XDB401_MAX_FAILURES  = 8;    // más tolerante con cable largo (~1 m)
 static constexpr uint32_t XDB401_RETRY_INTERVAL = 15000UL;  // reintento más rápido tras recovery
 
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK \
+ || DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 static bool beginBMP280() {
   if (bmp280.begin(0x76)) {
     bmp280_addr = 0x76;
@@ -428,7 +482,7 @@ static const char* temperatureSourceName() {
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (hdc_ok) return "HDC1080";
   if (bmp_temp_ok) return "BMP280";
-#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (aht20_ok) return "AHT20";
   if (bmp_temp_ok) return "BMP280";
 #endif
@@ -443,7 +497,7 @@ static const char* pressureSourceName() {
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (micropressure_ok) return "MicroPressure";
   if (bmp_pressure_ok)  return "BMP280";
-#elif DEVICE_PROFILE == PROFILE_IRRIGATION
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (bmp_pressure_ok) return "BMP280";
 #endif
   return "SIM";
@@ -458,7 +512,7 @@ float  humidityDHT11     = 0;   // DHT11 humedad
 float  bmpTemperature    = NAN; // BMP280 temperatura directa
 float  bmpPressure       = NAN; // BMP280 presión directa en kPa
 double pressure          = 0;
-#if DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 float  ina219BusVoltage = NAN;  // INA219 voltaje bus (V)
 float  ina219Current    = NAN;  // INA219 corriente (mA)
 float  ina219Power      = NAN;  // INA219 potencia (mW)
@@ -474,6 +528,9 @@ SoilSensor    soilSensor(Serial2, 13, 17, 27);  // RX=GPIO13, TX=GPIO17, DE/RE=G
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
 HalisenseData halisenseData = {};
 SoilSensor    soilSensor(Serial2, 14, 13, 27);  // RX=GPIO14, TX=GPIO13, DE/RE=GPIO27
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+HalisenseData halisenseData = {};
+SoilSensor    soilSensor(Serial2, ASR_RS485_RX_PIN, ASR_RS485_TX_PIN, ASR_RS485_DERE);  // RX=18, TX=19, DE/RE=23
 #endif
 
 // ── Parámetros calculados AQUALEAK ────────────────────────────────────────────
@@ -556,7 +613,8 @@ IrrigationType irrigationType = IRRIG_SPRINKLER;  // perfil de riego activo (con
 LeakDetector   leakDetector;                       // detector automático de fugas (solo modo real)
 unsigned long telemetryIntervalMs  = 20000UL;
 unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 unsigned long soilFastIntervalMs   = 3000UL;    // durante riego activo y ventana post-riego
 unsigned long soilSlowIntervalMs   = 20000UL;   // reposo normal
 #endif
@@ -902,7 +960,8 @@ struct TelemetrySnapshot {
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
   float dewPoint, heatIndex, absHum;
 #endif
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   float soilTemp, soilEc, soilPh, soilTds;
   int   soilN, soilP, soilK;
   bool  halisenseOk;
@@ -948,7 +1007,8 @@ unsigned long lastScreenTime      = 0;
 unsigned long lastSlowSensorRead   = 0;  // sensores lentos I2C: MCP9808, BMP280, HTU21, DHT, luz, suelo
 unsigned long lastPipelineFastRead = 0;  // XDB401 + caudalímetro: tan rápido como PIPELINE_FAST_MS
 unsigned long lastSensorRead       = 0;  // alias para compatibilidad con el bloque telemetría
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 unsigned long lastSoilReadMs      = 0;   // último muestreo del sensor de suelo RS485
 unsigned long soilPostIrrigEndMs  = 0;   // millis() cuando se apagó el último relay (0 = inactivo)
 #endif
@@ -962,8 +1022,10 @@ void printHardwareInfo() {
   DLOGF("Flash        : %d MB\n",        ESP.getFlashChipSize() / (1024 * 1024));
   DLOGF("Free Heap    : %d bytes\n",     ESP.getFreeHeap());
   DLOGF("SDK          : %s\n",           ESP.getSdkVersion());
-  DLOGF("MAC          : %s\n",           WiFi.macAddress().c_str());
+  DLOGF("MAC          : %s\n",           getDeviceMacAddress().c_str());
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
   DLOGF("IP           : %s\n",           WiFi.localIP().toString().c_str());
+#endif
   DLOGLN("====================");
 }
 
@@ -991,6 +1053,7 @@ static bool tlsClockReady(unsigned long waitMs = 5000) {
   return now >= 1700000000L;
 }
 
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000) {
   int handshakeSeconds = timeoutMs / 1000;
   if (handshakeSeconds < 1) handshakeSeconds = 1;
@@ -1003,6 +1066,58 @@ static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000)
     DLOGLN("[TLS] Advertencia: reloj aun no sincronizado; reintentando handshake con la CA cargada");
   }
 }
+#endif
+
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+static void prepareGsmTLSClient() {
+  gsmTLSClient.setCACert(MQTT_CA_CERT_PEM);
+}
+
+// Enciende el modem SIM7000G y establece conexión GPRS con APN Onomondo.
+// Retorna true si GPRS queda operativo.
+static bool sim7000g_powerOn() {
+  // DTR LOW → mantiene el modem despierto (no entra en sleep)
+  pinMode(MODEM_DTR_PIN, OUTPUT);
+  digitalWrite(MODEM_DTR_PIN, LOW);
+
+  // Secuencia PWRKEY: pulso ~1000 ms según datasheet SIM7000G
+  pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);  delay(100);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH); delay(1000);
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+
+  // UART modem en Serial1 (hardware UART independiente del debug)
+  Serial1.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+  DLOGLN("[SIM] Esperando boot del modem (3 s)...");
+  delay(3000);
+
+  DLOGLN("[SIM] Inicializando TinyGSM...");
+  if (!modemSIM.init()) {
+    DLOGLN("[SIM] ERROR: modem no responde a AT");
+    return false;
+  }
+  String info = modemSIM.getModemInfo();
+  DLOGF("[SIM] Modem: %s\n", info.c_str());
+
+  // Esperar registro en red celular (max 60 s)
+  DLOGLN("[SIM] Esperando registro en red...");
+  if (!modemSIM.waitForNetwork(60000L)) {
+    DLOGLN("[SIM] ERROR: sin cobertura o SIM no registrada");
+    return false;
+  }
+  DLOGF("[SIM] Red OK — operador: %s  RSSI: %d\n",
+        modemSIM.getOperator().c_str(), modemSIM.getSignalQuality());
+
+  // Conectar GPRS con APN Onomondo (sin usuario ni contraseña)
+  DLOGF("[SIM] Conectando GPRS (APN=%s)...\n", GSM_APN);
+  if (!modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS)) {
+    DLOGLN("[SIM] ERROR: fallo al conectar GPRS");
+    return false;
+  }
+  DLOGF("[SIM] GPRS OK — IP local: %s\n", modemSIM.localIP().toString().c_str());
+  return true;
+}
+#endif
 
 static bool parseRelayBitmask(const String& response, int& bitmaskOut) {
   String trimmed = response;
@@ -1029,7 +1144,7 @@ void postDeviceInfo() {
   doc["cpu_freq_mhz"]  = ESP.getCpuFreqMHz();
   doc["flash_size_mb"] = ESP.getFlashChipSize() / (1024 * 1024);
   doc["sdk_version"]   = ESP.getSdkVersion();
-  doc["mac_address"]      = WiFi.macAddress();
+  doc["mac_address"]      = getDeviceMacAddress();
   doc["ip_address"]       = WiFi.localIP().toString();
   doc["relay_count"]      = RELAY_COUNT;
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -1140,7 +1255,8 @@ void syncPipelineScenario() {
           DLOGF("[PIPE] Sync config → %lds\n", nextSync);
         }
       }
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       {
         long nextSoilFast = doc["soil_fast_interval_s"] | (long)(soilFastIntervalMs / 1000UL);
         long nextSoilSlow = doc["soil_slow_interval_s"] | (long)(soilSlowIntervalMs / 1000UL);
@@ -1255,7 +1371,11 @@ void takeSnapshot() {
   }
   // Campos que Core 0 puede leer directamente (thread-safe en ESP32: 32-bit, same-core read)
   _netSnap.heap   = (long)ESP.getFreeHeap();
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  _netSnap.rssi   = modemSIM.getSignalQuality();  // CSQ 0-31
+#else
   _netSnap.rssi   = WiFi.RSSI();
+#endif
   _netSnap.uptime = (long)(millis() / 1000);
 }
 
@@ -1290,6 +1410,16 @@ void networkTask(void* pvParameters) {
 #ifdef USE_MQTT
   static unsigned long mqttRetryDelayMs = 2000;
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  if (mqtt_port == 8883) {
+    prepareGsmTLSClient();
+    mqttClient.setClient(gsmTLSClient);
+    DLOGF("[MQTT] Broker TLS (GSM): %s:%d\n", mqtt_server, mqtt_port);
+  } else {
+    mqttClient.setClient(gsmTCPClient);
+    DLOGF("[MQTT] Broker sin TLS (GSM): %s:%d\n", mqtt_server, mqtt_port);
+  }
+#else
   if (mqtt_port == 8883) {
     prepareSecureClient(mqttTLSClient, 10000);
     mqttClient.setClient(mqttTLSClient);
@@ -1298,6 +1428,7 @@ void networkTask(void* pvParameters) {
     mqttClient.setClient(mqttTCPClient);
     DLOGF("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
   }
+#endif
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(1536);
@@ -1306,13 +1437,44 @@ void networkTask(void* pvParameters) {
   for (;;) {
     wdt_heartbeat("NetworkTask");
     esp_task_wdt_reset();
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
     ArduinoOTA.handle();  // siempre primero, alta frecuencia
 
     if (isUpdatingOTA) {
       vTaskDelay(10 / portTICK_PERIOD_MS);
       continue;
     }
+#endif
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+    // ── Conectividad celular: verificar red GSM y GPRS ─────────────────────
+    if (!modemSIM.isNetworkConnected()) {
+      wdt_heartbeat("NetworkTask", "gsm_network_wait");
+      setLedState(LED_WIFI_CONNECTING);
+      wifiFailCount++;
+      if (wifiFailCount >= 60) {
+        // ~5 min sin red celular — reiniciar dispositivo
+        esp_restart();
+      }
+      if (!modemSIM.waitForNetwork(10000L, true)) {
+        vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+        if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
+        continue;
+      }
+    }
+    if (!modemSIM.isGprsConnected()) {
+      wdt_heartbeat("NetworkTask", "gprs_connect");
+      setLedState(LED_WIFI_CONNECTING);
+      if (!modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS)) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+      DLOGF("[SIM] GPRS reconectado — IP: %s\n", modemSIM.localIP().toString().c_str());
+    }
+    wifiFailCount = 0;
+    wifiRetryDelayMs = 500;
+#else
+    // ── Conectividad WiFi ───────────────────────────────────────────────────
     if (WiFi.status() != WL_CONNECTED) {
       wdt_heartbeat("NetworkTask", "wifi_reconnect");
       setLedState(LED_WIFI_CONNECTING);
@@ -1341,16 +1503,19 @@ void networkTask(void* pvParameters) {
     // Resetear backoff solo tras 10s de conexión estable (evita martillear el AP)
     if (wifiStableSince == 0) wifiStableSince = millis();
     if (millis() - wifiStableSince > 10000) wifiRetryDelayMs = 500;
+#endif
 
     unsigned long now = millis();
 
 #ifdef USE_MQTT
     // Reintentar NTP cada 60s si el reloj no está sincronizado (fallo en boot)
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
     if (time(nullptr) < 1000000000L && (now - lastNtpRetry > 60000 || lastNtpRetry == 0)) {
       DLOGLN("[NTP] Reintentando sincronización...");
       configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
       lastNtpRetry = now;
     }
+#endif
 #endif
 
 #ifndef USE_MQTT
@@ -1366,7 +1531,11 @@ void networkTask(void* pvParameters) {
     if (!mqttClient.connected()) {
       wdt_heartbeat("NetworkTask", "mqtt_connect");
       setLedState(LED_MQTT_CONNECTING);
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+      if (mqtt_port == 8883) prepareGsmTLSClient();
+#else
       if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
+#endif
       esp_task_wdt_reset();
       if (!mqttConnect()) {
         vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
@@ -1550,7 +1719,8 @@ void networkTask(void* pvParameters) {
       }
 #endif
 
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       // Suelo muy seco
       {
         static const float SOIL_DRY_THRESHOLD = 30.0f;  // % — por debajo = suelo seco
@@ -1617,7 +1787,8 @@ void networkTask(void* pvParameters) {
       doc["uptime_s"]              = snap.uptime;
       doc["relay_active"]          = snap.relayMask;
       doc["soil_moisture"]         = r1(snap.soil);
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       doc["halisense_ok"]          = snap.halisenseOk;
       doc["soil_irrig_mode"]       = snap.soilIrrigMode;
       if (snap.halisenseOk) {
@@ -1648,8 +1819,13 @@ void networkTask(void* pvParameters) {
       doc["leak_warmup_progress"]   = leakDetector.warmupProgress();
       doc["xdb401_ok"]             = xdb401_ok;
       if (!isnan(snap.xdb401Temp)) doc["xdb401_temperature"] = r2(snap.xdb401Temp);
-      doc["mac_address"]           = WiFi.macAddress();
+      doc["mac_address"]           = getDeviceMacAddress(); // eFuse — idéntico en WiFi y cellular
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+      doc["ip_address"]            = modemSIM.localIP().toString();
+      doc["network"]               = "cellular";
+#else
       doc["ip_address"]            = WiFi.localIP().toString();
+#endif
       doc["relay_count"]           = RELAY_COUNT;
       doc["firmware_version"]      = FIRMWARE_VERSION;
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
@@ -1658,7 +1834,7 @@ void networkTask(void* pvParameters) {
       if (!isnan(snap.heatIndex))  doc["heat_index"]   = r1(snap.heatIndex);
       if (!isnan(snap.absHum))     doc["abs_humidity"] = r2(snap.absHum);
 #endif
-#if DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       doc["aht20_ok"]  = aht20_ok;
       doc["ina219_ok"] = ina219_ok;
       if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"] = r2(snap.inaVbus);
@@ -2038,6 +2214,60 @@ void setup() {
 
   DLOGF("Sensores activos → TempEnv:%s | Presion:%s\n",
     temperatureSourceName(), pressureSourceName());
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // ── AQUA_SMART_REMOTE: mismo sensor suite que IRRIGATION ────────────────
+  mcp_ok = false;
+
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                      Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16,
+                      Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_500);
+    float tBmp = NAN, pBmp = NAN;
+    bmp_temp_ok     = readBMP280Temperature(tBmp);
+    bmp_pressure_ok = readBMP280PressureKPa(pBmp);
+    if (bmp_temp_ok)     bmpTemperature = tBmp;
+    if (bmp_pressure_ok) { bmpPressure = pBmp; pressure = pBmp; bar_ok = true; }
+    DLOGF("BMP280 OK (0x%02X)\n", bmp280_addr);
+  } else {
+    bmp_temp_ok = bmp_pressure_ok = false;
+    DLOGLN("BMP280 no detectado — modo simulacion");
+  }
+
+  aht20_ok = aht20_begin();
+  if (aht20_ok) {
+    float t = NAN, h = NAN;
+    if (aht20_read(t, h)) {
+      temperatureMCP = t;
+      humidity       = h;
+      temp_ok        = true;
+      DLOGF("AHT20 OK — T:%.1f C  H:%.1f %%\n", t, h);
+    } else {
+      aht20_ok = false;
+    }
+  }
+  if (!aht20_ok) {
+    DLOGLN("AHT20 no detectado — modo simulacion");
+    if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+    else             { temperatureMCP = sim_tempMCP; }
+    humidity = sim_humidity;
+  }
+
+  ina219_ok = ina219_begin();
+  if (ina219_ok) {
+    ina219BusVoltage = ina219_readBusVoltage();
+    ina219Current    = ina219_readCurrent_mA();
+    ina219Power      = ina219_readPower_mW();
+    DLOGF("INA219 OK — Vbus:%.2f V  I:%.1f mA  P:%.1f mW\n",
+          ina219BusVoltage, ina219Current, ina219Power);
+  } else {
+    DLOGLN("INA219 no detectado");
+  }
+
+  DLOGF("Sensores activos → TempEnv:%s | Presion:%s\n",
+    temperatureSourceName(), pressureSourceName());
 #else
   // Perfil desconocido — sin sensores I2C meteo
   DLOGLN("Perfil desconocido — sensores meteo omitidos");
@@ -2200,7 +2430,8 @@ void setup() {
   }
 #endif
 
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (soilSensor.begin(4800))
     DLOGLN("SoilSensor RS485 iniciado OK");
   else
@@ -2230,6 +2461,76 @@ void setup() {
   drawBootScreen("Conectando WiFi...");
 #endif
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // ── Conectividad celular (SIM7000G + Onomondo) ─────────────────────────────
+  setLedState(LED_WIFI_CONNECTING);
+  DLOGLN("[ASR] Iniciando modem SIM7000G...");
+  bool simOk = sim7000g_powerOn();
+  if (!simOk) {
+    DLOGLN("[ASR] WARN: sin GPRS al arranque — networkTask reintentará");
+  }
+
+#if defined(USE_MQTT)
+  #ifndef DEV_MODE
+    // PROD: mqtt_user = serial hardware del dispositivo (MAC eFuse)
+    mqtt_user = device_serial_get();
+    // PROD: token pre-flasheado en NVS
+    if (prov_mqtt_token[0] != '\0') {
+      mqtt_pass = prov_mqtt_token;
+    } else {
+      DLOGLN("[MQTT] ADVERTENCIA: sin token NVS — dispositivo no provisionado de fábrica");
+    }
+    // finca_id = MAC hex (sin separadores)
+    static char _finca_mac[16];
+    const char* serial = device_serial_get();  // "AQ-FFFFFFFFFFFF"
+    if (strlen(serial) >= 15) {
+      strncpy(_finca_mac, serial + 3, 12);  // saltar "AQ-"
+      _finca_mac[12] = '\0';
+    } else {
+      strncpy(_finca_mac, serial, sizeof(_finca_mac) - 1);
+      _finca_mac[sizeof(_finca_mac) - 1] = '\0';
+    }
+    finca_id = _finca_mac;
+  #endif
+  DLOGF("[MQTT] Auth user: %s  |  Serial: %s\n", mqtt_user, device_serial_get());
+#endif
+
+  // Obtener hora desde la red GSM (alternativa a NTP en cellular)
+  if (simOk) {
+    int yr, mo, dy, hr, mn, sc;
+    float tz;
+    if (modemSIM.getNetworkTime(&yr, &mo, &dy, &hr, &mn, &sc, &tz)) {
+      // Construir epoch aproximado y setear el RTC del sistema
+      struct tm tm_info = {};
+      tm_info.tm_year = yr - 1900;
+      tm_info.tm_mon  = mo - 1;
+      tm_info.tm_mday = dy;
+      tm_info.tm_hour = hr;
+      tm_info.tm_min  = mn;
+      tm_info.tm_sec  = sc;
+      time_t epoch = mktime(&tm_info);
+      struct timeval tv = { epoch, 0 };
+      settimeofday(&tv, nullptr);
+      DLOGF("[SIM] Hora de red: %04d-%02d-%02d %02d:%02d:%02d\n",
+            yr, mo, dy, hr, mn, sc);
+    } else {
+      DLOGLN("[SIM] WARN: no se pudo obtener hora de red — timestamps no fiables");
+    }
+  }
+
+  // FreeRTOS: crear tarea de red en Core 0 (gestiona GPRS + MQTT)
+  dataMutex      = xSemaphoreCreateMutex();
+  telemetryQueue = xQueueCreate(1, sizeof(TelemetrySnapshot));
+  xTaskCreatePinnedToCore(
+    networkTask, "NetworkTask",
+    12288,       // stack ampliado para TLS (TinyGSM + PubSubClient)
+    nullptr, 2, &networkTaskHandle, 0
+  );
+  DLOGLN("[ASR] NetworkTask creada en Core 0");
+  printHardwareInfo();
+
+#else
+  // ── Conectividad WiFi ───────────────────────────────────────────────────────
   setLedState(LED_WIFI_CONNECTING);
   DLOGLN("Ajustando potencia WiFi...");
   WiFi.setTxPower(WIFI_POWER_18_5dBm); // Potencia ajustada a ~18.5 dBm
@@ -2370,6 +2671,7 @@ void setup() {
     drawBootScreen("Sin WiFi — modo offline");
 #endif
   }
+#endif  // DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE
 
 #ifdef HAS_DISPLAY
   delay(2500);
@@ -2378,10 +2680,16 @@ void setup() {
 #ifdef DEBUG_MODE
   DLOGLN(F("\n====== AQUANTIA BOOT COMPLETO ======"));
   DLOGF("[TEST] Perfil   : %s | Relays: %d\n",
-    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_AQUALEAK) ? "AQUALEAK" : "IRRIGATION", RELAY_COUNT);
+    (DEVICE_PROFILE == PROFILE_METEO)             ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_AQUALEAK)          ? "AQUALEAK" :
+    (DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE) ? "AQUA_SMART_REMOTE" : "IRRIGATION", RELAY_COUNT);
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  DLOGF("[TEST] GSM/GPRS : %s\n",
+    modemSIM.isGprsConnected() ? modemSIM.localIP().toString().c_str() : "SIN CONEXION");
+#else
   DLOGF("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
+#endif
   DLOGF("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
   DLOGF("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
 #if DEVICE_PROFILE == PROFILE_METEO
@@ -2791,6 +3099,75 @@ void loop() {
       ina219BusVoltage, ina219Current, ina219Power);
 #endif  // PROFILE_IRRIGATION
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+    // ── AQUA_SMART_REMOTE: BMP280 + AHT20 + INA219 ──────────────────────────
+
+    if (!bmp_ok) {
+      bmp_ok = beginBMP280();
+      if (bmp_ok) {
+        bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                          Adafruit_BMP280::SAMPLING_X2,
+                          Adafruit_BMP280::SAMPLING_X16,
+                          Adafruit_BMP280::FILTER_X16,
+                          Adafruit_BMP280::STANDBY_MS_500);
+        DLOGLN("[BMP280] Reconectado tras fallo");
+      }
+    }
+    bmp_temp_ok = bmp_pressure_ok = false;
+    if (bmp_ok) {
+      float tBmp = NAN, pBmp = NAN;
+      if (readBMP280Temperature(tBmp)) { bmpTemperature = tBmp; bmp_temp_ok = true; }
+      if (readBMP280PressureKPa(pBmp)) {
+        bmpPressure = pBmp; bmp_pressure_ok = true;
+        pressure = pBmp; bar_ok = true;
+      }
+      if (!bmp_temp_ok && !bmp_pressure_ok) {
+        bmp_ok = false;
+        DLOGLN("BMP280 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!bmp_pressure_ok) { bar_ok = false; pressure = sim_pressure; }
+
+    if (!aht20_ok) {
+      aht20_ok = aht20_begin();
+      if (aht20_ok) DLOGLN("[AHT20] Reconectado tras fallo");
+    }
+    if (aht20_ok) {
+      float t = NAN, h = NAN;
+      if (aht20_read(t, h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+      } else {
+        aht20_ok = false;
+        DLOGLN("AHT20 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!aht20_ok) {
+      if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+      else             { temperatureMCP = sim_tempMCP; temp_ok = false; }
+      humidity = sim_humidity;
+    }
+
+    if (!ina219_ok) {
+      ina219_ok = ina219_begin();
+      if (ina219_ok) DLOGLN("[INA219] Reconectado tras fallo");
+    }
+    if (ina219_ok) {
+      float v = ina219_readBusVoltage();
+      float c = ina219_readCurrent_mA();
+      float p = ina219_readPower_mW();
+      if (!isnan(v)) ina219BusVoltage = v;
+      if (!isnan(c)) ina219Current    = c;
+      if (!isnan(p)) ina219Power      = p;
+      if (isnan(v) && isnan(c)) { ina219_ok = false; DLOGLN("INA219 fallo en lectura"); }
+    }
+
+    DLOGF("[ASR] AHT:T=%.1f H=%.1f%%  BMP:T=%.1f P=%.2fkPa  INA:V=%.2f I=%.1fmA P=%.1fmW\n",
+      temperatureMCP, humidity, bmpTemperature, (float)pressure,
+      ina219BusVoltage, ina219Current, ina219Power);
+#endif  // PROFILE_AQUA_SMART_REMOTE
+
 #if DEVICE_PROFILE != PROFILE_AQUALEAK
     // TSL2584/APDS-9930 — omitido en AGROMETEO (usa BH1750)
     if (tsl_ok) {
@@ -2860,7 +3237,8 @@ void loop() {
       snap.tempDHT11     = temperatureDHT11;
       snap.humDHT11      = humidityDHT11;
       snap.soil          = soilMoisture;
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       snap.halisenseOk   = halisenseData.ok;
       snap.soilTemp      = halisenseData.ok ? halisenseData.temperature : NAN;
       snap.soilEc        = halisenseData.ok ? halisenseData.ec          : NAN;
@@ -2875,7 +3253,7 @@ void loop() {
 #endif
       snap.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
       snap.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
-#if DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
       snap.inaVbus    = ina219_ok ? ina219BusVoltage : NAN;
       snap.inaCurrent = ina219_ok ? ina219Current    : NAN;
       snap.inaPower   = ina219_ok ? ina219Power      : NAN;
@@ -2938,7 +3316,8 @@ void loop() {
   // ── 2c. SoilSensor RS485 — muestreo adaptativo según estado de riego ────────────
   // Rápido (3 s) cuando hay riego activo o en la ventana post-riego (2 min).
   // Lento (20 s) en reposo. Permite detectar si el suelo se está mojando al regar.
-#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   {
     static bool prevRelayOn = false;
     bool relayOn = anyRelayActive();
