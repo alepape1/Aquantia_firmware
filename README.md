@@ -42,9 +42,10 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 |--------|:----------------:|----------|:------:|:--------:|:--------------:|
 | **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
 | **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | AHT20 (T+H), INA219 (V/I/P), BMP280 (T+P, fallback) |
-| **AGROMETEO** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | Sin relays | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
+| **AQUALEAK** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | 1 × GPIO26 | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
+| **AQUA_SMART_REMOTE** | 4 | LilyGO T-SIM7000G | 4 × GPIO32/33/25/26 | No | SIM Onomondo (2G/LTE-M), RS485, AHT20, INA219 |
 
-> **Nota:** El perfil AGROMETEO no incluye relays. Publica parámetros agrometeorológicos calculados: `dew_point`, `heat_index` y `abs_humidity`.
+> **Nota:** El perfil AQUALEAK publica el campo `dew_point` (punto de rocío calculado). AQUA_SMART_REMOTE usa red celular LTE-M/2G (SIM Onomondo) en lugar de WiFi y envía un **payload reducido** (~350 B) para minimizar datos transferidos.
 
 Pinout completo de cada perfil: [PINOUT.md](PINOUT.md)
 
@@ -229,6 +230,20 @@ El motivo es que en PROD el broker identifica cada dispositivo **por su MAC** y 
 
 ## Arquitectura del firmware
 
+### Módulos de firmware — ficheros `.h`
+
+El sketch principal `ESP_monitor_server.ino` contiene solo globals, `setup()` y `loop()`. Toda la lógica vive en módulos independientes incluidos en orden estricto tras sus dependencias:
+
+| Fichero | Responsabilidad |
+|---------|----------------|
+| `sensor_recovery.h` | Backoff de reintentos, helpers BMP280, driver XDB401 (XGZP6847D I2C), `temperatureSourceName` / `pressureSourceName` |
+| `pipeline_core.h` | Simulación de presión/caudal (`driftClamp`, `updateSimulatedValues`, ruido sinusoidal), lectura real XDB401 + caudalímetro, `updatePipelineValues` |
+| `wind_sensor.h` | Media móvil circular (10 muestras) para ADC anemómetro/veleta, conversiones ADC→velocidad/ángulo, `degToCompass`, promedio vectorial de viento |
+| `http_client.h` | Capa HTTP para perfiles WiFi: `httpGet/Post`, `syncPipelineScenario`, `checkRelayCommand`, `postDeviceInfo`. Excluido en AQUA_SMART_REMOTE. |
+| `gsm_modem.h` | Init SIM7000G: pulsación PWRKEY, espera SIM READY, 3 reintentos GPRS, upload CA cert al modem, `prepareGsmTLSClient` (BearSSL en MCU). Solo AQUA_SMART_REMOTE. |
+| `network_task.h` | `takeSnapshot()` + `networkTask()` FreeRTOS (Core 0): reconexión WiFi/GSM con backoff, MQTT connect/publish, alertas edge-triggered, OTA |
+| `sensor_read.h` | `readSlowSensors(now)` — ciclo completo de 20 s por perfil → `TelemetrySnapshot` → `telemetryQueue`; `readSoilSensor(now)` — muestreo adaptativo RS485 |
+
 ### FreeRTOS dual-core
 
 ```
@@ -346,7 +361,7 @@ Modo de comunicación principal. Activar definiendo `USE_MQTT` en `secrets.h`.
 
 | Topic | Dirección | Cuándo | Contenido |
 |-------|-----------|--------|-----------|
-| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version, device_profile |
+| `aquantia/<finca_id>/register` | ESP → broker | Al arrancar (1 vez) | JSON con MAC, IP, chip info, relay_count, firmware_version, device_profile, sketch_size_kb, free_sketch_kb |
 | `aquantia/<finca_id>/telemetry` | ESP → broker | Cada 20s | JSON con todos los campos de sensores |
 | `aquantia/<finca_id>/alerts` | ESP → broker | Edge-triggered | JSON alerta de sensor/pipeline/heap |
 | `aquantia/<finca_id>/cmd` | broker → ESP | Comando | Ver tabla de comandos más abajo |
@@ -448,15 +463,50 @@ Campos exclusivos **PROFILE_IRRIGATION** (solo cuando `DEVICE_PROFILE = 2`):
 > - `ina219_current_ma`: corriente (mA), resolución 0.1 mA (shunt 0.1 Ω).
 > - `ina219_power_mw`: potencia (mW), resolución 2 mW.
 
-Campos exclusivos **PROFILE_AGROMETEO** (solo cuando `DEVICE_PROFILE = 3`):
+Campos exclusivos **PROFILE_AQUALEAK** (solo cuando `DEVICE_PROFILE = 3`):
 
 ```json
 {
-  "dew_point":     12.4,
-  "heat_index":    24.1,
-  "abs_humidity":   9.85
+  "dew_point":  12.4
 }
 ```
+
+### Payload telemetría GSM slim (PROFILE_AQUA_SMART_REMOTE)
+
+El perfil celular usa un documento reducido (~350 B, `StaticJsonDocument<512>`) para minimizar el consumo de datos sobre 2G/LTE-M. Solo incluye los campos más relevantes:
+
+```json
+{
+  "temperature":        22.5,
+  "humidity":           65.2,
+  "pressure":           101.30,
+  "windSpeed":          3.50,
+  "windDirection":      180.0,
+  "light":              350.0,
+  "soil_moisture":      50.0,
+  "pipeline_pressure":  3.50,
+  "pipeline_flow":      5.00,
+  "flow_total_l":       12.3,
+  "relay_active":       0,
+  "rssi":               14,
+  "free_heap":          198432,
+  "uptime_s":           12345,
+  "mac_address":        "FC:B4:67:F3:77:48",
+  "soil_temperature":   19.5,
+  "soil_ec":            0.35,
+  "soil_ph":            6.8,
+  "soil_n":             42,
+  "soil_p":             18,
+  "soil_k":             31,
+  "ina219_power_mw":    1850.0,
+  "ts":                 1746360000
+}
+```
+
+> - `rssi`: en GSM es el valor CSQ del modem (0–31), no dBm WiFi
+> - Los campos de suelo (`soil_temperature` … `soil_k`) solo se incluyen cuando `halisense_ok = true` (no se serializa el flag `halisense_ok` en este perfil para ahorrar bytes)
+> - `ina219_power_mw` solo presente cuando el INA219 respondió en el último ciclo
+> - El payload completo (WiFi) aplica solo a perfiles 1–3
 
 > - `halisense_ok`: `true` cuando el sensor RS485 respondió correctamente en el último ciclo
 > - `soil_irrig_mode`: `true` si el relay estaba activo o se estaba en ventana post-riego durante la lectura
@@ -535,6 +585,8 @@ El firmware publica en `aquantia/<finca_id>/alerts` solo al **cambio de estado**
 | `pipeline_ok` | info | Pipeline se recupera a estado normal |
 | `sensor_failure` | warning | Sensor deja de responder (XDB401, MCP9808, BMP280, HTU2x, HDC1080, BH1750, MicroPressure, AHT20, INA219) |
 | `sensor_ok` | info | Sensor se recupera |
+| `soil_dry` | warning | Humedad de suelo < 30 % (METEO, IRRIGATION, AQUA_SMART_REMOTE) — re-emitida cada 12 h si persiste |
+| `soil_ok` | info | Humedad de suelo recuperada tras alerta `soil_dry` |
 | `low_heap` | warning | Heap libre < 30 KB |
 
 ### Cooldown de alertas de sensor

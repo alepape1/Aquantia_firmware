@@ -9,6 +9,36 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased — refactor/modularize-ino]
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `refactor/modularize-ino`
+
+### Changed
+- **Modularización del firmware**: `ESP_monitor_server.ino` reducido de ~3 900 a ~1 700 líneas
+  extrayendo bloques de funciones a siete ficheros `.h` independientes. Sin cambios de
+  comportamiento en runtime — puramente organizativo.
+
+  | Fichero nuevo | Contenido |
+  |---------------|-----------|
+  | `sensor_recovery.h` | Constantes de backoff, helpers BMP280, driver XDB401 completo, `temperatureSourceName` / `pressureSourceName` |
+  | `pipeline_core.h` | `driftClamp`, `updateSimulatedValues`, `pipelineNoise`, `updatePipelineSimValues`, `readRealPipelineSensors`, `updatePipelineValues` |
+  | `wind_sensor.h` | Buffers de media móvil ADC, `adcToWindSpeed/Deg`, `degToCompass`, acumuladores vectoriales de viento, `accumulateWindVector`, `calcAndResetWindVector` |
+  | `http_client.h` | Capa HTTP completa para perfiles WiFi: `serverUseTls`, `serverBaseUrl`, `prepareSecureClient`, `httpGet`, `httpPost`, `syncPipelineScenario`, `checkRelayCommand`, `postDeviceInfo` |
+  | `gsm_modem.h` | Init SIM7000G: `sim7000g_uploadCACert`, `prepareGsmTLSClient`, `sim7000g_powerOn` (BearSSL sobre TCP, 3 reintentos GPRS) |
+  | `network_task.h` | `takeSnapshot` + `networkTask` completo (FreeRTOS Core 0): WiFi/GSM reconnect, MQTT connect/publish, alertas edge-triggered, OTA |
+  | `sensor_read.h` | `readSlowSensors(now)` y `readSoilSensor(now)` — wrappers del ciclo de 20 s llamados desde `loop()` |
+
+### Added
+- **`free_heap` + `uptime_s` en payload GSM slim** (PROFILE_AQUA_SMART_REMOTE): los dos
+  campos de diagnóstico de sistema se incluyen ahora en el payload reducido para celular
+  (512 B), además del payload WiFi completo donde ya estaban presentes.
+- **`sketch_size_kb` + `free_sketch_kb` en payload register** (`mqtt_helpers.h`): tamaño
+  del sketch compilado y espacio libre de OTA (en KB) añadidos al mensaje de registro al
+  arranque. Permite detectar en el dashboard si la partición OTA es suficiente para la
+  versión en uso.
+
+---
+
 ## [Unreleased]
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/helissense-sensor`
