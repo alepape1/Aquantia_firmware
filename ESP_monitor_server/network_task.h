@@ -270,7 +270,7 @@ void networkTask(void* pvParameters) {
         mqttPublishAlert("device_reboot", "info", msg);
       } else {
         static unsigned long _mqttReconnectAlertMs = 0;
-        if (millis() - _mqttReconnectAlertMs >= 600000UL) {
+        if (millis() - _mqttReconnectAlertMs >= 3600000UL) {
           mqttPublishAlert("mqtt_reconnect", "info", "Dispositivo reconectado al broker MQTT");
           _mqttReconnectAlertMs = millis();
         }

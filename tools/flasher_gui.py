@@ -88,6 +88,20 @@ FQBN_BY_PROFILE = {
     "4": "esp32:esp32:esp32",              # AQUA_SMART_REMOTE — LilyGO T-SIM7000G
 }
 
+FINCA_ID_BY_PROFILE = {
+    "1": "dev-meteo",
+    "2": "dev-irrig",
+    "3": "dev-aqualeak",
+    "4": "dev-remote",
+}
+
+HOSTNAME_BY_PROFILE = {
+    "1": "aquantia-meteo",
+    "2": "aquantia-irrig",
+    "3": "aquantia-aqualeak",
+    "4": "aquantia-remote",
+}
+
 BACKEND_URL = "https://meteo.aquantialab.com"
 APP_BASE_URL = "https://meteo.aquantialab.com"   # URL base del QR de claim
 
@@ -622,8 +636,9 @@ def discover_ota_devices(timeout=4):
         time.sleep(timeout)
         zc.close()
     else:
-        # Fallback: intentar resolver hostnames conocidos
-        for hostname in ["meteostation-esp32", "aquantia-device"]:
+        # Fallback: intentar resolver hostnames conocidos (por perfil + legacy)
+        candidates = list(HOSTNAME_BY_PROFILE.values()) + ["meteostation-esp32"]
+        for hostname in candidates:
             try:
                 ip = socket.gethostbyname(f"{hostname}.local")
                 found.append((hostname, ip, 3232))
@@ -1281,12 +1296,30 @@ class FlasherApp(tk.Tk):
                 new_content,
             )
 
+            profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+            finca_id = FINCA_ID_BY_PROFILE.get(profile, "dev-meteo")
+            hostname = HOSTNAME_BY_PROFILE.get(profile, "aquantia-meteo")
+            new_content = re.sub(
+                r'#define FINCA_ID\s+"[^"]+"',
+                f'#define FINCA_ID        "{finca_id}"',
+                new_content,
+            )
+            new_content = re.sub(
+                r'#define DEVICE_HOSTNAME\s+"[^"]+"',
+                f'#define DEVICE_HOSTNAME "{hostname}"',
+                new_content,
+            )
+
             if new_content != content:
                 with open(self._SECRETS_PATH, "w", encoding="utf-8") as f:
                     f.write(new_content)
                 if log_change:
                     self._log_line(
                         f"✓  Servidor firmware → {cfg['mqtt_server']}:{cfg['mqtt_port']}",
+                        "#4ec9b0",
+                    )
+                    self._log_line(
+                        f"✓  FINCA_ID → {finca_id}   HOSTNAME → {hostname}",
                         "#4ec9b0",
                     )
             return cfg

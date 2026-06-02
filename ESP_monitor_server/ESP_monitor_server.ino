@@ -1341,7 +1341,7 @@ void setup() {
 #endif
 
     // ── OTA (Over-The-Air) ──────────────────────────────────────────────────
-    ArduinoOTA.setHostname("meteostation-esp32");
+    ArduinoOTA.setHostname(DEVICE_HOSTNAME);
     // Contraseña OTA opcional — definir OTA_PASSWORD en secrets.h para activarla
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1412,7 +1412,7 @@ void setup() {
     );
     DLOGLN("NetworkTask creada en Core 0");
     WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
-    DLOGLN("OTA listo — hostname: meteostation-esp32");
+    DLOGLN("OTA listo — hostname: " DEVICE_HOSTNAME);
     // ── Fin OTA ─────────────────────────────────────────────────────────────
 
     printHardwareInfo();
