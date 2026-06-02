@@ -1,6 +1,6 @@
 # Aquantia — Pinout de dispositivos
 
-Dos perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo de compilación con `DEVICE_PROFILE`.
+Tres perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo de compilación con `DEVICE_PROFILE`.
 
 ---
 
@@ -259,6 +259,101 @@ Los relays **JQC-3FF-S-Z** son **activo-LOW**:
 | LOW | Activado | ON | Abierta |
 
 Durante una actualización OTA todos los relays pasan a OFF (HIGH) automáticamente por seguridad.
+
+---
+
+## PROFILE_AQUA_SMART_REMOTE (4) — LilyGO T-SIM7000G
+
+**Placa:** LilyGO T-SIM7000G (ESP32, modem SIM7000G integrado, conectividad LTE-M/NB-IoT/GPRS)
+**SIM:** Onomondo IoT SIM — APN `onomondo`, sin usuario ni contraseña
+**Conectividad:** Celular (TinyGSM) — sin WiFi. Sensor suite idéntico a PROFILE_IRRIGATION.
+**Pantalla:** La placa dispone de pantalla, a implementar en iteración futura.
+
+### Identidad del dispositivo
+
+El ESP32 tiene una MAC WiFi grabada en eFuse que **no cambia aunque WiFi no esté activo**. Esta MAC es el identificador principal en la API (campo `mac_address`, `device_mac`, `X-Device-MAC`). Para leerla sin inicializar WiFi el firmware usa:
+
+```c
+// provisioning.h — getDeviceMacAddress()
+uint8_t mac[6];
+esp_read_mac(mac, ESP_MAC_WIFI_STA);  // eFuse, sin WiFi
+// → "FC:B4:67:F3:77:48"  — mismo formato que WiFi.macAddress()
+```
+
+El campo `device_serial` (formato `AQ-FCB467F37748`) es distinto del `mac_address` y se usa como client ID en MQTT y en el QR de etiqueta, no como clave de lookup en la API.
+
+| Campo | Valor ejemplo | Usado en |
+|-------|--------------|----------|
+| `mac_address` | `FC:B4:67:F3:77:48` | API REST, MQTT telemetry, alerts |
+| `device_serial` | `AQ-FCB467F37748` | MQTT client ID, QR etiqueta, logs |
+| MQTT client ID | `aquantia-FCB467F37748` | Broker (mismos bytes que mac, sin colons) |
+
+### Arranque y conectividad cellular
+
+Secuencia de boot en `setup()`:
+1. `sim7000g_powerOn()` — DTR LOW → pulso PWRKEY 1 s → Serial1@115200 → `modemSIM.init()` → `waitForNetwork(60 s)` → `gprsConnect("onomondo")`
+2. Tiempo de red: `modemSIM.getNetworkTime()` → `settimeofday()` (en lugar de NTP)
+3. MQTT TLS: `gsmTLSClient.setCACert(MQTT_CA_CERT_PEM)` → `mqttClient.setClient(gsmTLSClient)`
+4. `networkTask` en Core 0 gestiona reconexión GPRS y MQTT
+
+RSSI reportado como CSQ (0–31) via `modemSIM.getSignalQuality()` en campo `rssi` de telemetría.
+
+### GPIO del firmware
+
+| Función | GPIO | Notas |
+|---------|:----:|-------|
+| I2C SDA | 21 | Bus sensores: AHT20, BMP280, INA219 |
+| I2C SCL | 22 | Bus sensores |
+| Caudalímetro (ISR) | 34 | ADC1_CH6, solo entrada — INPUT_PULLUP |
+| Relay 1 | 32 | Libre, sin conflicto con modem |
+| Relay 2 | 33 | Libre |
+| Relay 3 | 16 | Libre |
+| Relay 4 | 17 | Libre |
+| RS485 TX (DI→sensor) | 19 | GPIO libre — SD card intacta |
+| RS485 RX (RO←sensor) | 18 | GPIO libre — SD card intacta |
+| RS485 DE/RE | 23 | Control half-duplex Helissense |
+| MODEM TX (AT→modem) | 27 | Serial1 |
+| MODEM RX (AT←modem) | 26 | Serial1 |
+| MODEM DTR | 25 | LOW = modem despierto |
+| MODEM PWRKEY | 4 | Pulso 1000 ms para encender |
+| LED onboard | 12 | Activo-LOW (BOARD_LED_PIN) |
+| BAT ADC | 35 | Tensión batería — input-only |
+| SOLAR ADC | 36 | Tensión panel solar — input-only |
+
+### Pines SD card (intactos, disponibles)
+
+| Señal SD | GPIO |
+|----------|:----:|
+| MISO | 2 |
+| CS | 13 |
+| SCK | 14 |
+| MOSI | 15 |
+
+### Sensores I2C (SDA=21, SCL=22)
+
+| Sensor | Dirección | Función |
+|--------|:---------:|---------|
+| AHT20 | 0x38 | Temperatura + humedad ambiente |
+| INA219 | 0x40 | Voltaje bus / corriente / potencia |
+| BMP280 | 0x76/0x77 | Temperatura + presión atmosférica (fallback) |
+
+### Sensor de suelo RS485 — Helissense (Modbus RTU)
+
+| Parámetro | Valor |
+|-----------|-------|
+| Serial | Serial2 |
+| RX (ESP32←sensor) | GPIO 18 |
+| TX (ESP32→sensor) | GPIO 19 |
+| DE/RE | GPIO 23 |
+| Baudrate | 4800 |
+
+### Compilación
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 \
+  --build-property "build.extra_flags=-DDEVICE_PROFILE=4" \
+  ESP_monitor_server/ESP_monitor_server.ino
+```
 
 ---
 

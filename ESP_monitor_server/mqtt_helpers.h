@@ -7,17 +7,19 @@
 //           configSyncIntervalMs, irrigationType, leakDetector — globals del sketch.
 // =============================================================================
 
+// Declaración anticipada para evitar errores de visibilidad
+void mqttPublishAlert(const char* type, const char* severity, const char* message);
+
 // Callback para comandos entrantes en aquantia/<finca_id>/cmd
 // Payload esperado: {"relay": 0, "state": true} o {"type":"pipeline_config", ...}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   if (deserializeJson(doc, payload, length)) return;
 
   String targetMac = doc["mac"] | "";
   targetMac.trim();
   targetMac.toUpperCase();
-  String selfMac = WiFi.macAddress();
-  selfMac.trim();
+  String selfMac = getDeviceMacAddress();
   selfMac.toUpperCase();
   if (targetMac.length() > 0 && targetMac != selfMac) return;
 
@@ -77,6 +79,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (nextSync >= 5 && nextSync <= 3600) {
     configSyncIntervalMs = (unsigned long)nextSync * 1000UL;
   }
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION
+  {
+    long nextSoilFast = doc["soil_fast_interval_s"] | (long)(soilFastIntervalMs / 1000UL);
+    long nextSoilSlow = doc["soil_slow_interval_s"] | (long)(soilSlowIntervalMs / 1000UL);
+    if (nextSoilFast >= 3 && nextSoilFast <= 300)
+      soilFastIntervalMs = (unsigned long)nextSoilFast * 1000UL;
+    if (nextSoilSlow >= 20 && nextSoilSlow <= 3600)
+      soilSlowIntervalMs = (unsigned long)nextSoilSlow * 1000UL;
+  }
+#endif
 #ifdef HAS_DISPLAY
   if (nextDisplay >= 0 && nextDisplay <= 3600) {
     displayTimeoutMs = (unsigned long)nextDisplay * 1000UL;
@@ -87,21 +99,82 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     updatePipelineValues();
     DLOGF("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode, pipelineScenario);
   }
+
+#if defined(FLOW_PIN)
+  if (doc["reset_flow_counters"] | false) {
+    portENTER_CRITICAL(&_flowMux);
+    _flowIrrigPulses  = 0;
+    _flowLeakPulses   = 0;
+    _flowSessionBase  = _flowPulseTotal;
+    portEXIT_CRITICAL(&_flowMux);
+    DLOGLN("[FLOW] Contadores reseteados por MQTT");
+    mqttPublishAlert("flow_counters_reset", "info", "Contadores de flujo reseteados");
+  }
+#endif
 }
 
 // Conectar al broker y suscribirse al topic de comandos
 bool mqttConnect() {
   char client_id[48];
-  String mac_no_colon = WiFi.macAddress();
+  // Client ID = "aquantia-{MAC sin colons}" — idéntico en WiFi y cellular.
+  // getDeviceMacAddress() lee el eFuse: funciona sin WiFi inicializado.
+  String mac_no_colon = getDeviceMacAddress();
   mac_no_colon.replace(":", "");
+  snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
 
-  if (mac_no_colon.length() >= 12) {
-    snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
-  } else {
-    snprintf(client_id, sizeof(client_id), "aquantia-%s", device_serial_get());
-  }
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // No forzar stop() antes de cada CONNECT.
+  // En SIM7000SSL puede dejar sockets semicolgados en el módem y generar
+  // reconexiones con "already connected, closing old connection" en broker.
+  // Dejamos que PubSubClient/TinyGSM gestionen el ciclo del socket.
+#endif
+
+#ifdef DEBUG_MODE
+  DLOGF("[MQTT] Intentando conectar — broker=%s:%d  clientId=%s  user=%s  pass=%s\n",
+        mqtt_server, mqtt_port, client_id, mqtt_user,
+        (mqtt_pass && strlen(mqtt_pass) > 0) ? "[SET]" : "[EMPTY]");
+  unsigned long _t0 = millis();
+#endif
+
+  // keepAlive: en 2G el handshake TLS + CONNACK tarda ~90 s. Con keepalive=60
+  // el broker (timeout = 1.5×keepalive = 90 s) desconecta antes de que el ESP
+  // pueda enviar el primer PINGREQ. Con 180 s el broker espera 270 s → margen
+  // suficiente para el setup inicial y las publicaciones lentas sobre 2G.
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  mqttClient.setKeepAlive(180);
+#else
+  mqttClient.setKeepAlive(60);
+#endif
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  // Dejar margen para TLS handshake + CONNECT/CONNACK en enlace 2G.
+  mqttClient.setSocketTimeout(30);
+#endif
 
   bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
+
+#ifdef DEBUG_MODE
+  DLOGF("[MQTT] connect() tardó %lums → %s  state=%d\n",
+        millis() - _t0, ok ? "OK" : "FAIL", mqttClient.state());
+  // Decodificar el código de retorno PubSubClient
+  // -4=TIMEOUT -3=LOST -2=FAILED -1=DISCONNECTED 1=BAD_PROTOCOL
+  // 2=BAD_CLIENT_ID 3=UNAVAILABLE 4=BAD_CREDENTIALS 5=UNAUTHORIZED
+  if (!ok) {
+    const char* _mqttStateStr = "UNKNOWN";
+    switch (mqttClient.state()) {
+      case -4: _mqttStateStr = "CONNECTION_TIMEOUT";     break;
+      case -3: _mqttStateStr = "CONNECTION_LOST";        break;
+      case -2: _mqttStateStr = "CONNECT_FAILED";         break;
+      case -1: _mqttStateStr = "DISCONNECTED";           break;
+      case  1: _mqttStateStr = "BAD_PROTOCOL";           break;
+      case  2: _mqttStateStr = "BAD_CLIENT_ID";          break;
+      case  3: _mqttStateStr = "SERVER_UNAVAILABLE";     break;
+      case  4: _mqttStateStr = "BAD_CREDENTIALS";        break;
+      case  5: _mqttStateStr = "NOT_AUTHORIZED";         break;
+    }
+    DLOGF("[MQTT] Estado: %s (%d)\n", _mqttStateStr, mqttClient.state());
+  }
+#endif
+
   if (ok) {
     char cmd_topic[64];
     snprintf(cmd_topic, sizeof(cmd_topic), "aquantia/%s/cmd", finca_id);
@@ -116,20 +189,28 @@ bool mqttConnect() {
 
 // Publicar datos de registro al arranque (una sola vez)
 void mqttPublishRegister() {
-  StaticJsonDocument<320> doc;
-  doc["device_serial"]    = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
-  doc["mac_address"]      = WiFi.macAddress();
+  StaticJsonDocument<400> doc;
+  doc["device_serial"]    = device_serial_get();   // AQ-{MAC} — identidad hardware
+  doc["mac_address"]      = getDeviceMacAddress(); // "FC:B4:67:F3:77:48" — mismo en WiFi y cellular
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  doc["ip_address"]       = modemSIM.localIP().toString();
+  doc["network"]          = "cellular";
+#else
   doc["ip_address"]       = WiFi.localIP().toString();
+#endif
   doc["chip_model"]       = ESP.getChipModel();
   doc["chip_revision"]    = (int)ESP.getChipRevision();
   doc["cpu_freq_mhz"]     = (int)ESP.getCpuFreqMHz();
   doc["flash_size_mb"]    = (int)(ESP.getFlashChipSize() / 1048576);
+  doc["sketch_size_kb"]   = (int)(ESP.getSketchSize() / 1024);
+  doc["free_sketch_kb"]   = (int)(ESP.getFreeSketchSpace() / 1024);
   doc["sdk_version"]      = ESP.getSdkVersion();
   doc["relay_count"]      = RELAY_COUNT;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["device_profile"]   =
-    (DEVICE_PROFILE == PROFILE_METEO)      ? "METEO" :
-    (DEVICE_PROFILE == PROFILE_IRRIGATION) ? "IRRIGATION" : "AQUALEAK";
+    (DEVICE_PROFILE == PROFILE_METEO)             ? "METEO" :
+    (DEVICE_PROFILE == PROFILE_IRRIGATION)        ? "IRRIGATION" :
+    (DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE) ? "AQUA_SMART_REMOTE" : "AQUALEAK";
 
   char topic[64], buf[768];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
@@ -144,10 +225,10 @@ void mqttPublishRegister() {
 // El backend escucha este topic e inserta en la tabla alerts.
 // payload: { "device_mac", "type", "severity", "message" }
 // severity: "info" | "warning" | "critical"
-static void mqttPublishAlert(const char* type, const char* severity, const char* message) {
+void mqttPublishAlert(const char* type, const char* severity, const char* message) {
   if (!mqttClient.connected()) return;
   StaticJsonDocument<256> doc;
-  doc["device_mac"] = WiFi.macAddress();
+  doc["device_mac"] = getDeviceMacAddress();
   doc["type"]       = type;
   doc["severity"]   = severity;
   doc["message"]    = message;

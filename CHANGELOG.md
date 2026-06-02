@@ -9,6 +9,36 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased — refactor/modularize-ino]
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `refactor/modularize-ino`
+
+### Changed
+- **Modularización del firmware**: `ESP_monitor_server.ino` reducido de ~3 900 a ~1 700 líneas
+  extrayendo bloques de funciones a siete ficheros `.h` independientes. Sin cambios de
+  comportamiento en runtime — puramente organizativo.
+
+  | Fichero nuevo | Contenido |
+  |---------------|-----------|
+  | `sensor_recovery.h` | Constantes de backoff, helpers BMP280, driver XDB401 completo, `temperatureSourceName` / `pressureSourceName` |
+  | `pipeline_core.h` | `driftClamp`, `updateSimulatedValues`, `pipelineNoise`, `updatePipelineSimValues`, `readRealPipelineSensors`, `updatePipelineValues` |
+  | `wind_sensor.h` | Buffers de media móvil ADC, `adcToWindSpeed/Deg`, `degToCompass`, acumuladores vectoriales de viento, `accumulateWindVector`, `calcAndResetWindVector` |
+  | `http_client.h` | Capa HTTP completa para perfiles WiFi: `serverUseTls`, `serverBaseUrl`, `prepareSecureClient`, `httpGet`, `httpPost`, `syncPipelineScenario`, `checkRelayCommand`, `postDeviceInfo` |
+  | `gsm_modem.h` | Init SIM7000G: `sim7000g_uploadCACert`, `prepareGsmTLSClient`, `sim7000g_powerOn` (BearSSL sobre TCP, 3 reintentos GPRS) |
+  | `network_task.h` | `takeSnapshot` + `networkTask` completo (FreeRTOS Core 0): WiFi/GSM reconnect, MQTT connect/publish, alertas edge-triggered, OTA |
+  | `sensor_read.h` | `readSlowSensors(now)` y `readSoilSensor(now)` — wrappers del ciclo de 20 s llamados desde `loop()` |
+
+### Added
+- **`free_heap` + `uptime_s` en payload GSM slim** (PROFILE_AQUA_SMART_REMOTE): los dos
+  campos de diagnóstico de sistema se incluyen ahora en el payload reducido para celular
+  (512 B), además del payload WiFi completo donde ya estaban presentes.
+- **`sketch_size_kb` + `free_sketch_kb` en payload register** (`mqtt_helpers.h`): tamaño
+  del sketch compilado y espacio libre de OTA (en KB) añadidos al mensaje de registro al
+  arranque. Permite detectar en el dashboard si la partición OTA es suficiente para la
+  versión en uso.
+
+---
+
 ## [Unreleased]
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/helissense-sensor`
@@ -30,11 +60,51 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
   `SoilSensor(Serial2, rxPin, txPin, dePin)` tenía los pines en orden incorrecto.
   Corregido a `SoilSensor(Serial2, 14, 13, 27)` → RX=GPIO14, TX=GPIO13, DE/RE=GPIO27.
   Actualizado también el comentario en el `.ino` y el PINOUT.md.
+- **Boot log de perfil en AQUA_SMART_REMOTE**: el primer mensaje `[TEST] Perfil` en
+  `setup()` no contemplaba `PROFILE_AQUA_SMART_REMOTE` y mostraba `IRRIGATION (4)`.
+  Se corrigió el mapeo para imprimir `AQUA_SMART_REMOTE (4)`.
+- **Cache inicial GSM en debug (`CSQ/GPRS`)**: tras `sim7000g_powerOn()` el estado
+  publicado por Core 1 podía arrancar en `CSQ:0 / GPRS:DOWN` hasta que `NetworkTask`
+  hiciera el primer polling. Ahora se inicializan `_gprsConnectedFlag` y `_simCsqCache`
+  inmediatamente después del attach inicial para reflejar el estado real desde boot.
+- **Autotest de boot GSM (`[TEST] GSM/GPRS`)**: en PROFILE_AQUA_SMART_REMOTE el
+  mensaje de autodiagnóstico final usaba consulta directa al módem y podía mostrar
+  `SIN CONEXION` de forma transitoria. Ahora usa cache thread-safe (`_gprsConnectedFlag`
+  y `_simCsqCache`) para mantener coherencia con `[STATUS]`.
+- **Caudalímetro en PROFILE_AQUA_SMART_REMOTE**: GPIO34 es solo entrada en la T-SIM7000 y
+  no soporta pull-up interna. Se cambió la inicialización a `INPUT` para evitar el error
+  `gpio_pullup_en(...)` al arrancar.
+- **MQTT TLS en SIM7000G**: se añadió configuración SNI para `meteo.aquantialab.com` y un
+  timeout más largo en el cliente TLS del módem para completar el handshake sobre enlaces
+  GSM con latencia alta.
+- **Diagnóstico TLS SIM7000 (ctx 0/1)**: la configuración `AT+CSSLCFG` ahora usa contexto
+  SSL parametrizable y el firmware alterna automáticamente entre `sslCtx=1` y `sslCtx=0`
+  cuando `mqttClient.connect()` falla con `CONNECTION_TIMEOUT (-4)`. Esto permite validar
+  en campo diferencias de mapeo de contexto TLS entre revisiones de módem/firmware.
+- **Arranque SIM7000 más robusto**: se añade espera activa de `SIM_READY` (hasta 30 s)
+  antes del primer `gprsConnect()`, para reducir estados PDP inestables justo tras boot.
+- **Recuperación PDP tras timeout MQTT**: cuando hay `CONNECTION_TIMEOUT (-4)` con GPRS
+  activo, se ejecuta refresh del contexto PDP (`gprsDisconnect()` + `gprsConnect()`) antes
+  del siguiente intento MQTT.
 
 ### Improved
+- **Backoff global de recuperación de sensores**: cuando un sensor entra en fallo,
+  el firmware evita reintentos continuos en cada ciclo. Tras 4 intentos de recuperación
+  fallidos, aplica un enfriamiento de 5 minutos antes del siguiente intento.
+  Aplicado a XDB401, BMP280, MCP9808, MicroPressure, HTU2x, HDC1080, BH1750,
+  AHT20, INA219, TSL2584/APDS y Soil RS485.
 - **WDT heartbeat logging**: la función `wdt_heartbeat(task, phase)` escribe el nombre de
   tarea y fase actual en RTC RAM antes de operaciones bloqueantes. Si el WDT dispara,
   la alerta `device_reboot` incluirá el contexto exacto del bloqueo para diagnóstico remoto.
+- **Sondeo celular SIM7000G con cadencia controlada**: `NetworkTask` deja de ejecutar
+  consultas AT/GPRS en cada iteración de 10 ms y pasa a un polling cada 2 s (o inmediato
+  si GPRS cae). Reduce la interferencia sobre sockets TLS/MQTT y evita reconexiones espurias.
+- **Diagnóstico MQTT celular sin consultas AT extra**: los logs de estado de red durante
+  reconexión usan cache (`_gprsConnectedFlag`, `_simCsqCache`) en lugar de preguntar al
+  módem en caliente. Reduce comandos AT durante `connect()` y caídas tras `loop()`.
+- **Pre-limpieza de socket/buffer antes de `mqttConnect()` (AQUA_SMART_REMOTE)**:
+  se cierra explícitamente el cliente TLS/TCP previo y se limpia el stream AT del módem
+  antes de cada `CONNECT`, para evitar timeouts por `CONNACK` no leído en SIM7000G.
 - **Cooldown de alertas de sensor** (`SENSOR_ALERT_COOLDOWN = 12 h`): evita que un sensor
   persistentemente muerto inunde el broker con alertas repetidas. Tras el primer disparo
   edge-triggered, la alerta se re-emite cada 12 horas mientras el fallo persista.
