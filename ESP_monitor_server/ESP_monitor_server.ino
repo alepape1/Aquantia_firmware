@@ -395,8 +395,8 @@ static uint8_t       xdb401_recovery_failures = 0; // fallos consecutivos de rec
 static unsigned long xdb401_retry_at  = 0;        // millis() cuando intentar reinit
 static constexpr uint8_t  XDB401_MAX_FAILURES  = 8;    // más tolerante con cable largo (~1 m)
 static constexpr uint32_t XDB401_RETRY_INTERVAL = 15000UL;  // reintento más rápido tras recovery
-static constexpr uint8_t  XDB401_MAX_RECOVERY_FAILURES = 4;  // varios intentos antes de enfriamiento
-static constexpr uint32_t XDB401_RECOVERY_COOLDOWN = 300000UL; // 5 min
+static constexpr uint8_t  XDB401_MAX_RECOVERY_FAILURES = 240; // 1 h de reintentos (240 × 15 s)
+static constexpr uint32_t XDB401_RECOVERY_COOLDOWN = 86400000UL; // 24 h
 
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_AQUALEAK \

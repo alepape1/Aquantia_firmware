@@ -597,29 +597,31 @@ void readSoilSensor(unsigned long now) {
   if (now - lastSoilReadMs >= soilInterval) {
     lastSoilReadMs = now;
     wdt_heartbeat("loopTask", "soil_rs485");
-    if (now < soil_rs485_retry_at) {
-      halisenseData.ok = false;
-    } else if (soilSensor.readAllVariables()) {
-      sensorRecoveryMarkSuccess(soil_rs485_recovery_failures, soil_rs485_retry_at);
-      halisenseData.ok          = true;
-      halisenseData.moisture    = soilSensor.getHumidity();
-      halisenseData.temperature = soilSensor.getTemperature();
-      float ecRaw               = soilSensor.getEC();
-      halisenseData.ec          = ecRaw / 1000.0f;
-      halisenseData.tds         = ecRaw * 0.5f;
-      halisenseData.ph          = soilSensor.getPH();
-      halisenseData.n           = (int)soilSensor.getNitrogen();
-      halisenseData.p           = (int)soilSensor.getPhosphorus();
-      halisenseData.k           = (int)soilSensor.getPotassium();
-      soilMoisture              = halisenseData.moisture;
-      DLOGF("[SOIL] Hum=%.1f%% T=%.1f°C pH=%.1f N=%d P=%d K=%d [%s]\n",
-            halisenseData.moisture, halisenseData.temperature, halisenseData.ph,
-            halisenseData.n, halisenseData.p, halisenseData.k,
-            relayOn ? "RIEGO" : (soilPostIrrigEndMs != 0 ? "POST-RIEGO" : "REPOSO"));
+    if (now >= soil_rs485_retry_at) {
+      if (soilSensor.readAllVariables()) {
+        sensorRecoveryMarkSuccess(soil_rs485_recovery_failures, soil_rs485_retry_at);
+        halisenseData.ok          = true;
+        halisenseData.moisture    = soilSensor.getHumidity();
+        halisenseData.temperature = soilSensor.getTemperature();
+        float ecRaw               = soilSensor.getEC();
+        halisenseData.ec          = ecRaw / 1000.0f;
+        halisenseData.tds         = ecRaw * 0.5f;
+        halisenseData.ph          = soilSensor.getPH();
+        halisenseData.n           = (int)soilSensor.getNitrogen();
+        halisenseData.p           = (int)soilSensor.getPhosphorus();
+        halisenseData.k           = (int)soilSensor.getPotassium();
+        soilMoisture              = halisenseData.moisture;
+        DLOGF("[SOIL] Hum=%.1f%% T=%.1f°C pH=%.1f N=%d P=%d K=%d [%s]\n",
+              halisenseData.moisture, halisenseData.temperature, halisenseData.ph,
+              halisenseData.n, halisenseData.p, halisenseData.k,
+              relayOn ? "RIEGO" : (soilPostIrrigEndMs != 0 ? "POST-RIEGO" : "REPOSO"));
+      } else {
+        halisenseData.ok = false;
+        sensorRecoveryMarkFailure("SOIL", soil_rs485_recovery_failures, soil_rs485_retry_at);
+        DLOGLN("[SOIL] Sin respuesta del sensor RS485");
+      }
     } else {
       halisenseData.ok = false;
-      sensorRecoveryMarkFailure("SOIL", soil_rs485_recovery_failures, soil_rs485_retry_at);
-      DLOGLN("[SOIL] Sin respuesta del sensor RS485");
     }
   }
 #endif

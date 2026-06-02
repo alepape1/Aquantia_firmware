@@ -5,9 +5,10 @@
 #pragma once
 
 // ── Constantes de recuperación genérica ──────────────────────────────────────
-static constexpr uint8_t  SENSOR_RECOVERY_MAX_FAILURES    = 4;
+// Reintenta cada 15 s hasta 240 veces (= 1 hora); luego pausa 24 h antes de volver a intentar.
+static constexpr uint8_t  SENSOR_RECOVERY_MAX_FAILURES    = 240;
 static constexpr uint32_t SENSOR_RECOVERY_RETRY_INTERVAL  = 15000UL;
-static constexpr uint32_t SENSOR_RECOVERY_COOLDOWN        = 300000UL;
+static constexpr uint32_t SENSOR_RECOVERY_COOLDOWN        = 86400000UL;
 
 static void sensorRecoveryMarkSuccess(uint8_t& recoveryFailures, unsigned long& retryAt) {
   recoveryFailures = 0;
