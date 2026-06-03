@@ -18,7 +18,11 @@ public:
     // Initialize the sensor with specified baud rate
     bool begin(uint32_t baudRate = 4800);
 
-    // Read all variables at once (most efficient)
+    // Modbus slave address (persisted externally via SoilProvisioner)
+    void    setSlaveAddress(uint8_t addr) { _slaveAddr = addr; }
+    uint8_t getSlaveAddress() const       { return _slaveAddr; }
+
+    // Read all variables at once using _slaveAddr (most efficient)
     bool readAllVariables();
 
     // Individual reading functions
@@ -29,6 +33,12 @@ public:
     bool readNitrogen();
     bool readPhosphorus();
     bool readPotassium();
+
+    // Probe any address without changing _slaveAddr state — used by SoilProvisioner
+    bool probe(uint8_t addr);
+
+    // Change device's Modbus slave address (FC 0x06, register 0x0100 — YIERYI family)
+    bool changeAddress(uint8_t currentAddr, uint8_t newAddr);
 
     // Get the latest read values
     float getTemperature() const { return temperature; }
@@ -50,19 +60,11 @@ public:
 
 private:
     HardwareSerial &sensorSerial;
-    int _rxPin      = -1;
-    int _txPin      = -1;
-    int _dePin      = -1;
-    bool _customPins = false;
-
-    static const byte READ_ALL_REG[8];
-    static const byte READ_TEMP_REG[8];
-    static const byte READ_HUM_REG[8];
-    static const byte READ_EC_REG[8];
-    static const byte READ_PH_REG[8];
-    static const byte READ_N_REG[8];
-    static const byte READ_P_REG[8];
-    static const byte READ_K_REG[8];
+    int     _rxPin      = -1;
+    int     _txPin      = -1;
+    int     _dePin      = -1;
+    bool    _customPins = false;
+    uint8_t _slaveAddr  = 0x01;
 
     byte readBuffer[20] = {0x00};
 

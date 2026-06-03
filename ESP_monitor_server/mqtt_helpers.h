@@ -111,6 +111,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     mqttPublishAlert("flow_counters_reset", "info", "Contadores de flujo reseteados");
   }
 #endif
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  const char* soilCmd = doc["cmd"] | "";
+  if (strcmp(soilCmd, "provision_soil") == 0) {
+    DLOGLN("[SOIL-BUS] Provisioning iniciado por MQTT");
+    uint8_t newAddr = soilBusProvision(soilSensor);
+    char msg[64];
+    if (newAddr > 0)
+      snprintf(msg, sizeof(msg), "Sensor suelo asignado a dir 0x%02X", newAddr);
+    else
+      strlcpy(msg, "Provisioning fallido — ver Serial", sizeof(msg));
+    mqttPublishAlert("soil_provisioned", newAddr > 0 ? "info" : "warning", msg);
+  }
+#endif
 }
 
 // Conectar al broker y suscribirse al topic de comandos

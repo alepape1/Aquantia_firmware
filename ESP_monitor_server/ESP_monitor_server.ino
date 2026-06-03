@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.2.0-beta.3"
+#define FIRMWARE_VERSION "0.3.0-beta"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -118,12 +118,14 @@
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
   #include "SoilSensor.h"
+  #include "SoilProvisioner.h"
   #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
   // IRRIGATION: RS485 Helissense + INA219 + AHT20 + BMP280
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include "SoilSensor.h"
+  #include "SoilProvisioner.h"
   #include "halisense_sensor.h"
   #include "aht20_driver.h"
   #include "ina219_driver.h"
@@ -132,6 +134,7 @@
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include "SoilSensor.h"
+  #include "SoilProvisioner.h"
   #include "halisense_sensor.h"
   #include "aht20_driver.h"
   #include "ina219_driver.h"
@@ -1190,6 +1193,13 @@ void setup() {
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
  || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  {
+    uint8_t savedSoilAddr = soilBusLoadAddress();
+    if (savedSoilAddr > 0) {
+      soilSensor.setSlaveAddress(savedSoilAddr);
+      DLOGF("[SOIL] Dirección cargada de NVS: 0x%02X\n", savedSoilAddr);
+    }
+  }
   if (soilSensor.begin(4800))
     DLOGLN("SoilSensor RS485 iniciado OK");
   else
