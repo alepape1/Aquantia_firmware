@@ -18,8 +18,10 @@
 // plus any already-programmed sensors. The new sensor must be the only one at 0x01.
 //
 // Note on baud rate: all sensors on the same RS485 bus must run at the same baud.
-// If your new sensor is at 9600 baud and existing sensors are at 4800, you must
-// also write register 0x0101 (value 2 = 4800 bps) before calling this provisioner.
+// This firmware uses 9600 baud. All sensors must be at 9600 before provisioning.
+// Register 0x0101 controls baud rate on some models (0=1200,1=2400,2=4800,3=9600),
+// but many sensors (e.g. this YIERYI variant) have it fixed and ignore FC 0x06 writes
+// to that register — confirmed by ILLEGAL DATA ADDRESS (exception 0x02) response.
 // =============================================================================
 
 #include "SoilSensor.h"

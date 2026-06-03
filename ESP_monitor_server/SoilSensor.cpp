@@ -23,6 +23,8 @@
 
   Address change: FC 0x06, register 0x0100 = new slave address (YIERYI family standard).
   Baud rate change: FC 0x06, register 0x0101 = 0-4 (1200/2400/4800/9600/19200) — if supported.
+  Note: some variants (confirmed YIERYI NPK) have baud rate fixed in firmware and return
+  ILLEGAL DATA ADDRESS (exception 0x02) when writing 0x0101 — bus must stay at 9600.
 */
 
 #include "SoilSensor.h"

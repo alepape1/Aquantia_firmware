@@ -16,7 +16,7 @@ public:
     SoilSensor(HardwareSerial &serial, int rxPin, int txPin, int dePin);
 
     // Initialize the sensor with specified baud rate
-    bool begin(uint32_t baudRate = 4800);
+    bool begin(uint32_t baudRate = 9600);
 
     // Modbus slave address (persisted externally via SoilProvisioner)
     void    setSlaveAddress(uint8_t addr) { _slaveAddr = addr; }
