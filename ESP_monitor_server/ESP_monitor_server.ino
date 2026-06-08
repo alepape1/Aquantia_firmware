@@ -1200,7 +1200,7 @@ void setup() {
       DLOGF("[SOIL] Dirección cargada de NVS: 0x%02X\n", savedSoilAddr);
     }
   }
-  if (soilSensor.begin(9600))
+  if (soilSensor.begin(4800))
     DLOGLN("SoilSensor RS485 iniciado OK");
   else
     DLOGLN("[WARN] SoilSensor: sin respuesta al arranque — continuando");

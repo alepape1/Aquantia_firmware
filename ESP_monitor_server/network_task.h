@@ -482,9 +482,9 @@ void networkTask(void* pvParameters) {
       bool ok;
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-      // ── GSM slim payload: ~350 B ──────────────────────────────────────────
+      // ── GSM slim payload ─────────────────────────────────────────────────
       {
-        StaticJsonDocument<512> doc;
+        StaticJsonDocument<640> doc;
         doc["temperature"]       = r2(snap.tempMCP);
         doc["humidity"]          = r2(snap.humidity);
         doc["pressure"]          = r2(snap.pressure);
@@ -508,9 +508,11 @@ void networkTask(void* pvParameters) {
           doc["soil_p"]           = snap.soilP;
           doc["soil_k"]           = snap.soilK;
         }
-        if (!isnan(snap.inaPower)) doc["ina219_power_mw"] = r1(snap.inaPower);
+        if (!isnan(snap.inaPower))   doc["ina219_power_mw"]    = r1(snap.inaPower);
+        if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"]  = r2(snap.inaVbus);
+        if (!isnan(snap.inaCurrent)) doc["ina219_current_ma"]   = r1(snap.inaCurrent);
         { time_t _ts = time(nullptr); if (_ts > 1000000000L) doc["ts"] = (long)_ts; }
-        char buf[512];
+        char buf[640];
         payload_len = serializeJson(doc, buf, sizeof(buf));
         if (payload_len >= sizeof(buf))
           DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n", (unsigned)payload_len, (unsigned)sizeof(buf));
@@ -519,7 +521,7 @@ void networkTask(void* pvParameters) {
 #else
       // ── Full payload (WiFi / debug) ───────────────────────────────────────
       {
-        StaticJsonDocument<1024> doc;
+        StaticJsonDocument<1280> doc;
         doc["temperature"]           = r2(snap.tempMCP);
         doc["pressure"]              = r2(snap.pressure);
         doc["humidity"]              = r2(snap.humidity);
@@ -549,7 +551,10 @@ void networkTask(void* pvParameters) {
 #endif
         doc["pipeline_pressure"]     = r2(snap.pipePressure);
         doc["pipeline_flow"]         = r2(snap.pipeFlow);
-        doc["flow_total_l"]          = roundf(snap.flowTotalL * 10.0f) / 10.0f;
+        doc["flow_total_l"]          = roundf(snap.flowTotalL   * 100.0f) / 100.0f;
+        doc["flow_session_l"]        = roundf(snap.flowSessionL * 100.0f) / 100.0f;
+        doc["flow_irrig_l"]          = roundf(snap.flowIrrigL   * 100.0f) / 100.0f;
+        doc["flow_leak_l"]           = roundf(snap.flowLeakL    * 100.0f) / 100.0f;
         doc["pipeline_scenario"]     = pipelineScenario;
         doc["pipeline_mode"]         = pipelineMode;
         doc["pipeline_source"]       = pipelineSource;
@@ -571,10 +576,12 @@ void networkTask(void* pvParameters) {
 #if DEVICE_PROFILE == PROFILE_IRRIGATION
         doc["aht20_ok"]  = aht20_ok;
         doc["ina219_ok"] = ina219_ok;
-        if (!isnan(snap.inaPower))   doc["ina219_power_mw"] = r1(snap.inaPower);
+        if (!isnan(snap.inaPower))   doc["ina219_power_mw"]   = r1(snap.inaPower);
+        if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"] = r2(snap.inaVbus);
+        if (!isnan(snap.inaCurrent)) doc["ina219_current_ma"]  = r1(snap.inaCurrent);
 #endif
         { time_t _ts = time(nullptr); if (_ts > 1000000000L) doc["ts"] = (long)_ts; }
-        char buf[1024];
+        char buf[1280];
         payload_len = serializeJson(doc, buf, sizeof(buf));
         if (payload_len >= sizeof(buf))
           DLOGF("[MQTT] WARN payload truncado (%u >= %u)\n", (unsigned)payload_len, (unsigned)sizeof(buf));

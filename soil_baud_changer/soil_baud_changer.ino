@@ -1,6 +1,6 @@
 // soil_baud_changer.ino
-// One-shot: changes a YIERYI RS485 soil sensor from 9600 → 4800 baud.
-// Register 0x0101 values: 0=1200, 1=2400, 2=4800, 3=9600, 4=19200
+// One-shot: changes a YIERYI RS485 soil sensor from 4800 → 9600 baud and address to 3.
+// Register 0x0100: slave address | Register 0x0101 values: 0=1200, 1=2400, 2=4800, 3=9600, 4=19200
 //
 // Wiring (ESP32 example):
 //   GPIO16 (RX2) ← sensor TX
@@ -71,20 +71,32 @@ void setup() {
 
   if (DE_PIN >= 0) { pinMode(DE_PIN, OUTPUT); digitalWrite(DE_PIN, LOW); }
 
-  Serial2.begin(9600, SERIAL_8N1, SENSOR_RX, SENSOR_TX);
+  Serial2.begin(4800, SERIAL_8N1, SENSOR_RX, SENSOR_TX);
   delay(500);
-  Serial.println("Conectado al sensor a 9600 baud.");
-  Serial.println("Enviando cambio de baud rate: 9600 → 4800 (reg 0x0101 = 2) ...");
+  Serial.println("Conectado al sensor a 4800 baud, dir 0x01.");
 
-  bool ok = sendFC06(Serial2, SLAVE_ADDR, 0x0101, 2);
-  if (ok) {
-    Serial.println("OK — el sensor confirmó el cambio.");
-    Serial.println("Verifica reconectando con soil_scanner a 4800 baud.");
+  Serial.println("Cambiando direccion: 0x01 → 0x03 (reg 0x0100 = 3) ...");
+  bool okAddr = sendFC06(Serial2, SLAVE_ADDR, 0x0100, 3);
+  if (okAddr) {
+    Serial.println("OK — direccion cambiada a 3.");
+  } else {
+    Serial.println("FALLO al cambiar direccion — abortando.");
+    Serial2.end();
+    return;
+  }
+  delay(200);
+
+  Serial.println("Cambiando baud rate: 4800 → 9600 (reg 0x0101 = 3) ...");
+  // Tras el cambio de dir, el sensor responde en addr 3
+  bool okBaud = sendFC06(Serial2, 0x03, 0x0101, 3);
+  if (okBaud) {
+    Serial.println("OK — baud rate cambiado a 9600.");
+    Serial.println("Verifica reconectando con soil_scanner a 9600 baud, dir 3.");
   } else {
     Serial.println("FALLO — no se recibió confirmación.");
     Serial.println("Posibles causas:");
     Serial.println("  · Sensor no implementa registro 0x0101 (algunos modelos lo ignoran)");
-    Serial.println("  · El sensor reinicia sin enviar eco — prueba soil_scanner a 4800 igual");
+    Serial.println("  · El sensor reinicia sin enviar eco — prueba soil_scanner a 9600 / dir 3 igual");
     Serial.println("  · Conexiones o DE/RE pin incorrectos");
   }
 
