@@ -9,6 +9,50 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased — feat/per-profile-device-ids]
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/per-profile-device-ids`
+
+### Fixed
+
+- **INA219 — voltaje y corriente nunca publicados**: el firmware calculaba correctamente
+  `inaVbus` e `inaCurrent` en el `TelemetrySnapshot` pero solo serializaba `ina219_power_mw`
+  en ambos payloads MQTT (WiFi completo y GSM slim). Las columnas `ina219_bus_voltage` y
+  `ina219_current_ma` siempre llegaban `NULL` al backend.
+  Ahora ambos campos se publican en todos los payloads:
+  - Full WiFi (`PROFILE_IRRIGATION`): `ina219_bus_voltage` (2 decimales, V) + `ina219_current_ma` (1 decimal, mA)
+  - GSM slim (`PROFILE_AQUA_SMART_REMOTE`): ídem
+
+- **Flow counters — `flow_session_l`, `flow_irrig_l`, `flow_leak_l` ausentes en payload WiFi**:
+  los tres contadores de caudal se calculaban correctamente en `sensor_read.h` y se almacenaban
+  en el snapshot, pero solo `flow_total_l` se añadía al JSON del payload WiFi completo.
+  Los tres campos nuevos llegan ahora al backend con precisión de 2 decimales (antes
+  `flow_total_l` usaba 1 decimal — uniformizado a 2).
+
+- **pH Halisense escala incorrecta**: el sensor devuelve el valor de pH ×100 (no ×10).
+  La división en `halisense_sensor.h` pasó de `reg[3] / 10.0f` a `reg[3] / 100.0f`.
+  Afecta a todos los perfiles que incluyen el sensor Halisense RS485.
+
+- **Baud rate sensor suelo YIERYI**: el sensor estaba configurado a 9600 baud pero opera
+  a 4800. `SoilSensor::begin()` por defecto pasó de `9600` a `4800`. Corregido también
+  en la llamada de `ESP_monitor_server.ino` para `PROFILE_IRRIGATION`.
+
+### Changed
+
+- **`StaticJsonDocument` GSM slim** (`PROFILE_AQUA_SMART_REMOTE`): aumentado de `<512>` a
+  `<640>` y `char buf[512]` a `char buf[640]` para acomodar los nuevos campos INA sin
+  riesgo de truncación.
+
+- **`char buf` WiFi completo**: aumentado de `char buf[1024]` a `char buf[1280]` por los
+  campos `flow_session_l`, `flow_irrig_l`, `flow_leak_l` e INA añadidos. El
+  `StaticJsonDocument<1024>` también aumentado a `<1280>`.
+
+- **`soil_baud_changer.ino` repropuesto**: la herramienta pasó de cambiar 9600→4800 a
+  cambiar 4800→9600 y reasignar la dirección Modbus de 0x01 a 0x03 en el mismo sketch
+  (útil para reprovisionamiento de sensores reconfigurados).
+
+---
+
 ## [Unreleased — refactor/modularize-ino]
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `refactor/modularize-ino`

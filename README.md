@@ -473,7 +473,7 @@ Campos exclusivos **PROFILE_AQUALEAK** (solo cuando `DEVICE_PROFILE = 3`):
 
 ### Payload telemetría GSM slim (PROFILE_AQUA_SMART_REMOTE)
 
-El perfil celular usa un documento reducido (~350 B, `StaticJsonDocument<512>`) para minimizar el consumo de datos sobre 2G/LTE-M. Solo incluye los campos más relevantes:
+El perfil celular usa un documento reducido (`StaticJsonDocument<640>`) para minimizar el consumo de datos sobre 2G/LTE-M. Solo incluye los campos más relevantes:
 
 ```json
 {
@@ -499,13 +499,15 @@ El perfil celular usa un documento reducido (~350 B, `StaticJsonDocument<512>`) 
   "soil_p":             18,
   "soil_k":             31,
   "ina219_power_mw":    1850.0,
+  "ina219_bus_voltage": 12.34,
+  "ina219_current_ma":  150.0,
   "ts":                 1746360000
 }
 ```
 
 > - `rssi`: en GSM es el valor CSQ del modem (0–31), no dBm WiFi
 > - Los campos de suelo (`soil_temperature` … `soil_k`) solo se incluyen cuando `halisense_ok = true` (no se serializa el flag `halisense_ok` en este perfil para ahorrar bytes)
-> - `ina219_power_mw` solo presente cuando el INA219 respondió en el último ciclo
+> - `ina219_power_mw`, `ina219_bus_voltage`, `ina219_current_ma` solo presentes cuando el INA219 respondió en el último ciclo
 > - El payload completo (WiFi) aplica solo a perfiles 1–3
 
 > - `halisense_ok`: `true` cuando el sensor RS485 respondió correctamente en el último ciclo
@@ -736,7 +738,7 @@ Modbus RTU a **4800 baud, 8N1**. El firmware lee 7 registros desde la dirección
 | 0 | Temperatura del suelo (°C) | ÷10 |
 | 1 | Humedad del suelo (%) | ÷10 |
 | 2 | CE — conductividad eléctrica (µS/cm → dS/m ÷1000, TDS ppm ×0.5) | — |
-| 3 | pH | ÷10 |
+| 3 | pH | ÷100 |
 | 4 | Nitrógeno N (mg/kg) | directo |
 | 5 | Fósforo P (mg/kg) | directo |
 | 6 | Potasio K (mg/kg) | directo |
