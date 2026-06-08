@@ -9,6 +9,23 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased — audit/security-2026-06]
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `audit/security-2026-06`
+
+### Security
+
+- **AUDIT PRE**: auditoría de seguridad exhaustiva (12 áreas, puntuación global 4.8/10) — ver [SECURITY.md](SECURITY.md)
+- **AUDIT C1** ❌: `secrets - copia.h` con credenciales WiFi y MQTT trackeado en rama `develop` — pendiente limpieza con `git filter-repo` y rotación de credenciales
+- **AUDIT C2** ❌: `ArduinoOTA` sin contraseña (`OTA_PASSWORD` no definido) ni verificación de integridad — pendiente migración a OTA autenticado
+- **AUDIT C3** ❌: TLS en path celular SIM7000G con `authmode=0` (sin validación CA) en rama `feat/SIM_MODEM` — pendiente corrección a `authmode=1`
+- **AUDIT C4** ❌: Flash Encryption y Secure Boot deshabilitados en `sdkconfig` — pendiente habilitación en proceso de fábrica
+- **AUDIT C5** ⚠️: Contraseña SoftAP `"aquantia1"` igual en todos los dispositivos — pendiente derivación por serial del dispositivo
+- **DOCS**: creados `SECURITY.md` (informe completo PRE + plantilla POST), `wiki/Seguridad.md` (arquitectura de seguridad)
+- **DOCS**: actualizados `README.md` (sección Seguridad) y `wiki/Home.md` (enlace a Seguridad)
+
+---
+
 ## [Unreleased — feat/per-profile-device-ids]
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/per-profile-device-ids`

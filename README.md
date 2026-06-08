@@ -1033,3 +1033,23 @@ El backend mantiene en `app_settings` la clave `min_firmware_version` con la ver
 | `v0.2.0` | `v0.1.x` | Puede no funcionar — revisar CHANGELOG |
 
 Ver también: [CHANGELOG.md](CHANGELOG.md) y el [README del backend](../app_meteo/app_meteo/README.md).
+
+---
+
+## Seguridad
+
+> **Puntuación global: 4.8/10** — Auditoría realizada el 2026-06-09. Ver [SECURITY.md](SECURITY.md) para el informe completo, plan de remediación y checklist ENS Básico.
+
+| Área | Puntuación PRE | Objetivo POST |
+|------|:--------------:|:-------------:|
+| Credenciales y secretos | 4/10 | 9/10 |
+| TLS / Comunicaciones | 5/10 | 9/10 |
+| Seguridad OTA | 2/10 | 8/10 |
+| Secure Boot / Flash Encryption | 0/10 | 9/10 |
+| Autenticación de dispositivo | 6/10 | 8/10 |
+| Watchdog y resiliencia | 8/10 | 8/10 |
+| Validación de inputs | 7/10 | 8/10 |
+
+Las 5 vulnerabilidades críticas identificadas y el plan de remediación completo (prioridades CRÍTICA / ALTA / MEDIA / BAJA) están documentados en [SECURITY.md](SECURITY.md).
+
+Para la arquitectura de seguridad del sistema (identidad de dispositivo, TLS, OTA, provisioning), ver [wiki/Seguridad.md](wiki/Seguridad.md).
