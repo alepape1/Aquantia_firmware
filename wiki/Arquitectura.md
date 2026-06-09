@@ -104,7 +104,11 @@ Wrappers del `loop()` de Core 1:
 ### `mqtt_helpers.h`
 - `mqttCallback`: decodifica comandos relay + config de pipeline desde `aquantia/<finca_id>/cmd`.
   Filtrado por MAC opcional. Protege escrituras con `dataMutex`.
+  Acepta `telemetry_interval_s` para cambiar el ritmo de envío en caliente (p. ej. 5 s durante riego).
 - `mqttConnect`: Client ID `aquantia-{MAC}`, `setKeepAlive(180)` para GSM / 60 para WiFi.
+  Usa **sesión persistente** (`cleanSession=false`): el broker encola mensajes QoS 1 mientras
+  el dispositivo está desconectado y los entrega al reconectar. El client ID basado en MAC
+  garantiza que el broker identifica la misma sesión entre reconexiones.
   Suscripción a `cmd` con QoS 1.
 - `mqttPublishRegister`: payload de registro al arranque con chip info, `sketch_size_kb`,
   `free_sketch_kb`, `device_profile` string.

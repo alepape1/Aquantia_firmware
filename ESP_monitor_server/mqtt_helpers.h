@@ -165,7 +165,10 @@ bool mqttConnect() {
   mqttClient.setSocketTimeout(30);
 #endif
 
-  bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
+  // cleanSession=false: el broker encola mensajes QoS 1 mientras el dispositivo
+  // esté desconectado (drop de WiFi/MQTT) y los entrega al reconectar.
+  // Requiere client_id estable — lo es: basado en el eFuse MAC.
+  bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass, NULL, 0, false, NULL, false);
 
 #ifdef DEBUG_MODE
   DLOGF("[MQTT] connect() tardó %lums → %s  state=%d\n",
