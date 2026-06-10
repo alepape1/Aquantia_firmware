@@ -1661,9 +1661,12 @@ void loop() {
     DLOGF("[VIENTO] %.1f m/s (filt:%.1f)  Dir:%.0f° (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
 #if defined(FLOW_PIN)
+    noInterrupts();
+    uint32_t _dbgFlowTotal = _flowPulseTotal;
+    interrupts();
     DLOGF("[FLOW  ] %.2f L/min  Total:%lu p  Intervalo:%lu us\n",
-      _flowLpm, (unsigned long)_flowPulseTotal, (unsigned long)_flowLastDtUs);
-    if (_flowPulseTotal == 0)
+      _flowLpm, (unsigned long)_dbgFlowTotal, (unsigned long)_flowLastDtUs);
+    if (_dbgFlowTotal == 0)
       DLOGLN("[WARN  ] Caudalimetro: sin pulsos — verif. cableado GPIO" + String(FLOW_PIN));
 #endif
 #endif
