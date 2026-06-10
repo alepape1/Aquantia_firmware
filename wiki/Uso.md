@@ -54,3 +54,36 @@ real de todos los relays. El backend actualiza `relay_state.actual` con ese valo
 
 El valor se puede cambiar en cualquier momento enviando `telemetry_interval_s` en cualquier
 mensaje al topic `cmd`. Rango permitido: 5–3600 s.
+
+---
+
+## SoilProvisioner — auto-provisioning del sensor de suelo
+
+El módulo `SoilProvisioner.h` permite reasignar la dirección Modbus del sensor Helissense
+RS485 sin necesidad de acceso físico al dispositivo.
+
+### Comando MQTT
+
+Publicar en `aquantia/<finca_id>/cmd`:
+```json
+{"cmd": "provision_soil"}
+```
+Con `mac` opcional para filtrar por dispositivo:
+```json
+{"cmd": "provision_soil", "mac": "FC:B4:67:F3:77:48"}
+```
+
+### Flujo interno
+
+1. `soilBusScan(sensor, maxAddr=8)` — escanea direcciones 1–8 buscando el sensor.
+2. Si lo encuentra, `soilBusProvision(sensor)` asigna una dirección libre con `changeAddress()`.
+3. La nueva dirección se guarda en NVS (`soil_bus/addr`).
+4. En el próximo boot, `soilBusLoadAddress()` la carga automáticamente antes de `soilSensor.begin(4800)`.
+
+### Cuándo usarlo
+
+- El sensor no responde tras cambiar de dispositivo o borrar NVS.
+- Se re-provisionó manualmente la dirección del sensor físico.
+- El log serial muestra `[SOIL] Sin respuesta en addr X`.
+
+Ver también: [FAQ — El sensor de suelo no responde](FAQ#el-sensor-de-suelo-no-responde--da-valores-incorrectos)

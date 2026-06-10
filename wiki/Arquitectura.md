@@ -29,6 +29,7 @@ ESP_monitor_server/
 ├── htu2x_driver.h           ← HTU21/HTU2x temperatura+humedad (I2C, sin lib)
 ├── light_sensor.h           ← TSL2584/APDS-9930/BH1750 iluminancia
 ├── SoilSensor.h/cpp         ← Helissense Modbus RTU RS485 (4800 baud, 8N1)
+├── SoilProvisioner.h        ← auto-provisioning dirección Modbus vía NVS (soil_bus/addr)
 │
 ├── sensor_recovery.h        ← backoff de reintentos, helpers BMP280, driver XDB401
 ├── pipeline_core.h          ← simulación presión/caudal + lectura real XDB401
@@ -57,6 +58,13 @@ Dos modos de operación para presión y caudal de tubería:
 - **Real** (`pipeline_mode = "real"`): `readRealPipelineSensors` lee el XDB401 cada 200 ms
   y el caudalímetro YF-B9 (ISR + spinlock `_flowMux`) en micros.
 `updatePipelineValues` despacha al modo activo y alimenta al `LeakDetector`.
+
+**`readXDB401Safe(float&)`** — helper interno que centraliza la lógica de reintentos y
+gestión de fallos del XDB401 (antes duplicada 3 veces). Asigna `NAN` si el sensor falla.
+
+**Ghost flow guard**: si `_flowLpm > 0` pero no llegan pulsos en el intervalo actual y ese
+intervalo supera 2 periodos esperados al caudal previo, `_flowLpm` se zerifica inmediatamente
+en lugar de esperar hasta 500 ms (útil para detección rápida de parada de bomba).
 
 ### `wind_sensor.h`
 - **Media móvil circular** (10 muestras, 100 ms) sobre ADC anemómetro y veleta.
@@ -90,7 +98,7 @@ FreeRTOS task en Core 0 (prioridad 2):
 - **Alertas edge-triggered**: pipeline, sensores individuales, `soil_dry`, `low_heap` —
   todas con cooldown 12 h para re-emisión si el fallo persiste.
 - **Telemetría**: cada `telemetryIntervalMs` llama `takeSnapshot()` y publica en
-  `aquantia/<finca_id>/telemetry`. WiFi: payload completo 1024 B. GSM: payload slim 512 B.
+  `aquantia/<finca_id>/telemetry`. WiFi: payload completo 1280 B. GSM: payload slim 640 B.
 - **OTA**: `ArduinoOTA.handle()` sin bloquear sensores (solo perfiles WiFi).
 
 ### `sensor_read.h`
