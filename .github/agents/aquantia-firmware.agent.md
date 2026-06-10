@@ -12,11 +12,14 @@ Eres un agente especialista en firmware ESP32 para Aquantia. Prioriza cambios pe
 - **Última versión estable:** `0.2.0-beta.3`
 - **Rama de trabajo actual:** `feat/per-profile-device-ids`
 - **Rama base:** `main`
-- **Último commit:** `ab3383f` — `fix(mqtt): use persistent session to prevent lost valve commands`
+- **Último commit:** `1912520` — `fix(pipeline): zero _flowLpm on flow stop, extract readXDB401Safe helper`
 - **Backend compatible:** `v0.1.0` o superior
 
 ### Avances recientes integrados en esta rama
 
+- **Ghost flow guard** (`pipeline_core.h`): si `_flowLpm > 0` pero no llegan pulsos en el intervalo actual y ese intervalo supera 2 periodos esperados, `_flowLpm` se fuerza a `0.0f` inmediatamente, sin esperar el siguiente ciclo de 500 ms.
+- **`readXDB401Safe()` helper** (`pipeline_core.h`): lógica de reintentos y gestión de fallos del XDB401 extraída a función única — antes estaba duplicada 3 veces en `readRealPipelineSensors`.
+- **ISR guard en debug log** (`ESP_monitor_server.ino`): lectura de `_flowPulseTotal` protegida con `noInterrupts`/`interrupts` antes de imprimirla en el log de depuración.
 - **Sesión MQTT persistente** (`cleanSession=false`): previene pérdida de comandos de válvula durante reconexión; requiere `clientId` estable por dispositivo.
 - **Per-profile FINCA_ID/hostname** en flasher (`flasher_gui.py`): cada perfil puede tener ID de finca independiente configurado al provisionar.
 - **MQTT reconnect cooldown 1 h**: tras 1 h de reconexión fallida continua, el firmware para el sondeo de sensores 24 h para conservar batería/CPU.

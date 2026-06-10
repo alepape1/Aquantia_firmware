@@ -1,8 +1,8 @@
 # Aquantia — Firmware ESP32
 
-**Versión activa:** `0.2.0-beta.3` · **Rama:** `feat/helissense-sensor` · **Backend compatible:** `v0.1.0+`
+**Versión activa:** `0.3.0-beta` · **Rama:** `feat/per-profile-device-ids` · **Backend compatible:** `v0.1.0+`
 
-Firmware para la estación meteorológica y sistema de detección de fugas/control de riego Aquantia. Compatible con **tres perfiles de hardware** seleccionables en tiempo de compilación.
+Firmware para la estación meteorológica y sistema de detección de fugas/control de riego Aquantia. Compatible con **cuatro perfiles de hardware** seleccionables en tiempo de compilación.
 
 Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/alepape1/app_meteo)
 

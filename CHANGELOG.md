@@ -37,6 +37,23 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
   a 4800. `SoilSensor::begin()` por defecto pasó de `9600` a `4800`. Corregido también
   en la llamada de `ESP_monitor_server.ino` para `PROFILE_IRRIGATION`.
 
+- **Ghost flow — `_flowLpm` no se zerificaba al parar el flujo**: si el flujo se detenía
+  bruscamente, `_flowLpm` permanecía positivo durante hasta 500 ms (hasta el siguiente
+  intervalo de cálculo). Ahora, si no llega ningún pulso en el intervalo actual Y ese
+  intervalo supera 2 periodos esperados al caudal previo, `_flowLpm` se fuerza a `0.0f`
+  inmediatamente (`pipeline_core.h`).
+
+- **Lectura de `_flowPulseTotal` en debug log sin protección ISR**: el log de depuración
+  leía la variable compartida con la ISR sin `noInterrupts`/`interrupts`. Corregido con
+  copia local protegida (`ESP_monitor_server.ino`).
+
+### Refactored
+
+- **`readXDB401Safe()` — lógica de reintentos XDB401 extraída a helper**: la misma
+  secuencia de reconexión y gestión de fallos del sensor XDB401 estaba duplicada 3 veces
+  en `readRealPipelineSensors`. Centralizada en `readXDB401Safe(float&)`. Sin cambio
+  de comportamiento en runtime.
+
 ### Changed
 
 - **`StaticJsonDocument` GSM slim** (`PROFILE_AQUA_SMART_REMOTE`): aumentado de `<512>` a
