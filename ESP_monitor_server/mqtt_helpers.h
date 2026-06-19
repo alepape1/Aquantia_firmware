@@ -126,6 +126,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     mqttPublishAlert("soil_provisioned", newAddr > 0 ? "info" : "warning", msg);
   }
 #endif
+
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE && !defined(DEV_MODE)
+  // Comando: {"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}
+  // Enviar ANTES de cambiar el router para cero downtime; si ya se perdió la
+  // conexión, usar el portal SoftAP (Aquantia-XXXXXX) que aparece tras ~30 min.
+  {
+    const char* wifiCmd = doc["cmd"] | "";
+    if (strcmp(wifiCmd, "update_wifi") == 0) {
+      const char* newSsid = doc["ssid"] | "";
+      const char* newPass = doc["password"] | "";
+      if (strlen(newSsid) > 0 && strlen(newSsid) < sizeof(prov_ssid)) {
+        provisioning_save(newSsid, newPass);
+        DLOGF("[PROV] WiFi actualizado por MQTT: ssid=%s\n", newSsid);
+        mqttPublishAlert("wifi_updated", "info", newSsid);
+        delay(500);
+        ESP.restart();
+      }
+    }
+  }
+#endif
 }
 
 // Conectar al broker y suscribirse al topic de comandos

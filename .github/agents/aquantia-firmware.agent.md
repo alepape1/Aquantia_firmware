@@ -12,7 +12,7 @@ Eres un agente especialista en firmware ESP32 para Aquantia. Prioriza cambios pe
 - **Última versión estable:** `0.2.0-beta.3`
 - **Rama de trabajo actual:** `feat/per-profile-device-ids`
 - **Rama base:** `main`
-- **Último commit:** `1912520` — `fix(pipeline): zero _flowLpm on flow stop, extract readXDB401Safe helper`
+- **Último commit:** `feat(provisioning): auto AP mode after WiFi failure + MQTT update_wifi command`
 - **Backend compatible:** `v0.1.0` o superior
 
 ### Avances recientes integrados en esta rama
@@ -31,6 +31,9 @@ Eres un agente especialista en firmware ESP32 para Aquantia. Prioriza cambios pe
 - **XDB401 sentinel `NAN`** (no `-1.0f`): no descartar presiones negativas reales.
 - **Buffer MQTT `2048` B**: reduce riesgo de truncado en payloads completos.
 - **BearSSL/SNI en SIM7000G**: client TLS preparado en cada intento de conexión (no solo una vez); timeout TLS 75 s; refresh PDP tras timeout.
+- **Auto AP mode tras fallo prolongado de WiFi** (`provisioning.h`, `network_task.h`): tras 60 reintentos fallidos (~30 min), se activa un flag en RTC RAM y el siguiente boot abre el portal SoftAP (`Aquantia-XXXXXX`) sin borrar credenciales. El usuario puede actualizar el SSID/contraseña si el router cambió, o cerrar el portal si era una caída temporal. Solo producción.
+- **Comando MQTT `update_wifi`** (`mqtt_helpers.h`): `{"cmd":"update_wifi","ssid":"X","password":"Y"}` actualiza credenciales WiFi en NVS remotamente (enviar antes de cambiar el router para cero downtime). Solo perfiles WiFi y producción.
+- **`provisioning_clear_wifi()`** (`provisioning.h`): borra solo `ssid`/`password` del NVS, preserva `mqtt_token`.
 
 ## Arquitectura del firmware
 
@@ -323,6 +326,24 @@ python tools/flasher_gui.py
 - `CONNECTION_TIMEOUT (-4)` en 8883: priorizar verificar paridad host/puerto/protocolo y logs del broker antes de tocar sensores.
 - Sesión persistente (`cleanSession=false`): si el broker no retiene subs tras reconexión, verificar que `clientId` sea estable y que el broker tenga soporte de sesión persistente habilitado.
 - Cooldown de reconexión: tras 1 h de fallo continuo, el firmware entra en modo conservación (24 h pausa de sensores). Visible en log serial como `[MQTT] Entering sensor stop mode`.
+
+### Recuperación ante cambio de credenciales WiFi
+
+Cuando el usuario cambia el router (SSID o contraseña), hay dos flujos de recuperación:
+
+1. **Proactivo — MQTT `update_wifi`** (recomendado, cero downtime):
+   Mientras el dispositivo aún está conectado, publicar en `aquantia/<finca_id>/cmd`:
+   `{"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}`
+   El dispositivo guarda en NVS, publica ACK `wifi_updated` y reinicia con las nuevas credenciales.
+
+2. **Reactivo — Portal SoftAP automático** (cuando la conexión ya se perdió):
+   Tras ~30 min de fallo continuo (60 reintentos × backoff de hasta 30 s), el dispositivo
+   activa el flag RTC y reinicia. En el siguiente boot aparece la red `Aquantia-XXXXXX`
+   (contraseña `aquantia1`). Conectar el móvil → `http://192.168.4.1` → ingresar nuevas credenciales.
+   Las credenciales previas no se borran: si el router estaba caído temporalmente, cerrar
+   el portal sin cambiar nada y el dispositivo reconecta al volver la red.
+
+**No** usar factory reset (GPIO0 ≥3s) para este caso — borra también el `mqtt_token`.
 
 ### SIM7000G / AQUA_SMART_REMOTE
 - Modem R1529 no soporta `AT+CSSLCFG`; TLS se hace en MCU con BearSSL sobre TCP.

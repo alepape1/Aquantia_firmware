@@ -778,7 +778,7 @@ void setup() {
 
   provisioning_load();  // carga ssid+password desde NVS si existen
 
-  if (!provisioning_has_credentials()) {
+  if (provisioning_check_ap_forced() || !provisioning_has_credentials()) {
 #ifdef HAS_DISPLAY
     // Dibujar pantalla AP antes de entrar en el portal (que bloquea para siempre).
     // Usamos device_serial_get() en vez de WiFi.macAddress() porque WiFi aún

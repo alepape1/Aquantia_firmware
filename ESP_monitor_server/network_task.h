@@ -161,6 +161,13 @@ void networkTask(void* pvParameters) {
       wifiFailCount++;
 
       if (wifiFailCount >= 60) {
+#ifndef DEV_MODE
+        // Señalizar al siguiente boot que abra el portal SoftAP para que el
+        // usuario pueda actualizar las credenciales si el router cambió.
+        // No se borran credenciales: si el router estaba caído temporalmente
+        // el usuario simplemente cierra el portal y el dispositivo reconecta.
+        provisioning_set_ap_forced();
+#endif
         esp_restart();
       } else if (wifiFailCount % 10 == 0) {
         WiFi.disconnect(true);

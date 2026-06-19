@@ -13,6 +13,28 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/per-profile-device-ids`
 
+### Added
+
+- **Auto AP mode tras fallo prolongado de WiFi** (`provisioning.h`, `network_task.h`):
+  tras 60 reintentos consecutivos fallidos (~30 min con backoff), el dispositivo activa un
+  flag en RTC RAM (`_prov_ap_forced_flag`) y reinicia. En el siguiente boot, `setup()`
+  detecta el flag con `provisioning_check_ap_forced()` y lanza el portal SoftAP
+  (`Aquantia-XXXXXX`) sin borrar las credenciales. Permite al usuario actualizar el
+  SSID/contraseña si el router cambió, o simplemente cerrar el portal si era una caída
+  temporal. Antes del cambio, el dispositivo reiniciaba indefinidamente sin recuperación.
+  Solo activo en modo producción (`#ifndef DEV_MODE`).
+
+- **Comando MQTT `update_wifi`** (`mqtt_helpers.h`):
+  permite actualizar las credenciales WiFi remotamente desde la app antes de cambiar el
+  router — cero downtime, sin acceso físico al dispositivo.
+  Payload: `{"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}`.
+  Respuesta: alerta MQTT `{"event":"wifi_updated","ssid":"NuevoSSID"}` + restart.
+  Solo activo en perfiles WiFi y modo producción (`!PROFILE_AQUA_SMART_REMOTE && !DEV_MODE`).
+
+- **`provisioning_clear_wifi()`** (`provisioning.h`):
+  borra únicamente las claves `ssid`/`password` del NVS preservando `mqtt_token`. Permite
+  reset parcial de credenciales WiFi sin perder el token de autenticación MQTT de fábrica.
+
 ### Fixed
 
 - **INA219 — voltaje y corriente nunca publicados**: el firmware calculaba correctamente
