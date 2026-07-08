@@ -15,6 +15,18 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ### Added
 
+- **ENS160 + AHT21 — sensor de calidad de aire IAQ** (`ens160_driver.h`, `ESP_monitor_server.ino`,
+  `sensor_read.h`, `network_task.h`): integración del módulo ENS160+AHT21 disponible en AliExpress.
+  Detección automática en runtime en todos los perfiles (sin recompilación por perfil).
+  ENS160 se detecta por PART_ID en 0x52 o 0x53; AHT21 (0x38) es protocolo-compatible con el
+  driver AHT20 existente y se detecta automáticamente en perfiles IRRIGATION/AQUA_SMART_REMOTE.
+  Salidas publicadas en MQTT cuando el sensor está presente:
+  `ens160_aqi` (UBA 1-5), `ens160_tvoc` (ppb), `ens160_eco2` (ppm eq.).
+  La compensación de temperatura y humedad del ENS160 usa los valores actuales del sensor
+  primario de cada perfil (MCP9808/HTU2x, HDC1080, AHT20/21). Incluye log serial completo al
+  arranque con todos los sensores detectados por tipo (temperatura, humedad, presión, calidad
+  de aire, luz, corriente) y cuál será utilizado en cada categoría.
+
 - **Auto AP mode tras fallo prolongado de WiFi** (`provisioning.h`, `network_task.h`):
   tras 60 reintentos consecutivos fallidos (~30 min con backoff), el dispositivo activa un
   flag en RTC RAM (`_prov_ap_forced_flag`) y reinicia. En el siguiente boot, `setup()`

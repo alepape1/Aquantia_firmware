@@ -518,6 +518,11 @@ void networkTask(void* pvParameters) {
         if (!isnan(snap.inaPower))   doc["ina219_power_mw"]    = r1(snap.inaPower);
         if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"]  = r2(snap.inaVbus);
         if (!isnan(snap.inaCurrent)) doc["ina219_current_ma"]   = r1(snap.inaCurrent);
+        if (snap.ensAqi > 0) {
+          doc["ens160_aqi"]  = snap.ensAqi;
+          doc["ens160_tvoc"] = snap.ensTvoc;
+          doc["ens160_eco2"] = snap.ensEco2;
+        }
         { time_t _ts = time(nullptr); if (_ts > 1000000000L) doc["ts"] = (long)_ts; }
         char buf[640];
         payload_len = serializeJson(doc, buf, sizeof(buf));
@@ -587,6 +592,12 @@ void networkTask(void* pvParameters) {
         if (!isnan(snap.inaVbus))    doc["ina219_bus_voltage"] = r2(snap.inaVbus);
         if (!isnan(snap.inaCurrent)) doc["ina219_current_ma"]  = r1(snap.inaCurrent);
 #endif
+        doc["ens160_ok"] = ens160_ok;
+        if (snap.ensAqi > 0) {
+          doc["ens160_aqi"]  = snap.ensAqi;
+          doc["ens160_tvoc"] = snap.ensTvoc;
+          doc["ens160_eco2"] = snap.ensEco2;
+        }
         { time_t _ts = time(nullptr); if (_ts > 1000000000L) doc["ts"] = (long)_ts; }
         char buf[1280];
         payload_len = serializeJson(doc, buf, sizeof(buf));

@@ -391,7 +391,8 @@ bool aht20_ok  = false;   // AHT20  — temperatura y humedad ambiente (I2C 0x38
 bool ina219_ok = false;   // INA219 — voltaje / corriente / potencia  (I2C 0x40)
 static uint8_t bmp280_addr = 0x00;
 #endif
-bool tsl_ok   = false;
+bool tsl_ok    = false;
+bool ens160_ok = false;   // ENS160 — sensor IAQ (TVOC, eCO2, AQI)
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
 static uint8_t       xdb401_failures  = 0;       // fallos consecutivos de lectura
 static uint8_t       xdb401_recovery_failures = 0; // fallos consecutivos de recuperación
@@ -439,6 +440,10 @@ static uint8_t       tsl_recovery_failures = 0;
 static unsigned long tsl_retry_at = 0;
 #endif
 
+// ENS160 — todos los perfiles (detección en runtime)
+static uint8_t       ens160_recovery_failures = 0;
+static unsigned long ens160_retry_at = 0;
+
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
  || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 static uint8_t       soil_rs485_recovery_failures = 0;
@@ -467,6 +472,9 @@ float  ina219BusVoltage = NAN;  // INA219 voltaje bus (V)
 float  ina219Current    = NAN;  // INA219 corriente (mA)
 float  ina219Power      = NAN;  // INA219 potencia (mW)
 #endif
+uint8_t  ens160Aqi  = 0;    // UBA Air Quality Index (1-5), 0 = no disponible
+uint16_t ens160Tvoc = 0;    // TVOC en ppb
+uint16_t ens160Eco2 = 0;    // eCO2 en ppm eq.
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
@@ -583,6 +591,7 @@ static bool anyRelayActive() {
 
 #include "htu2x_driver.h"
 #include "light_sensor.h"
+#include "ens160_driver.h"
 
 
 // ── FreeRTOS (solo ESP32) — declarado aquí para estar disponible antes de su uso ──
@@ -604,6 +613,10 @@ struct TelemetrySnapshot {
   float flowIrrigL;    ///< Litros acumulados con relay ON  (riego). 0 si sin caudalimetro.
   float flowLeakL;     ///< Litros acumulados con relay OFF (fuga detectada). 0 si sin caudalimetro.
   float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
+  // ENS160 — calidad de aire (todos los perfiles, NaN/0 si no detectado)
+  uint8_t  ensAqi;    // UBA Air Quality Index 1-5 (0 = no disponible)
+  uint16_t ensTvoc;   // TVOC en ppb
+  uint16_t ensEco2;   // eCO2 en ppm eq.
   long  heap, uptime;
   int   rssi, relayMask;
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
@@ -1224,6 +1237,74 @@ void setup() {
     DLOGLN("XDB401 no detectado — presion tuberia en modo simulacion");
   }
   leakDetector.begin(irrigationType);
+
+  // ── ENS160 — sensor IAQ (todos los perfiles, detección en runtime) ──────────
+  // Placa ENS160+AHT21 (AliExpress): ENS160 en 0x52, AHT21 en 0x38.
+  // AHT21 @ 0x38 es protocolo-compatible con AHT20 — detectado automáticamente
+  // en perfiles IRRIGATION/AQUA_SMART_REMOTE por aht20_driver.h.
+  ens160_ok = ens160_begin();
+  if (ens160_ok) {
+    // Primera compensación con los valores de T/HR ya leídos en este boot
+    ens160_set_compensation(temperatureMCP, humidity);
+    uint8_t aqi = 0; uint16_t tvoc = 0, eco2 = 0;
+    if (ens160_read(aqi, tvoc, eco2)) {
+      ens160Aqi  = aqi;
+      ens160Tvoc = tvoc;
+      ens160Eco2 = eco2;
+      DLOGF("ENS160 OK — AQI:%d  TVOC:%d ppb  eCO2:%d ppm\n", aqi, tvoc, eco2);
+    } else {
+      DLOGLN("ENS160 OK (calentando — lecturas iniciales no disponibles aun)");
+    }
+  } else {
+    DLOGLN("ENS160 no detectado");
+  }
+
+  // ── Resumen de sensores detectados ──────────────────────────────────────────
+  DLOGLN("\n=== Resumen de sensores ===");
+  // Temperatura
+#if DEVICE_PROFILE == PROFILE_METEO
+  DLOGF("  Temperatura  : %s%s%s\n",
+    mcp_ok      ? "[MCP9808] " : "",
+    bmp_temp_ok ? "[BMP280]  " : "",
+    (!mcp_ok && !bmp_temp_ok) ? "[SIM]" : "");
+  DLOGF("  -> Usando    : %s\n", temperatureSourceName());
+  DLOGF("  Humedad      : %s%s\n",
+    htu_ok ? "[HTU2x]" : "",
+    !htu_ok ? "[SIM]"  : "");
+  DLOGF("  Presion atm  : %s%s%s\n",
+    micropressure_ok ? "[MicroPressure] " : "",
+    bmp_pressure_ok  ? "[BMP280] "        : "",
+    (!micropressure_ok && !bmp_pressure_ok) ? "[SIM]" : "");
+  DLOGF("  -> Usando    : %s\n", pressureSourceName());
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
+  DLOGF("  Temperatura  : %s%s\n",
+    hdc_ok      ? "[HDC1080] " : "",
+    bmp_temp_ok ? "[BMP280]  " : "");
+  if (!hdc_ok && !bmp_temp_ok) DLOGLN("  Temperatura  : [SIM]");
+  DLOGF("  -> Usando    : %s\n", temperatureSourceName());
+  DLOGF("  Humedad      : %s\n", hdc_ok ? "[HDC1080]" : "[SIM]");
+  DLOGF("  Presion atm  : %s%s%s\n",
+    micropressure_ok ? "[MicroPressure] " : "",
+    bmp_pressure_ok  ? "[BMP280] "        : "",
+    (!micropressure_ok && !bmp_pressure_ok) ? "[SIM]" : "");
+  DLOGF("  -> Usando    : %s\n", pressureSourceName());
+  DLOGF("  Luz          : %s\n", bh1750_ok ? "[BH1750]" : "[SIM]");
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  DLOGF("  Temperatura  : %s%s\n",
+    aht20_ok    ? "[AHT20/21] " : "",
+    bmp_temp_ok ? "[BMP280]  "  : "");
+  if (!aht20_ok && !bmp_temp_ok) DLOGLN("  Temperatura  : [SIM]");
+  DLOGF("  -> Usando    : %s\n", temperatureSourceName());
+  DLOGF("  Humedad      : %s\n", aht20_ok ? "[AHT20/21]" : "[SIM]");
+  DLOGF("  Presion atm  : %s%s\n",
+    bmp_pressure_ok ? "[BMP280]" : "",
+    !bmp_pressure_ok ? "[SIM]"   : "");
+  DLOGF("  -> Usando    : %s\n", pressureSourceName());
+  DLOGF("  Corriente    : %s\n", ina219_ok ? "[INA219]" : "[no]");
+#endif
+  DLOGF("  Presion tubo : %s\n", xdb401_ok ? "[XDB401]" : "[SIM]");
+  DLOGF("  Calidad aire : %s\n", ens160_ok ? "[ENS160]" : "[no detectado]");
+  DLOGLN("===========================\n");
 
 #ifdef HAS_DISPLAY
   drawBootScreen("Conectando WiFi...");

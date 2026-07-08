@@ -479,6 +479,32 @@ void readSlowSensors(unsigned long now) {
 #  endif
 #endif
 
+  // ── ENS160 — calidad de aire (todos los perfiles, detección en runtime) ──────
+  if (!ens160_ok && now >= ens160_retry_at) {
+    ens160_ok = ens160_begin();
+    if (ens160_ok) {
+      sensorRecoveryMarkSuccess(ens160_recovery_failures, ens160_retry_at);
+      DLOGLN("[ENS160] Reconectado tras fallo");
+    } else {
+      sensorRecoveryMarkFailure("ENS160", ens160_recovery_failures, ens160_retry_at);
+    }
+  }
+  if (ens160_ok) {
+    // Compensación con valores de T/HR actuales (mejora precisión interna)
+    ens160_set_compensation(temperatureMCP, humidity);
+    uint8_t  aqi  = 0;
+    uint16_t tvoc = 0, eco2 = 0;
+    if (ens160_read(aqi, tvoc, eco2)) {
+      ens160Aqi  = aqi;
+      ens160Tvoc = tvoc;
+      ens160Eco2 = eco2;
+      DLOGF("[ENS160] AQI:%d  TVOC:%d ppb  eCO2:%d ppm\n", aqi, tvoc, eco2);
+    } else {
+      ens160_ok = false;
+      DLOGLN("[ENS160] Fallo en lectura — reintentando en proximo ciclo");
+    }
+  }
+
   updateSimulatedValues();
   if (strcmp(pipelineMode, "sim") == 0) updatePipelineValues();
 
@@ -542,6 +568,9 @@ void readSlowSensors(unsigned long now) {
     snap.flowLeakL    = 0.0f;
 #endif
     snap.xdb401Temp    = xdb401Temperature;
+    snap.ensAqi        = ens160_ok ? ens160Aqi  : 0;
+    snap.ensTvoc       = ens160_ok ? ens160Tvoc : 0;
+    snap.ensEco2       = ens160_ok ? ens160Eco2 : 0;
     snap.relayMask     = 0;
     if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       for (int i = 0; i < RELAY_COUNT; i++)
