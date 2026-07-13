@@ -129,6 +129,7 @@ static const char* temperatureSourceName() {
   if (bmp_temp_ok) return "BMP280";
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
   if (hdc_ok) return "HDC1080";
+  if (aht20_ok) return "AHT21";
   if (bmp_temp_ok) return "BMP280";
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
   if (aht20_ok) return "AHT20";

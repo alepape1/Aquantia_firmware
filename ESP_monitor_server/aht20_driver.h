@@ -4,7 +4,8 @@
 // Dirección 0x38. Driver directo via Wire, sin librería externa.
 // =============================================================================
 
-#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE \
+ || DEVICE_PROFILE == PROFILE_AQUALEAK
 
 #define AHT20_ADDR      0x38
 #define AHT20_CMD_INIT  0xBE
@@ -78,4 +79,4 @@ static float aht20_readHum() {
   return h;
 }
 
-#endif  // PROFILE_IRRIGATION || PROFILE_AQUA_SMART_REMOTE
+#endif  // PROFILE_IRRIGATION || PROFILE_AQUA_SMART_REMOTE || PROFILE_AQUALEAK

@@ -200,9 +200,28 @@ void readSlowSensors(unsigned long now) {
     }
   }
   if (!hdc_ok) {
-    if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
-    else             { temperatureMCP = sim_tempMCP;    temp_ok = false; }
-    humidity = sim_humidity;
+    // AHT21 fallback — recovery igual que el resto de sensores
+    if (!aht20_ok && now >= aht20_retry_at) {
+      aht20_ok = aht20_begin();
+      if (aht20_ok) sensorRecoveryMarkSuccess(aht20_recovery_failures, aht20_retry_at);
+      else          sensorRecoveryMarkFailure("AHT21", aht20_recovery_failures, aht20_retry_at);
+    }
+    if (aht20_ok) {
+      float t = NAN, h = NAN;
+      if (aht20_read(t, h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+      } else {
+        aht20_ok = false;
+        DLOGLN("AHT21 fallo en lectura");
+      }
+    }
+    if (!aht20_ok) {
+      if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+      else             { temperatureMCP = sim_tempMCP;    temp_ok = false; }
+      humidity = sim_humidity;
+    }
   }
 
   bar_ok = false;

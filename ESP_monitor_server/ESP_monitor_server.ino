@@ -145,6 +145,7 @@
   #include <BH1750.h>
   #include <SparkFun_Qwiic_Power_Switch_Arduino_Library.h>
   #include <SparkFun_MicroPressure.h>
+  #include "aht20_driver.h"   // AHT21 — fallback T+RH si HDC1080 no presente (protocolo idéntico)
 #else
   // IRRIGATION: solo I2C básico (sin sensores meteo)
   #include <Wire.h>
@@ -379,6 +380,7 @@ bool dht_ok = false;
 static uint8_t bmp280_addr = 0x00;
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
 bool hdc_ok        = false;   // HDC1080 — temperatura y humedad primaria
+bool aht20_ok      = false;   // AHT21   — fallback T+RH si HDC1080 no detectado (0x38)
 bool bh1750_ok     = false;   // BH1750  — iluminancia
 bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
 static uint8_t bmp280_addr = 0x00;
@@ -428,9 +430,12 @@ static uint8_t       bh1750_recovery_failures = 0;
 static unsigned long bh1750_retry_at = 0;
 #endif
 
-#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE \
+ || DEVICE_PROFILE == PROFILE_AQUALEAK
 static uint8_t       aht20_recovery_failures = 0;
 static unsigned long aht20_retry_at = 0;
+#endif
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 static uint8_t       ina219_recovery_failures = 0;
 static unsigned long ina219_retry_at = 0;
 #endif
@@ -1097,9 +1102,24 @@ void setup() {
     }
   }
   if (!hdc_ok) {
-    DLOGLN("HDC1080 no detectado — modo simulacion");
-    temperatureMCP = sim_tempMCP;
-    humidity       = sim_humidity;
+    DLOGLN("HDC1080 no detectado — probando AHT21 en 0x38");
+    aht20_ok = aht20_begin();
+    if (aht20_ok) {
+      float t = NAN, h = NAN;
+      if (aht20_read(t, h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+        DLOGF("AHT21 OK — T:%.1f C  H:%.1f %%\n", t, h);
+      } else {
+        aht20_ok = false;
+      }
+    }
+    if (!aht20_ok) {
+      DLOGLN("AHT21 no detectado — modo simulacion");
+      temperatureMCP = sim_tempMCP;
+      humidity       = sim_humidity;
+    }
   }
 
   // BH1750 — iluminancia
@@ -1277,12 +1297,13 @@ void setup() {
     (!micropressure_ok && !bmp_pressure_ok) ? "[SIM]" : "");
   DLOGF("  -> Usando    : %s\n", pressureSourceName());
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
-  DLOGF("  Temperatura  : %s%s\n",
+  DLOGF("  Temperatura  : %s%s%s\n",
     hdc_ok      ? "[HDC1080] " : "",
+    aht20_ok    ? "[AHT21]   " : "",
     bmp_temp_ok ? "[BMP280]  " : "");
-  if (!hdc_ok && !bmp_temp_ok) DLOGLN("  Temperatura  : [SIM]");
+  if (!hdc_ok && !aht20_ok && !bmp_temp_ok) DLOGLN("  Temperatura  : [SIM]");
   DLOGF("  -> Usando    : %s\n", temperatureSourceName());
-  DLOGF("  Humedad      : %s\n", hdc_ok ? "[HDC1080]" : "[SIM]");
+  DLOGF("  Humedad      : %s\n", hdc_ok ? "[HDC1080]" : aht20_ok ? "[AHT21]" : "[SIM]");
   DLOGF("  Presion atm  : %s%s%s\n",
     micropressure_ok ? "[MicroPressure] " : "",
     bmp_pressure_ok  ? "[BMP280] "        : "",
@@ -1551,8 +1572,9 @@ void setup() {
   DLOGF("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
   DLOGF("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
-  DLOGF("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
-  DLOGF("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] HDC1080  : %s\n", hdc_ok    ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] AHT21    : %s\n", aht20_ok  ? "REAL (fallback T+RH)" : (hdc_ok ? "no usado" : "SIM (sin sensor)"));
+  DLOGF("[TEST] BH1750   : %s\n", bh1750_ok ? "REAL" : "SIM (sin sensor)");
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   DLOGF("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
@@ -1772,7 +1794,7 @@ void loop() {
     if (!bar_ok)          DLOGLN("[WARN  ] Barometro: SIM (sin sensor real)");
     if (!htu_ok)          DLOGLN("[WARN  ] HTU2x: SIM (sin sensor real)");
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
-    if (!hdc_ok)          DLOGLN("[WARN  ] HDC1080: SIM (sin sensor real)");
+    if (!hdc_ok && !aht20_ok) DLOGLN("[WARN  ] HDC1080/AHT21: SIM (sin sensor T+RH real)");
     if (!bmp_ok)          DLOGLN("[WARN  ] BMP280: SIM (sin sensor real)");
     if (!bh1750_ok)       DLOGLN("[WARN  ] BH1750: SIM (sin sensor real)");
 #endif
