@@ -37,13 +37,15 @@
 
 // ── Plataforma: ESP32 ─────────────────────────────────────────────────────────
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  // AQUA_SMART_REMOTE usa conectividad celular — sin WiFi.
-  // SIM7000SSL no se usa: el stack SSL hardware del R1529 no soporta authmode/cacert.
+  // AQUA_SMART_REMOTE: conectividad celular primaria (SIM7000G + BearSSL).
   // TLS lo gestiona el ESP32 (BearSSL via SSLClient) sobre TCP plano.
+  // WiFi incluido para fallback cuando SIM no disponible.
   #define TINY_GSM_MODEM_SIM7000
   #include <TinyGsmClient.h>
   #include <SSLClient.h>
   #include "trust_anchors.h"
+  #include <WiFi.h>
+  #include <WiFiClientSecure.h>
 #else
   #include "WiFi.h"
   #include <HTTPClient.h>
@@ -353,6 +355,9 @@ static TinyGsmClient  _gsmTCPBase (modemSIM, 1);  // canal independiente para SS
 // BearSSL en el ESP32: TLS gestionado por el MCU, no por el SIM7000G.
 // A0 = pin analógico flotante para semilla de entropía.
 static SSLClient      gsmTLSClient(_gsmTCPBase, TAs, TAs_NUM, A0);
+// WiFi fallback — clientes usados cuando SIM no disponible
+static WiFiClient       asr_wifiFallbackClient;
+static WiFiClientSecure asr_wifiFallbackTLSClient;
 // ── Cache de estado GSM para lectura segura desde Core 1 ─────────────────────
 // TinyGSM NO es thread-safe: NUNCA llamar a modemSIM.* desde loop() (Core 1)
 // mientras NetworkTask (Core 0) pueda estar usando Serial1.

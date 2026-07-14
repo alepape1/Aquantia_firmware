@@ -3,6 +3,11 @@
 // Requiere: todos los globales de sensores, relays, MQTT, GSM/WiFi declarados en .ino.
 #pragma once
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+// true cuando WiFi es el transporte activo por fallo de SIM (Core 0 only — sin mutex).
+static bool _wifiFallbackActive = false;
+#endif
+
 // Captura atómica de sensores para telemetría.
 // Core 1 construye el snapshot y lo publica en telemetryQueue.
 // Core 0 solo lo lee aquí — sin bloqueo, sin mutex, sin latencia.
@@ -12,7 +17,7 @@ void takeSnapshot() {
   }
   _netSnap.heap   = (long)ESP.getFreeHeap();
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  _netSnap.rssi   = modemSIM.getSignalQuality();
+  _netSnap.rssi   = _wifiFallbackActive ? (int)WiFi.RSSI() : (int)modemSIM.getSignalQuality();
 #else
   _netSnap.rssi   = WiFi.RSSI();
 #endif
@@ -75,6 +80,37 @@ void networkTask(void* pvParameters) {
   mqttClient.setBufferSize(2048);
 #endif
 
+#if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE && defined(DEV_MODE)
+  // DEV_MODE: WiFi primario con WIFI_SSID/WIFI_PASSWORD de secrets.h.
+  // Permite desarrollar sin depender de la SIM. Si no hay WiFi, el
+  // dispositivo cae a SIM normalmente.
+  DLOGLN("[NET] DEV_MODE ASR: probando WiFi primario (" WIFI_SSID ")...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_18_5dBm);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  {
+    unsigned long _wifiDevT0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - _wifiDevT0 < 15000UL) {
+      esp_task_wdt_reset();
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    DLOGF("[NET] WiFi DEV activo — IP: %s\n", WiFi.localIP().toString().c_str());
+    _wifiFallbackActive = true;
+    if (mqtt_port == 8883) {
+      asr_wifiFallbackTLSClient.setCACert(MQTT_CA_CERT_PEM);
+      mqttClient.setClient(asr_wifiFallbackTLSClient);
+    } else {
+      mqttClient.setClient(asr_wifiFallbackClient);
+    }
+  } else {
+    DLOGLN("[NET] WiFi DEV no disponible — usando SIM");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+#endif
+
   for (;;) {
     wdt_heartbeat("NetworkTask");
     esp_task_wdt_reset();
@@ -87,71 +123,168 @@ void networkTask(void* pvParameters) {
 #endif
 
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-    // ── Conectividad celular — SIM data-only (Onomondo) ─────────────────────
+    // ── Conectividad — SIM primario, WiFi como fallback ──────────────────────
     static unsigned long _lastCellPollMs = 0;
-    bool doCellPoll = (millis() - _lastCellPollMs >= 2000UL) || !_gprsConnectedFlag;
-    if (doCellPoll) {
-      _lastCellPollMs = millis();
+    static unsigned long _lastSimCheckMs = 0;   // comprobación periódica de recuperación SIM
 
-      if (!modemSIM.testAT()) {
-        wdt_heartbeat("NetworkTask", "gsm_at_check");
-        setLedState(LED_WIFI_CONNECTING);
-        wifiFailCount++;
-        _gprsConnectedFlag = false;
-        _simCsqCache = 0;
-        DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
-        if (wifiFailCount >= 30) {
-          DLOGLN("[SIM] 30 fallos AT consecutivos — reiniciando ESP");
-          esp_restart();
-        }
+    if (_wifiFallbackActive) {
+      // ── Modo WiFi fallback ──────────────────────────────────────────────────
+      if (WiFi.status() != WL_CONNECTED) {
+#ifdef DEV_MODE
+        // DEV_MODE: WiFi es primario — reconectar sin caer a SIM.
+        DLOGLN("[NET] WiFi DEV caído — reconectando en 5 s...");
+        mqttClient.disconnect();
+        WiFi.reconnect();
         vTaskDelay(pdMS_TO_TICKS(5000));
         continue;
+#else
+        DLOGLN("[NET] WiFi fallback caído — volviendo a modo SIM");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        _wifiFallbackActive = false;
+        _lastCellPollMs     = 0;
+        if (mqtt_port == 8883) { prepareGsmTLSClient(); mqttClient.setClient(gsmTLSClient); }
+        else                   { mqttClient.setClient(gsmTCPClient); }
+        mqttClient.disconnect();
+        continue;
+#endif
       }
-
-      _gprsConnectedFlag = modemSIM.isGprsConnected();
-      if (!_gprsConnectedFlag) {
-        wdt_heartbeat("NetworkTask", "gprs_connect");
-        setLedState(LED_WIFI_CONNECTING);
-        wifiFailCount++;
-        int csq  = modemSIM.getSignalQuality();
-        int creg = modemSIM.getRegistrationStatus();
-        _simCsqCache = csq;
-        DLOGF("[SIM] GPRS inactivo — CSQ:%d  CREG:%d  failCount:%d  APN:%s\n",
-              csq, creg, wifiFailCount, GSM_APN);
-        if (wifiFailCount >= 60) {
-          DLOGLN("[SIM] 60 fallos consecutivos sin GPRS — reiniciando ESP");
-          esp_restart();
+      // Intentar recuperar SIM cada 5 minutos (solo producción; DEV_MODE usa WiFi como primario)
+#ifndef DEV_MODE
+      if (millis() - _lastSimCheckMs >= 300000UL) {
+        _lastSimCheckMs = millis();
+        DLOGLN("[NET] Comprobando recuperación SIM (modo WiFi fallback)...");
+        if (modemSIM.testAT()) {
+          bool gprsOk = modemSIM.isGprsConnected();
+          if (!gprsOk) gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
+          if (gprsOk) {
+            DLOGLN("[SIM] SIM recuperado — desactivando WiFi fallback");
+            _wifiFallbackActive  = false;
+            _gprsConnectedFlag   = true;
+            _simCsqCache         = modemSIM.getSignalQuality();
+            wifiFailCount        = 0;
+            wifiRetryDelayMs     = 500;
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            if (mqtt_port == 8883) { prepareGsmTLSClient(); mqttClient.setClient(gsmTLSClient); }
+            else                   { mqttClient.setClient(gsmTCPClient); }
+            mqttClient.disconnect();
+          } else {
+            DLOGLN("[NET] SIM no disponible — manteniendo WiFi fallback");
+          }
+        } else {
+          DLOGLN("[NET] Modem sin respuesta — manteniendo WiFi fallback");
         }
-        bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
-        _gprsConnectedFlag = gprsOk;
-        _simCsqCache = modemSIM.getSignalQuality();
-      #ifdef USE_MQTT
-        if (gprsOk) mqttConnectFails = 0;
-      #endif
-        DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
-              gprsOk ? "OK" : "FAIL", _simCsqCache);
-        if (!gprsOk) {
-          vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
-          if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
+      }
+#endif  // !DEV_MODE
+
+    } else {
+      // ── Modo SIM normal ─────────────────────────────────────────────────────
+      bool doCellPoll = (millis() - _lastCellPollMs >= 2000UL) || !_gprsConnectedFlag;
+      if (doCellPoll) {
+        _lastCellPollMs = millis();
+
+        if (!modemSIM.testAT()) {
+          wdt_heartbeat("NetworkTask", "gsm_at_check");
+          setLedState(LED_WIFI_CONNECTING);
+          wifiFailCount++;
+          _gprsConnectedFlag = false;
+          _simCsqCache = 0;
+          DLOGF("[SIM] Modem no responde a AT — failCount:%d\n", wifiFailCount);
+          if (wifiFailCount >= 10) {
+            DLOGLN("[SIM] 10 fallos AT consecutivos — reiniciando ESP");
+            esp_restart();
+          }
+          vTaskDelay(pdMS_TO_TICKS(5000));
           continue;
         }
-        DLOGF("[SIM] GPRS reconectado — IP: %s\n", modemSIM.localIP().toString().c_str());
-      } else {
-        _simCsqCache = modemSIM.getSignalQuality();
+
+        _gprsConnectedFlag = modemSIM.isGprsConnected();
+        if (!_gprsConnectedFlag) {
+          wdt_heartbeat("NetworkTask", "gprs_connect");
+          setLedState(LED_WIFI_CONNECTING);
+          wifiFailCount++;
+          int csq  = modemSIM.getSignalQuality();
+          int creg = modemSIM.getRegistrationStatus();
+          _simCsqCache = csq;
+          DLOGF("[SIM] GPRS inactivo — CSQ:%d  CREG:%d  failCount:%d  APN:%s\n",
+                csq, creg, wifiFailCount, GSM_APN);
+
+#ifndef DEV_MODE
+          // Intentar WiFi fallback tras 5 fallos consecutivos de GPRS.
+          // Cada ciclo de fallo tarda ~60-90s (gprsConnect timeout + backoff),
+          // así que 5 fallos ≈ 5-8 min. prov_ssid solo existe fuera de DEV_MODE.
+          if (wifiFailCount == 5 && strlen(prov_ssid) > 0) {
+            DLOGF("[NET] %d fallos GPRS — intentando WiFi fallback (%s)...\n",
+                  wifiFailCount, prov_ssid);
+            WiFi.mode(WIFI_STA);
+            WiFi.setTxPower(WIFI_POWER_18_5dBm);
+            WiFi.begin(prov_ssid, prov_password);
+            unsigned long _wt0 = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - _wt0 < 15000UL) {
+              esp_task_wdt_reset();
+              vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+              DLOGF("[NET] WiFi fallback activo — IP: %s\n",
+                    WiFi.localIP().toString().c_str());
+              _wifiFallbackActive = true;
+              wifiFailCount       = 0;
+              wifiRetryDelayMs    = 500;
+              _lastSimCheckMs     = millis();
+              if (mqtt_port == 8883) {
+                asr_wifiFallbackTLSClient.setCACert(MQTT_CA_CERT_PEM);
+                mqttClient.setClient(asr_wifiFallbackTLSClient);
+              } else {
+                mqttClient.setClient(asr_wifiFallbackClient);
+              }
+              mqttClient.disconnect();
+            } else {
+              DLOGLN("[NET] WiFi fallback FAIL — red WiFi no disponible");
+              WiFi.disconnect(true);
+              WiFi.mode(WIFI_OFF);
+            }
+          }
+#endif  // !DEV_MODE
+
+          if (wifiFailCount >= 15) {
+            DLOGLN("[SIM] 15 fallos consecutivos sin GPRS ni WiFi — reiniciando ESP");
+            esp_restart();
+          }
+
+          if (!_wifiFallbackActive) {
+            bool gprsOk = modemSIM.gprsConnect(GSM_APN, GSM_USER, GSM_PASS);
+            _gprsConnectedFlag = gprsOk;
+            _simCsqCache = modemSIM.getSignalQuality();
+          #ifdef USE_MQTT
+            if (gprsOk) mqttConnectFails = 0;
+          #endif
+            DLOGF("[SIM] gprsConnect → %s  CSQ:%d\n",
+                  gprsOk ? "OK" : "FAIL", _simCsqCache);
+            if (!gprsOk) {
+              vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+              if (wifiRetryDelayMs < 30000) wifiRetryDelayMs = min(wifiRetryDelayMs * 2UL, 30000UL);
+              continue;
+            }
+            DLOGF("[SIM] GPRS reconectado — IP: %s\n", modemSIM.localIP().toString().c_str());
+          }
+        } else {
+          _simCsqCache = modemSIM.getSignalQuality();
+        }
       }
-    }
 #ifdef DEBUG_MODE
-    static unsigned long _lastGprsReport = 0;
-    if (_gprsConnectedFlag && millis() - _lastGprsReport >= 30000) {
-      _lastGprsReport = millis();
-      DLOGF("[SIM] GPRS OK — IP:%s  CSQ:%d  Op:%s\n",
-            modemSIM.localIP().toString().c_str(),
-            _simCsqCache,
-            modemSIM.getOperator().c_str());
-    }
+      static unsigned long _lastGprsReport = 0;
+      if (_gprsConnectedFlag && millis() - _lastGprsReport >= 30000) {
+        _lastGprsReport = millis();
+        DLOGF("[SIM] GPRS OK — IP:%s  CSQ:%d  Op:%s\n",
+              modemSIM.localIP().toString().c_str(),
+              _simCsqCache,
+              modemSIM.getOperator().c_str());
+      }
 #endif
-    wifiFailCount = 0;
-    wifiRetryDelayMs = 500;
+      wifiFailCount = 0;
+      wifiRetryDelayMs = 500;
+    }
 #else
     // ── Conectividad WiFi ───────────────────────────────────────────────────
     if (WiFi.status() != WL_CONNECTED) {
@@ -197,6 +330,13 @@ void networkTask(void* pvParameters) {
       configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
       lastNtpRetry = now;
     }
+#elif DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+    if (_wifiFallbackActive && time(nullptr) < 1000000000L
+        && (now - lastNtpRetry > 60000 || lastNtpRetry == 0)) {
+      DLOGLN("[NTP] WiFi fallback — sincronizando NTP...");
+      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+      lastNtpRetry = now;
+    }
 #endif
 #endif
 
@@ -223,7 +363,10 @@ void networkTask(void* pvParameters) {
   #endif
 #endif
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  if (mqtt_port == 8883) prepareGsmTLSClient();
+      if (mqtt_port == 8883) {
+        if (_wifiFallbackActive) asr_wifiFallbackTLSClient.setCACert(MQTT_CA_CERT_PEM);
+        else                     prepareGsmTLSClient();
+      }
 #else
       if (mqtt_port == 8883) prepareSecureClient(mqttTLSClient, 10000);
 #endif

@@ -32,7 +32,8 @@ Eres un agente especialista en firmware ESP32 para Aquantia. Prioriza cambios pe
 - **Buffer MQTT `2048` B**: reduce riesgo de truncado en payloads completos.
 - **BearSSL/SNI en SIM7000G**: client TLS preparado en cada intento de conexión (no solo una vez); timeout TLS 75 s; refresh PDP tras timeout.
 - **Auto AP mode tras fallo prolongado de WiFi** (`provisioning.h`, `network_task.h`): tras 60 reintentos fallidos (~30 min), se activa un flag en RTC RAM y el siguiente boot abre el portal SoftAP (`Aquantia-XXXXXX`) sin borrar credenciales. El usuario puede actualizar el SSID/contraseña si el router cambió, o cerrar el portal si era una caída temporal. Solo producción.
-- **Comando MQTT `update_wifi`** (`mqtt_helpers.h`): `{"cmd":"update_wifi","ssid":"X","password":"Y"}` actualiza credenciales WiFi en NVS remotamente (enviar antes de cambiar el router para cero downtime). Solo perfiles WiFi y producción.
+- **Comando MQTT `update_wifi`** (`mqtt_helpers.h`): `{"cmd":"update_wifi","ssid":"X","password":"Y"}` actualiza credenciales WiFi en NVS remotamente (enviar antes de cambiar el router para cero downtime). Perfiles WiFi y también `AQUA_SMART_REMOTE` (preconfigurar SSID/password de fallback mientras SIM sigue activa). Solo producción (`!DEV_MODE`).
+- **WiFi fallback en AQUA_SMART_REMOTE** (`network_task.h`): tras 5 intentos fallidos de GPRS (~5-8 min reales — cada ciclo bloquea ~60-90 s en `gprsConnect()` + backoff), el dispositivo intenta WiFi usando `prov_ssid`/`prov_password` de NVS. Si conecta, MQTT sigue funcionando por WiFi; cada 5 min se comprueba si SIM se recupera y vuelve automáticamente a celular. Reinicio a los 15 fallos acumulados (GPRS+WiFi). Fallos AT del modem reinician a los 10. Solo producción (`#ifndef DEV_MODE` — `prov_ssid` no existe en `DEV_MODE`).
 - **`provisioning_clear_wifi()`** (`provisioning.h`): borra solo `ssid`/`password` del NVS, preserva `mqtt_token`.
 
 ## Arquitectura del firmware
@@ -350,6 +351,12 @@ Cuando el usuario cambia el router (SSID o contraseña), hay dos flujos de recup
 - Preparar cliente TLS del modem en **cada** intento de conexión, no solo una vez.
 - Si hay fallo de PDP, esperar refresh antes de reintentar GPRS.
 - Contrastar contexto SSL `0/1` en logs para diferenciar fallo TLS de fallo TCP.
+- **WiFi fallback**: `wifiFailCount` mezcla fallos AT y GPRS. Thresholds actuales:
+  - AT sin respuesta → restart a los **10** fallos (~60 s de `testAT()` + delay 5 s)
+  - GPRS inactivo → WiFi fallback en `== 5`, restart total en `>= 15`
+  - Cada ciclo GPRS falla en ~60-90 s (`gprsConnect()` timeout de TinyGSM + backoff)
+  - El bloque de fallback usa `prov_ssid`/`prov_password` que solo existen `#ifndef DEV_MODE`
+- Para preconfigurar WiFi de fallback en campo: `{"cmd":"update_wifi","ssid":"X","password":"Y"}` mientras SIM está activa.
 
 ### Soil Sensor / SoilProvisioner
 - Si el sensor no responde, usar `{"cmd": "provision_soil"}` vía MQTT o botón en Flash Tool para ejecutar `soilBusProvision()` y reasignar dirección Modbus.

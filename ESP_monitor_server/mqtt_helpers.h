@@ -127,10 +127,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 #endif
 
-#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE && !defined(DEV_MODE)
+#ifndef DEV_MODE
   // Comando: {"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}
-  // Enviar ANTES de cambiar el router para cero downtime; si ya se perdió la
-  // conexión, usar el portal SoftAP (Aquantia-XXXXXX) que aparece tras ~30 min.
+  // En perfiles WiFi: enviar antes de cambiar router (cero downtime) o usar portal SoftAP.
+  // En AQUA_SMART_REMOTE: preconfigurar credenciales WiFi para fallback cuando SIM falle.
   {
     const char* wifiCmd = doc["cmd"] | "";
     if (strcmp(wifiCmd, "update_wifi") == 0) {
@@ -231,8 +231,13 @@ void mqttPublishRegister() {
   doc["device_serial"]    = device_serial_get();   // AQ-{MAC} — identidad hardware
   doc["mac_address"]      = getDeviceMacAddress(); // "FC:B4:67:F3:77:48" — mismo en WiFi y cellular
 #if DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
-  doc["ip_address"]       = modemSIM.localIP().toString();
-  doc["network"]          = "cellular";
+  if (WiFi.status() == WL_CONNECTED && !_gprsConnectedFlag) {
+    doc["ip_address"] = WiFi.localIP().toString();
+    doc["network"]    = "wifi_fallback";
+  } else {
+    doc["ip_address"] = modemSIM.localIP().toString();
+    doc["network"]    = "cellular";
+  }
 #else
   doc["ip_address"]       = WiFi.localIP().toString();
 #endif

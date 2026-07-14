@@ -41,7 +41,24 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
   router — cero downtime, sin acceso físico al dispositivo.
   Payload: `{"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}`.
   Respuesta: alerta MQTT `{"event":"wifi_updated","ssid":"NuevoSSID"}` + restart.
-  Solo activo en perfiles WiFi y modo producción (`!PROFILE_AQUA_SMART_REMOTE && !DEV_MODE`).
+  Habilitado ahora también en `PROFILE_AQUA_SMART_REMOTE` para preconfigurar el SSID/password
+  de fallback WiFi mientras la SIM sigue activa.
+  Solo activo en modo producción (`!DEV_MODE`).
+
+- **WiFi fallback en AQUA_SMART_REMOTE** (`ESP_monitor_server.ino`, `network_task.h`, `mqtt_helpers.h`):
+  si el dispositivo no consigue GPRS tras **5 intentos consecutivos fallidos** (~5-8 min reales,
+  ya que cada ciclo de fallo bloquea ~60-90 s en `gprsConnect()` más el backoff exponencial),
+  intenta conectarse por WiFi usando las credenciales almacenadas en NVS (`prov_ssid`/`prov_password`).
+  Si WiFi conecta, el broker MQTT se alcanza por WiFi hasta que SIM vuelva a estar disponible.
+  Cada 5 minutos en modo fallback se comprueba si SIM se recupera; si GPRS vuelve, el dispositivo
+  regresa a SIM automáticamente y desconecta WiFi para ahorrar energía.
+  El campo `rssi` en telemetría reporta RSSI WiFi mientras el fallback está activo.
+  El payload `register` incluye `"network":"wifi_fallback"` y la IP WiFi.
+  Si WiFi tampoco está disponible, se reinicia el ESP a los 15 fallos acumulados.
+  Fallos de respuesta AT del modem (`testAT()` sin respuesta) reinician a los 10 fallos (~60 s).
+  Requisito: credenciales WiFi deben estar en NVS (flasheadas en fábrica o via `update_wifi` MQTT).
+  Solo activo en modo producción (`#ifndef DEV_MODE`): `prov_ssid`/`prov_password` no se declaran
+  en `DEV_MODE`, por lo que el bloque de fallback está protegido con el mismo guard.
 
 - **`provisioning_clear_wifi()`** (`provisioning.h`):
   borra únicamente las claves `ssid`/`password` del NVS preservando `mqtt_token`. Permite
