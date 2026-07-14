@@ -456,7 +456,7 @@ Primera versión operativa con FreeRTOS. Incluida en `v0.1.0-beta.1`.
 
 ---
 
-[v0.1.0]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0
-[v0.1.0-beta.3]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.3
-[v0.1.0-beta.2]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.2
-[v0.1.0-beta.1]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.1
+[v0.1.0]: https://github.com/alepape1/Aquantia_firmware/releases/tag/v0.1.0
+[v0.1.0-beta.3]: https://github.com/alepape1/Aquantia_firmware/releases/tag/v0.1.0-beta.3
+[v0.1.0-beta.2]: https://github.com/alepape1/Aquantia_firmware/releases/tag/v0.1.0-beta.2
+[v0.1.0-beta.1]: https://github.com/alepape1/Aquantia_firmware/releases/tag/v0.1.0-beta.1
