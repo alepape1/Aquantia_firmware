@@ -71,6 +71,36 @@ void updatePipelineSimValues() {
   }
 }
 
+// ── Helper XDB401: reintentos + lectura con gestión de fallos ─────────────────
+// Centraliza la lógica duplicada de reconexión y lectura del sensor de presión.
+// Siempre asigna pressureBar: NAN si falla, valor real si tiene éxito.
+static void readXDB401Safe(float& pressureBar) {
+  pressureBar = NAN;
+  if (!xdb401_ok && millis() >= xdb401_retry_at) {
+    if (xdb401_begin()) {
+      float _p0, _t0;
+      if (xdb401_read(_p0, _t0)) {
+        xdb401_ok = true; xdb401_failures = 0; xdb401_recovery_failures = 0;
+        pressureBar = _p0; xdb401Temperature = _t0;
+        DLOGLN("[XDB401] Reconectado tras fallo");
+      }
+    }
+    if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
+  }
+  if (xdb401_ok) {
+    float p, tc;
+    if (xdb401_read(p, tc)) {
+      pressureBar = p; xdb401Temperature = tc;
+      xdb401_failures = 0; xdb401_recovery_failures = 0;
+    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
+      xdb401_ok       = false;
+      xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
+      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
+            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
+    }
+  }
+}
+
 // ── Lectura de sensores reales de tubería ─────────────────────────────────────
 static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
 #if defined(FLOW_PIN)
@@ -80,31 +110,20 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   if (dt < 500000UL) {
     // Intervalo demasiado corto para recalcular caudal — reutilizar último valor.
     // Pero SÍ leemos el XDB401: presión y caudal son independientes.
+    //
+    // Guarda contra caudal fantasma: si el flujo se detuvo bruscamente, _flowLpm
+    // seguiría siendo positivo durante hasta 500 ms. Si no llegó ningún pulso en
+    // el intervalo actual Y ese intervalo supera 2 períodos esperados al caudal
+    // actual, forzamos cero para reflejar la parada inmediatamente.
+    if (_flowLpm > 0.0f) {
+      noInterrupts();
+      uint32_t _peekCount = _flowPulseCount;
+      interrupts();
+      float _twoPeriodsUs = 2.0f * 60.0e6f / (_flowLpm * (float)FLOW_K_FACTOR);
+      if (_peekCount == 0 && (float)dt >= _twoPeriodsUs) _flowLpm = 0.0f;
+    }
     flowLpm = _flowLpm;
-    pressureBar = NAN;
-    if (!xdb401_ok && millis() >= xdb401_retry_at) {
-      if (xdb401_begin()) {
-        float _p0, _t0;
-        if (xdb401_read(_p0, _t0)) {
-          xdb401_ok = true; xdb401_failures = 0; xdb401_recovery_failures = 0;
-          pressureBar = _p0; xdb401Temperature = _t0;
-          DLOGLN("[XDB401] Reconectado tras fallo");
-        }
-      }
-      if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
-    }
-    if (xdb401_ok) {
-      float p, tc;
-      if (xdb401_read(p, tc)) {
-        pressureBar = p; xdb401Temperature = tc;
-        xdb401_failures = 0; xdb401_recovery_failures = 0;
-      } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
-        xdb401_ok       = false;
-        xdb401_retry_at = millis() + XDB401_RETRY_INTERVAL;
-        DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
-              (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
-      }
-    }
+    readXDB401Safe(pressureBar);
     return true;
   }
 
@@ -130,57 +149,14 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
   interrupts();
   g_flowSessionL = (_fTot - _fBase) / (float)FLOW_K_FACTOR;
 
-  pressureBar = NAN;
-  if (!xdb401_ok && millis() >= xdb401_retry_at) {
-    if (xdb401_begin()) {
-      float _p0, _t0;
-      if (xdb401_read(_p0, _t0)) {
-        xdb401_ok = true; xdb401_failures = 0; xdb401_recovery_failures = 0;
-        pressureBar = _p0; xdb401Temperature = _t0;
-        DLOGLN("[XDB401] Reconectado tras fallo");
-      }
-    }
-    if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
-  }
-  if (xdb401_ok) {
-    float p, tc;
-    if (xdb401_read(p, tc)) {
-      pressureBar = p; xdb401Temperature = tc;
-      xdb401_failures = 0; xdb401_recovery_failures = 0;
-    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
-      xdb401_ok        = false;
-      xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
-      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
-            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
-    }
-  }
+  readXDB401Safe(pressureBar);
   return true;
 #else
   // Sin caudalímetro: si hay XDB401 devolvemos presión real con caudal 0
-  if (!xdb401_ok && millis() >= xdb401_retry_at) {
-    if (xdb401_begin()) {
-      float _p0, _t0;
-      if (xdb401_read(_p0, _t0)) {
-        xdb401_ok = true; xdb401_failures = 0; xdb401_recovery_failures = 0;
-        pressureBar = _p0; xdb401Temperature = _t0;
-        DLOGLN("[XDB401] Reconectado tras fallo");
-        return true;
-      }
-    }
-    if (!xdb401_ok) xdb401_schedule_retry_after_recovery_fail();
-  }
-  if (xdb401_ok) {
-    float p, tc;
-    if (xdb401_read(p, tc)) {
-      pressureBar = p; xdb401Temperature = tc; flowLpm = 0.0f;
-      xdb401_failures = 0; xdb401_recovery_failures = 0;
-      return true;
-    } else if (++xdb401_failures >= XDB401_MAX_FAILURES) {
-      xdb401_ok        = false;
-      xdb401_retry_at  = millis() + XDB401_RETRY_INTERVAL;
-      DLOGF("[XDB401] %u fallos consecutivos — suspendido %lus\n",
-            (unsigned)XDB401_MAX_FAILURES, (unsigned long)XDB401_RETRY_INTERVAL / 1000);
-    }
+  readXDB401Safe(pressureBar);
+  if (!isnan(pressureBar)) {
+    flowLpm = 0.0f;
+    return true;
   }
   (void)pressureBar;
   (void)flowLpm;

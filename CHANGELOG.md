@@ -9,6 +9,101 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [Unreleased — feat/per-profile-device-ids]
+
+**Backend compatible:** `v0.1.0` o superior · **Rama:** `feat/per-profile-device-ids`
+
+### Added
+
+- **ENS160 + AHT21 — sensor de calidad de aire IAQ** (`ens160_driver.h`, `ESP_monitor_server.ino`,
+  `sensor_read.h`, `network_task.h`): integración del módulo ENS160+AHT21 disponible en AliExpress.
+  Detección automática en runtime en todos los perfiles (sin recompilación por perfil).
+  ENS160 se detecta por PART_ID en 0x52 o 0x53; AHT21 (0x38) es protocolo-compatible con el
+  driver AHT20 existente y se detecta automáticamente en perfiles IRRIGATION/AQUA_SMART_REMOTE.
+  Salidas publicadas en MQTT cuando el sensor está presente:
+  `ens160_aqi` (UBA 1-5), `ens160_tvoc` (ppb), `ens160_eco2` (ppm eq.).
+  La compensación de temperatura y humedad del ENS160 usa los valores actuales del sensor
+  primario de cada perfil (MCP9808/HTU2x, HDC1080, AHT20/21). Incluye log serial completo al
+  arranque con todos los sensores detectados por tipo (temperatura, humedad, presión, calidad
+  de aire, luz, corriente) y cuál será utilizado en cada categoría.
+
+- **Auto AP mode tras fallo prolongado de WiFi** (`provisioning.h`, `network_task.h`):
+  tras 60 reintentos consecutivos fallidos (~30 min con backoff), el dispositivo activa un
+  flag en RTC RAM (`_prov_ap_forced_flag`) y reinicia. En el siguiente boot, `setup()`
+  detecta el flag con `provisioning_check_ap_forced()` y lanza el portal SoftAP
+  (`Aquantia-XXXXXX`) sin borrar las credenciales. Permite al usuario actualizar el
+  SSID/contraseña si el router cambió, o simplemente cerrar el portal si era una caída
+  temporal. Antes del cambio, el dispositivo reiniciaba indefinidamente sin recuperación.
+  Solo activo en modo producción (`#ifndef DEV_MODE`).
+
+- **Comando MQTT `update_wifi`** (`mqtt_helpers.h`):
+  permite actualizar las credenciales WiFi remotamente desde la app antes de cambiar el
+  router — cero downtime, sin acceso físico al dispositivo.
+  Payload: `{"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}`.
+  Respuesta: alerta MQTT `{"event":"wifi_updated","ssid":"NuevoSSID"}` + restart.
+  Solo activo en perfiles WiFi y modo producción (`!PROFILE_AQUA_SMART_REMOTE && !DEV_MODE`).
+
+- **`provisioning_clear_wifi()`** (`provisioning.h`):
+  borra únicamente las claves `ssid`/`password` del NVS preservando `mqtt_token`. Permite
+  reset parcial de credenciales WiFi sin perder el token de autenticación MQTT de fábrica.
+
+### Fixed
+
+- **INA219 — voltaje y corriente nunca publicados**: el firmware calculaba correctamente
+  `inaVbus` e `inaCurrent` en el `TelemetrySnapshot` pero solo serializaba `ina219_power_mw`
+  en ambos payloads MQTT (WiFi completo y GSM slim). Las columnas `ina219_bus_voltage` y
+  `ina219_current_ma` siempre llegaban `NULL` al backend.
+  Ahora ambos campos se publican en todos los payloads:
+  - Full WiFi (`PROFILE_IRRIGATION`): `ina219_bus_voltage` (2 decimales, V) + `ina219_current_ma` (1 decimal, mA)
+  - GSM slim (`PROFILE_AQUA_SMART_REMOTE`): ídem
+
+- **Flow counters — `flow_session_l`, `flow_irrig_l`, `flow_leak_l` ausentes en payload WiFi**:
+  los tres contadores de caudal se calculaban correctamente en `sensor_read.h` y se almacenaban
+  en el snapshot, pero solo `flow_total_l` se añadía al JSON del payload WiFi completo.
+  Los tres campos nuevos llegan ahora al backend con precisión de 2 decimales (antes
+  `flow_total_l` usaba 1 decimal — uniformizado a 2).
+
+- **pH Halisense escala incorrecta**: el sensor devuelve el valor de pH ×100 (no ×10).
+  La división en `halisense_sensor.h` pasó de `reg[3] / 10.0f` a `reg[3] / 100.0f`.
+  Afecta a todos los perfiles que incluyen el sensor Halisense RS485.
+
+- **Baud rate sensor suelo YIERYI**: el sensor estaba configurado a 9600 baud pero opera
+  a 4800. `SoilSensor::begin()` por defecto pasó de `9600` a `4800`. Corregido también
+  en la llamada de `ESP_monitor_server.ino` para `PROFILE_IRRIGATION`.
+
+- **Ghost flow — `_flowLpm` no se zerificaba al parar el flujo**: si el flujo se detenía
+  bruscamente, `_flowLpm` permanecía positivo durante hasta 500 ms (hasta el siguiente
+  intervalo de cálculo). Ahora, si no llega ningún pulso en el intervalo actual Y ese
+  intervalo supera 2 periodos esperados al caudal previo, `_flowLpm` se fuerza a `0.0f`
+  inmediatamente (`pipeline_core.h`).
+
+- **Lectura de `_flowPulseTotal` en debug log sin protección ISR**: el log de depuración
+  leía la variable compartida con la ISR sin `noInterrupts`/`interrupts`. Corregido con
+  copia local protegida (`ESP_monitor_server.ino`).
+
+### Refactored
+
+- **`readXDB401Safe()` — lógica de reintentos XDB401 extraída a helper**: la misma
+  secuencia de reconexión y gestión de fallos del sensor XDB401 estaba duplicada 3 veces
+  en `readRealPipelineSensors`. Centralizada en `readXDB401Safe(float&)`. Sin cambio
+  de comportamiento en runtime.
+
+### Changed
+
+- **`StaticJsonDocument` GSM slim** (`PROFILE_AQUA_SMART_REMOTE`): aumentado de `<512>` a
+  `<640>` y `char buf[512]` a `char buf[640]` para acomodar los nuevos campos INA sin
+  riesgo de truncación.
+
+- **`char buf` WiFi completo**: aumentado de `char buf[1024]` a `char buf[1280]` por los
+  campos `flow_session_l`, `flow_irrig_l`, `flow_leak_l` e INA añadidos. El
+  `StaticJsonDocument<1024>` también aumentado a `<1280>`.
+
+- **`soil_baud_changer.ino` repropuesto**: la herramienta pasó de cambiar 9600→4800 a
+  cambiar 4800→9600 y reasignar la dirección Modbus de 0x01 a 0x03 en el mismo sketch
+  (útil para reprovisionamiento de sensores reconfigurados).
+
+---
+
 ## [Unreleased — refactor/modularize-ino]
 
 **Backend compatible:** `v0.1.0` o superior · **Rama:** `refactor/modularize-ino`

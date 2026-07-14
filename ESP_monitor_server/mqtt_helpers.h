@@ -111,6 +111,41 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     mqttPublishAlert("flow_counters_reset", "info", "Contadores de flujo reseteados");
   }
 #endif
+
+#if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
+ || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  const char* soilCmd = doc["cmd"] | "";
+  if (strcmp(soilCmd, "provision_soil") == 0) {
+    DLOGLN("[SOIL-BUS] Provisioning iniciado por MQTT");
+    uint8_t newAddr = soilBusProvision(soilSensor);
+    char msg[64];
+    if (newAddr > 0)
+      snprintf(msg, sizeof(msg), "Sensor suelo asignado a dir 0x%02X", newAddr);
+    else
+      strlcpy(msg, "Provisioning fallido — ver Serial", sizeof(msg));
+    mqttPublishAlert("soil_provisioned", newAddr > 0 ? "info" : "warning", msg);
+  }
+#endif
+
+#if DEVICE_PROFILE != PROFILE_AQUA_SMART_REMOTE && !defined(DEV_MODE)
+  // Comando: {"cmd":"update_wifi","ssid":"NuevoSSID","password":"NuevoPass"}
+  // Enviar ANTES de cambiar el router para cero downtime; si ya se perdió la
+  // conexión, usar el portal SoftAP (Aquantia-XXXXXX) que aparece tras ~30 min.
+  {
+    const char* wifiCmd = doc["cmd"] | "";
+    if (strcmp(wifiCmd, "update_wifi") == 0) {
+      const char* newSsid = doc["ssid"] | "";
+      const char* newPass = doc["password"] | "";
+      if (strlen(newSsid) > 0 && strlen(newSsid) < sizeof(prov_ssid)) {
+        provisioning_save(newSsid, newPass);
+        DLOGF("[PROV] WiFi actualizado por MQTT: ssid=%s\n", newSsid);
+        mqttPublishAlert("wifi_updated", "info", newSsid);
+        delay(500);
+        ESP.restart();
+      }
+    }
+  }
+#endif
 }
 
 // Conectar al broker y suscribirse al topic de comandos
@@ -150,7 +185,10 @@ bool mqttConnect() {
   mqttClient.setSocketTimeout(30);
 #endif
 
-  bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
+  // cleanSession=false: el broker encola mensajes QoS 1 mientras el dispositivo
+  // esté desconectado (drop de WiFi/MQTT) y los entrega al reconectar.
+  // Requiere client_id estable — lo es: basado en el eFuse MAC.
+  bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass, NULL, 0, false, NULL, false);
 
 #ifdef DEBUG_MODE
   DLOGF("[MQTT] connect() tardó %lums → %s  state=%d\n",

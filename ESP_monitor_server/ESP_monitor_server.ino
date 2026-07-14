@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.2.0-beta.3"
+#define FIRMWARE_VERSION "0.3.0-beta"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -118,12 +118,14 @@
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
   #include "SoilSensor.h"
+  #include "SoilProvisioner.h"
   #include "halisense_sensor.h"
 #elif DEVICE_PROFILE == PROFILE_IRRIGATION
   // IRRIGATION: RS485 Helissense + INA219 + AHT20 + BMP280
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include "SoilSensor.h"
+  #include "SoilProvisioner.h"
   #include "halisense_sensor.h"
   #include "aht20_driver.h"
   #include "ina219_driver.h"
@@ -132,6 +134,7 @@
   #include <Wire.h>
   #include <Adafruit_BMP280.h>
   #include "SoilSensor.h"
+  #include "SoilProvisioner.h"
   #include "halisense_sensor.h"
   #include "aht20_driver.h"
   #include "ina219_driver.h"
@@ -142,6 +145,7 @@
   #include <BH1750.h>
   #include <SparkFun_Qwiic_Power_Switch_Arduino_Library.h>
   #include <SparkFun_MicroPressure.h>
+  #include "aht20_driver.h"   // AHT21 — fallback T+RH si HDC1080 no presente (protocolo idéntico)
 #else
   // IRRIGATION: solo I2C básico (sin sensores meteo)
   #include <Wire.h>
@@ -376,6 +380,7 @@ bool dht_ok = false;
 static uint8_t bmp280_addr = 0x00;
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
 bool hdc_ok        = false;   // HDC1080 — temperatura y humedad primaria
+bool aht20_ok      = false;   // AHT21   — fallback T+RH si HDC1080 no detectado (0x38)
 bool bh1750_ok     = false;   // BH1750  — iluminancia
 bool qwiic_ps_ok   = false;   // Qwiic Power Switch (PCA9536) — alimenta el bus de sensores
 static uint8_t bmp280_addr = 0x00;
@@ -388,7 +393,8 @@ bool aht20_ok  = false;   // AHT20  — temperatura y humedad ambiente (I2C 0x38
 bool ina219_ok = false;   // INA219 — voltaje / corriente / potencia  (I2C 0x40)
 static uint8_t bmp280_addr = 0x00;
 #endif
-bool tsl_ok   = false;
+bool tsl_ok    = false;
+bool ens160_ok = false;   // ENS160 — sensor IAQ (TVOC, eCO2, AQI)
 bool xdb401_ok = false;   // XDB401 — sensor de presión de tubería I2C
 static uint8_t       xdb401_failures  = 0;       // fallos consecutivos de lectura
 static uint8_t       xdb401_recovery_failures = 0; // fallos consecutivos de recuperación
@@ -424,9 +430,12 @@ static uint8_t       bh1750_recovery_failures = 0;
 static unsigned long bh1750_retry_at = 0;
 #endif
 
-#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE \
+ || DEVICE_PROFILE == PROFILE_AQUALEAK
 static uint8_t       aht20_recovery_failures = 0;
 static unsigned long aht20_retry_at = 0;
+#endif
+#if DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
 static uint8_t       ina219_recovery_failures = 0;
 static unsigned long ina219_retry_at = 0;
 #endif
@@ -435,6 +444,10 @@ static unsigned long ina219_retry_at = 0;
 static uint8_t       tsl_recovery_failures = 0;
 static unsigned long tsl_retry_at = 0;
 #endif
+
+// ENS160 — todos los perfiles (detección en runtime)
+static uint8_t       ens160_recovery_failures = 0;
+static unsigned long ens160_retry_at = 0;
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
  || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
@@ -464,6 +477,9 @@ float  ina219BusVoltage = NAN;  // INA219 voltaje bus (V)
 float  ina219Current    = NAN;  // INA219 corriente (mA)
 float  ina219Power      = NAN;  // INA219 potencia (mW)
 #endif
+uint8_t  ens160Aqi  = 0;    // UBA Air Quality Index (1-5), 0 = no disponible
+uint16_t ens160Tvoc = 0;    // TVOC en ppb
+uint16_t ens160Eco2 = 0;    // eCO2 en ppm eq.
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
@@ -580,6 +596,7 @@ static bool anyRelayActive() {
 
 #include "htu2x_driver.h"
 #include "light_sensor.h"
+#include "ens160_driver.h"
 
 
 // ── FreeRTOS (solo ESP32) — declarado aquí para estar disponible antes de su uso ──
@@ -601,6 +618,10 @@ struct TelemetrySnapshot {
   float flowIrrigL;    ///< Litros acumulados con relay ON  (riego). 0 si sin caudalimetro.
   float flowLeakL;     ///< Litros acumulados con relay OFF (fuga detectada). 0 si sin caudalimetro.
   float xdb401Temp;   // temperatura interna sensor de presión (XDB401)
+  // ENS160 — calidad de aire (todos los perfiles, NaN/0 si no detectado)
+  uint8_t  ensAqi;    // UBA Air Quality Index 1-5 (0 = no disponible)
+  uint16_t ensTvoc;   // TVOC en ppb
+  uint16_t ensEco2;   // eCO2 en ppm eq.
   long  heap, uptime;
   int   rssi, relayMask;
 #if DEVICE_PROFILE == PROFILE_AQUALEAK
@@ -775,7 +796,7 @@ void setup() {
 
   provisioning_load();  // carga ssid+password desde NVS si existen
 
-  if (!provisioning_has_credentials()) {
+  if (provisioning_check_ap_forced() || !provisioning_has_credentials()) {
 #ifdef HAS_DISPLAY
     // Dibujar pantalla AP antes de entrar en el portal (que bloquea para siempre).
     // Usamos device_serial_get() en vez de WiFi.macAddress() porque WiFi aún
@@ -1081,9 +1102,24 @@ void setup() {
     }
   }
   if (!hdc_ok) {
-    DLOGLN("HDC1080 no detectado — modo simulacion");
-    temperatureMCP = sim_tempMCP;
-    humidity       = sim_humidity;
+    DLOGLN("HDC1080 no detectado — probando AHT21 en 0x38");
+    aht20_ok = aht20_begin();
+    if (aht20_ok) {
+      float t = NAN, h = NAN;
+      if (aht20_read(t, h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+        DLOGF("AHT21 OK — T:%.1f C  H:%.1f %%\n", t, h);
+      } else {
+        aht20_ok = false;
+      }
+    }
+    if (!aht20_ok) {
+      DLOGLN("AHT21 no detectado — modo simulacion");
+      temperatureMCP = sim_tempMCP;
+      humidity       = sim_humidity;
+    }
   }
 
   // BH1750 — iluminancia
@@ -1190,6 +1226,13 @@ void setup() {
 
 #if DEVICE_PROFILE == PROFILE_METEO || DEVICE_PROFILE == PROFILE_IRRIGATION \
  || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  {
+    uint8_t savedSoilAddr = soilBusLoadAddress();
+    if (savedSoilAddr > 0) {
+      soilSensor.setSlaveAddress(savedSoilAddr);
+      DLOGF("[SOIL] Dirección cargada de NVS: 0x%02X\n", savedSoilAddr);
+    }
+  }
   if (soilSensor.begin(4800))
     DLOGLN("SoilSensor RS485 iniciado OK");
   else
@@ -1214,6 +1257,75 @@ void setup() {
     DLOGLN("XDB401 no detectado — presion tuberia en modo simulacion");
   }
   leakDetector.begin(irrigationType);
+
+  // ── ENS160 — sensor IAQ (todos los perfiles, detección en runtime) ──────────
+  // Placa ENS160+AHT21 (AliExpress): ENS160 en 0x52, AHT21 en 0x38.
+  // AHT21 @ 0x38 es protocolo-compatible con AHT20 — detectado automáticamente
+  // en perfiles IRRIGATION/AQUA_SMART_REMOTE por aht20_driver.h.
+  ens160_ok = ens160_begin();
+  if (ens160_ok) {
+    // Primera compensación con los valores de T/HR ya leídos en este boot
+    ens160_set_compensation(temperatureMCP, humidity);
+    uint8_t aqi = 0; uint16_t tvoc = 0, eco2 = 0;
+    if (ens160_read(aqi, tvoc, eco2)) {
+      ens160Aqi  = aqi;
+      ens160Tvoc = tvoc;
+      ens160Eco2 = eco2;
+      DLOGF("ENS160 OK — AQI:%d  TVOC:%d ppb  eCO2:%d ppm\n", aqi, tvoc, eco2);
+    } else {
+      DLOGLN("ENS160 OK (calentando — lecturas iniciales no disponibles aun)");
+    }
+  } else {
+    DLOGLN("ENS160 no detectado");
+  }
+
+  // ── Resumen de sensores detectados ──────────────────────────────────────────
+  DLOGLN("\n=== Resumen de sensores ===");
+  // Temperatura
+#if DEVICE_PROFILE == PROFILE_METEO
+  DLOGF("  Temperatura  : %s%s%s\n",
+    mcp_ok      ? "[MCP9808] " : "",
+    bmp_temp_ok ? "[BMP280]  " : "",
+    (!mcp_ok && !bmp_temp_ok) ? "[SIM]" : "");
+  DLOGF("  -> Usando    : %s\n", temperatureSourceName());
+  DLOGF("  Humedad      : %s%s\n",
+    htu_ok ? "[HTU2x]" : "",
+    !htu_ok ? "[SIM]"  : "");
+  DLOGF("  Presion atm  : %s%s%s\n",
+    micropressure_ok ? "[MicroPressure] " : "",
+    bmp_pressure_ok  ? "[BMP280] "        : "",
+    (!micropressure_ok && !bmp_pressure_ok) ? "[SIM]" : "");
+  DLOGF("  -> Usando    : %s\n", pressureSourceName());
+#elif DEVICE_PROFILE == PROFILE_AQUALEAK
+  DLOGF("  Temperatura  : %s%s%s\n",
+    hdc_ok      ? "[HDC1080] " : "",
+    aht20_ok    ? "[AHT21]   " : "",
+    bmp_temp_ok ? "[BMP280]  " : "");
+  if (!hdc_ok && !aht20_ok && !bmp_temp_ok) DLOGLN("  Temperatura  : [SIM]");
+  DLOGF("  -> Usando    : %s\n", temperatureSourceName());
+  DLOGF("  Humedad      : %s\n", hdc_ok ? "[HDC1080]" : aht20_ok ? "[AHT21]" : "[SIM]");
+  DLOGF("  Presion atm  : %s%s%s\n",
+    micropressure_ok ? "[MicroPressure] " : "",
+    bmp_pressure_ok  ? "[BMP280] "        : "",
+    (!micropressure_ok && !bmp_pressure_ok) ? "[SIM]" : "");
+  DLOGF("  -> Usando    : %s\n", pressureSourceName());
+  DLOGF("  Luz          : %s\n", bh1750_ok ? "[BH1750]" : "[SIM]");
+#elif DEVICE_PROFILE == PROFILE_IRRIGATION || DEVICE_PROFILE == PROFILE_AQUA_SMART_REMOTE
+  DLOGF("  Temperatura  : %s%s\n",
+    aht20_ok    ? "[AHT20/21] " : "",
+    bmp_temp_ok ? "[BMP280]  "  : "");
+  if (!aht20_ok && !bmp_temp_ok) DLOGLN("  Temperatura  : [SIM]");
+  DLOGF("  -> Usando    : %s\n", temperatureSourceName());
+  DLOGF("  Humedad      : %s\n", aht20_ok ? "[AHT20/21]" : "[SIM]");
+  DLOGF("  Presion atm  : %s%s\n",
+    bmp_pressure_ok ? "[BMP280]" : "",
+    !bmp_pressure_ok ? "[SIM]"   : "");
+  DLOGF("  -> Usando    : %s\n", pressureSourceName());
+  DLOGF("  Corriente    : %s\n", ina219_ok ? "[INA219]" : "[no]");
+#endif
+  DLOGF("  Presion tubo : %s\n", xdb401_ok ? "[XDB401]" : "[SIM]");
+  DLOGF("  Calidad aire : %s\n", ens160_ok ? "[ENS160]" : "[no detectado]");
+  DLOGLN("===========================\n");
 
 #ifdef HAS_DISPLAY
   drawBootScreen("Conectando WiFi...");
@@ -1341,7 +1453,7 @@ void setup() {
 #endif
 
     // ── OTA (Over-The-Air) ──────────────────────────────────────────────────
-    ArduinoOTA.setHostname("meteostation-esp32");
+    ArduinoOTA.setHostname(DEVICE_HOSTNAME);
     // Contraseña OTA opcional — definir OTA_PASSWORD en secrets.h para activarla
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1412,7 +1524,7 @@ void setup() {
     );
     DLOGLN("NetworkTask creada en Core 0");
     WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
-    DLOGLN("OTA listo — hostname: meteostation-esp32");
+    DLOGLN("OTA listo — hostname: " DEVICE_HOSTNAME);
     // ── Fin OTA ─────────────────────────────────────────────────────────────
 
     printHardwareInfo();
@@ -1460,8 +1572,9 @@ void setup() {
   DLOGF("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
   DLOGF("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
-  DLOGF("[TEST] HDC1080  : %s\n", hdc_ok     ? "REAL" : "SIM (sin sensor)");
-  DLOGF("[TEST] BH1750   : %s\n", bh1750_ok  ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] HDC1080  : %s\n", hdc_ok    ? "REAL" : "SIM (sin sensor)");
+  DLOGF("[TEST] AHT21    : %s\n", aht20_ok  ? "REAL (fallback T+RH)" : (hdc_ok ? "no usado" : "SIM (sin sensor)"));
+  DLOGF("[TEST] BH1750   : %s\n", bh1750_ok ? "REAL" : "SIM (sin sensor)");
 #endif
 #if DEVICE_PROFILE == PROFILE_METEO
   DLOGF("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
@@ -1651,9 +1764,12 @@ void loop() {
     DLOGF("[VIENTO] %.1f m/s (filt:%.1f)  Dir:%.0f° (%s)\n",
       windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
 #if defined(FLOW_PIN)
+    noInterrupts();
+    uint32_t _dbgFlowTotal = _flowPulseTotal;
+    interrupts();
     DLOGF("[FLOW  ] %.2f L/min  Total:%lu p  Intervalo:%lu us\n",
-      _flowLpm, (unsigned long)_flowPulseTotal, (unsigned long)_flowLastDtUs);
-    if (_flowPulseTotal == 0)
+      _flowLpm, (unsigned long)_dbgFlowTotal, (unsigned long)_flowLastDtUs);
+    if (_dbgFlowTotal == 0)
       DLOGLN("[WARN  ] Caudalimetro: sin pulsos — verif. cableado GPIO" + String(FLOW_PIN));
 #endif
 #endif
@@ -1678,7 +1794,7 @@ void loop() {
     if (!bar_ok)          DLOGLN("[WARN  ] Barometro: SIM (sin sensor real)");
     if (!htu_ok)          DLOGLN("[WARN  ] HTU2x: SIM (sin sensor real)");
 #elif DEVICE_PROFILE == PROFILE_AQUALEAK
-    if (!hdc_ok)          DLOGLN("[WARN  ] HDC1080: SIM (sin sensor real)");
+    if (!hdc_ok && !aht20_ok) DLOGLN("[WARN  ] HDC1080/AHT21: SIM (sin sensor T+RH real)");
     if (!bmp_ok)          DLOGLN("[WARN  ] BMP280: SIM (sin sensor real)");
     if (!bh1750_ok)       DLOGLN("[WARN  ] BH1750: SIM (sin sensor real)");
 #endif
