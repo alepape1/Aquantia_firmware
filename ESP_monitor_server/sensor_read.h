@@ -200,9 +200,28 @@ void readSlowSensors(unsigned long now) {
     }
   }
   if (!hdc_ok) {
-    if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
-    else             { temperatureMCP = sim_tempMCP;    temp_ok = false; }
-    humidity = sim_humidity;
+    // AHT21 fallback — recovery igual que el resto de sensores
+    if (!aht20_ok && now >= aht20_retry_at) {
+      aht20_ok = aht20_begin();
+      if (aht20_ok) sensorRecoveryMarkSuccess(aht20_recovery_failures, aht20_retry_at);
+      else          sensorRecoveryMarkFailure("AHT21", aht20_recovery_failures, aht20_retry_at);
+    }
+    if (aht20_ok) {
+      float t = NAN, h = NAN;
+      if (aht20_read(t, h)) {
+        temperatureMCP = t;
+        humidity       = h;
+        temp_ok        = true;
+      } else {
+        aht20_ok = false;
+        DLOGLN("AHT21 fallo en lectura");
+      }
+    }
+    if (!aht20_ok) {
+      if (bmp_temp_ok) { temperatureMCP = bmpTemperature; temp_ok = true; }
+      else             { temperatureMCP = sim_tempMCP;    temp_ok = false; }
+      humidity = sim_humidity;
+    }
   }
 
   bar_ok = false;
@@ -479,6 +498,32 @@ void readSlowSensors(unsigned long now) {
 #  endif
 #endif
 
+  // ── ENS160 — calidad de aire (todos los perfiles, detección en runtime) ──────
+  if (!ens160_ok && now >= ens160_retry_at) {
+    ens160_ok = ens160_begin();
+    if (ens160_ok) {
+      sensorRecoveryMarkSuccess(ens160_recovery_failures, ens160_retry_at);
+      DLOGLN("[ENS160] Reconectado tras fallo");
+    } else {
+      sensorRecoveryMarkFailure("ENS160", ens160_recovery_failures, ens160_retry_at);
+    }
+  }
+  if (ens160_ok) {
+    // Compensación con valores de T/HR actuales (mejora precisión interna)
+    ens160_set_compensation(temperatureMCP, humidity);
+    uint8_t  aqi  = 0;
+    uint16_t tvoc = 0, eco2 = 0;
+    if (ens160_read(aqi, tvoc, eco2)) {
+      ens160Aqi  = aqi;
+      ens160Tvoc = tvoc;
+      ens160Eco2 = eco2;
+      DLOGF("[ENS160] AQI:%d  TVOC:%d ppb  eCO2:%d ppm\n", aqi, tvoc, eco2);
+    } else {
+      ens160_ok = false;
+      DLOGLN("[ENS160] Fallo en lectura — reintentando en proximo ciclo");
+    }
+  }
+
   updateSimulatedValues();
   if (strcmp(pipelineMode, "sim") == 0) updatePipelineValues();
 
@@ -542,6 +587,9 @@ void readSlowSensors(unsigned long now) {
     snap.flowLeakL    = 0.0f;
 #endif
     snap.xdb401Temp    = xdb401Temperature;
+    snap.ensAqi        = ens160_ok ? ens160Aqi  : 0;
+    snap.ensTvoc       = ens160_ok ? ens160Tvoc : 0;
+    snap.ensEco2       = ens160_ok ? ens160Eco2 : 0;
     snap.relayMask     = 0;
     if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       for (int i = 0; i < RELAY_COUNT; i++)
@@ -597,29 +645,31 @@ void readSoilSensor(unsigned long now) {
   if (now - lastSoilReadMs >= soilInterval) {
     lastSoilReadMs = now;
     wdt_heartbeat("loopTask", "soil_rs485");
-    if (now < soil_rs485_retry_at) {
-      halisenseData.ok = false;
-    } else if (soilSensor.readAllVariables()) {
-      sensorRecoveryMarkSuccess(soil_rs485_recovery_failures, soil_rs485_retry_at);
-      halisenseData.ok          = true;
-      halisenseData.moisture    = soilSensor.getHumidity();
-      halisenseData.temperature = soilSensor.getTemperature();
-      float ecRaw               = soilSensor.getEC();
-      halisenseData.ec          = ecRaw / 1000.0f;
-      halisenseData.tds         = ecRaw * 0.5f;
-      halisenseData.ph          = soilSensor.getPH();
-      halisenseData.n           = (int)soilSensor.getNitrogen();
-      halisenseData.p           = (int)soilSensor.getPhosphorus();
-      halisenseData.k           = (int)soilSensor.getPotassium();
-      soilMoisture              = halisenseData.moisture;
-      DLOGF("[SOIL] Hum=%.1f%% T=%.1f°C pH=%.1f N=%d P=%d K=%d [%s]\n",
-            halisenseData.moisture, halisenseData.temperature, halisenseData.ph,
-            halisenseData.n, halisenseData.p, halisenseData.k,
-            relayOn ? "RIEGO" : (soilPostIrrigEndMs != 0 ? "POST-RIEGO" : "REPOSO"));
+    if (now >= soil_rs485_retry_at) {
+      if (soilSensor.readAllVariables()) {
+        sensorRecoveryMarkSuccess(soil_rs485_recovery_failures, soil_rs485_retry_at);
+        halisenseData.ok          = true;
+        halisenseData.moisture    = soilSensor.getHumidity();
+        halisenseData.temperature = soilSensor.getTemperature();
+        float ecRaw               = soilSensor.getEC();
+        halisenseData.ec          = ecRaw / 1000.0f;
+        halisenseData.tds         = ecRaw * 0.5f;
+        halisenseData.ph          = soilSensor.getPH();
+        halisenseData.n           = (int)soilSensor.getNitrogen();
+        halisenseData.p           = (int)soilSensor.getPhosphorus();
+        halisenseData.k           = (int)soilSensor.getPotassium();
+        soilMoisture              = halisenseData.moisture;
+        DLOGF("[SOIL] Hum=%.1f%% T=%.1f°C pH=%.1f N=%d P=%d K=%d [%s]\n",
+              halisenseData.moisture, halisenseData.temperature, halisenseData.ph,
+              halisenseData.n, halisenseData.p, halisenseData.k,
+              relayOn ? "RIEGO" : (soilPostIrrigEndMs != 0 ? "POST-RIEGO" : "REPOSO"));
+      } else {
+        halisenseData.ok = false;
+        sensorRecoveryMarkFailure("SOIL", soil_rs485_recovery_failures, soil_rs485_retry_at);
+        DLOGLN("[SOIL] Sin respuesta del sensor RS485");
+      }
     } else {
       halisenseData.ok = false;
-      sensorRecoveryMarkFailure("SOIL", soil_rs485_recovery_failures, soil_rs485_retry_at);
-      DLOGLN("[SOIL] Sin respuesta del sensor RS485");
     }
   }
 #endif

@@ -97,8 +97,8 @@ bool halisense_read(HalisenseData &out) {
     float ec_raw    = (float)reg[2];
     out.ec          = ec_raw / 1000.0f;
     out.tds         = ec_raw * 0.5f;
-    // Registro 3: pH (÷10)
-    out.ph          = reg[3] / 10.0f;
+    // Registro 3: pH (÷100 → escala ×100 en este sensor)
+    out.ph          = reg[3] / 100.0f;
     // Registros 4-6: NPK directos (mg/kg)
     out.n           = (int)reg[4];
     out.p           = (int)reg[5];

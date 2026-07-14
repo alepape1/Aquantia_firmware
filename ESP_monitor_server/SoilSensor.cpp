@@ -20,21 +20,14 @@
     0x0004 - Nitrogen       (mg/kg)
     0x0005 - Phosphorus     (mg/kg)
     0x0006 - Potassium      (mg/kg)
+
+  Address change: FC 0x06, register 0x0100 = new slave address (YIERYI family standard).
+  Baud rate change: FC 0x06, register 0x0101 = 0-4 (1200/2400/4800/9600/19200) — if supported.
+  Note: some variants (confirmed YIERYI NPK) have baud rate fixed in firmware and return
+  ILLEGAL DATA ADDRESS (exception 0x02) when writing 0x0101 — bus must stay at 9600.
 */
 
 #include "SoilSensor.h"
-
-// ── Modbus command bytes ─────────────────────────────────────────────────────
-// Format: {ADDR, FC, REG_HI, REG_LO, COUNT_HI, COUNT_LO, CRC_LO, CRC_HI}
-
-const byte SoilSensor::READ_ALL_REG[8]  = {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08};
-const byte SoilSensor::READ_HUM_REG[8]  = {0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x0A};
-const byte SoilSensor::READ_TEMP_REG[8] = {0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0xD5, 0xCA};
-const byte SoilSensor::READ_EC_REG[8]   = {0x01, 0x03, 0x00, 0x02, 0x00, 0x01, 0x25, 0xCA};
-const byte SoilSensor::READ_PH_REG[8]   = {0x01, 0x03, 0x00, 0x03, 0x00, 0x01, 0x74, 0x0A};
-const byte SoilSensor::READ_N_REG[8]    = {0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB};
-const byte SoilSensor::READ_P_REG[8]    = {0x01, 0x03, 0x00, 0x05, 0x00, 0x01, 0x94, 0x0B};
-const byte SoilSensor::READ_K_REG[8]    = {0x01, 0x03, 0x00, 0x06, 0x00, 0x01, 0x64, 0x0B};
 
 // ── Timing constants ─────────────────────────────────────────────────────────
 static const uint16_t TX_ENABLE_DELAY_MS    = 10;   // DE/RE settle time before sending
@@ -53,6 +46,29 @@ static uint16_t crc16(const byte *data, size_t len)
         }
     }
     return crc;
+}
+
+// Build a standard FC 0x03 read command with CRC
+static void buildReadCmd(uint8_t addr, uint16_t startReg, uint16_t count, byte *out)
+{
+    out[0] = addr;
+    out[1] = 0x03;
+    out[2] = startReg >> 8;
+    out[3] = startReg & 0xFF;
+    out[4] = count >> 8;
+    out[5] = count & 0xFF;
+    uint16_t c = crc16(out, 6);
+    out[6] = c & 0xFF;
+    out[7] = c >> 8;
+}
+
+// ── CRC validation ────────────────────────────────────────────────────────────
+static bool validateCRC(const byte *buf, size_t len)
+{
+    if (len < 4) return false;
+    uint16_t calc = crc16(buf, len - 2);
+    uint16_t recv = (uint16_t)buf[len - 2] | ((uint16_t)buf[len - 1] << 8);
+    return (calc == recv);
 }
 
 // ── Constructors ─────────────────────────────────────────────────────────────
@@ -111,7 +127,6 @@ bool SoilSensor::sendCommand(const byte *command, size_t length)
     if (_dePin >= 0) digitalWrite(_dePin, LOW);   // back to RX
 
     // Flush TX echo — some RS485 adapters reflect TX bytes back into RX during transmission.
-    // After flush() the last byte is fully shifted out, so the echo is already in the FIFO.
     delay(2);
     while (sensorSerial.available()) sensorSerial.read();
 
@@ -134,25 +149,18 @@ bool SoilSensor::sendCommand(const byte *command, size_t length)
     return (idx > 0);
 }
 
-// ── CRC validation ────────────────────────────────────────────────────────────
-static bool validateCRC(const byte *buf, size_t len)
-{
-    if (len < 4) return false;
-    uint16_t calc = crc16(buf, len - 2);
-    uint16_t recv = (uint16_t)buf[len - 2] | ((uint16_t)buf[len - 1] << 8);
-    return (calc == recv);
-}
-
 // ── readAllVariables() ────────────────────────────────────────────────────────
 bool SoilSensor::readAllVariables()
 {
-    if (!sendCommand(READ_ALL_REG, sizeof(READ_ALL_REG))) return false;
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0000, 7, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
     return processReadingAll();
 }
 
 bool SoilSensor::processReadingAll()
 {
-    if (readBuffer[0] != 0x01 || readBuffer[1] != 0x03 || readBuffer[2] != 0x0E) return false;
+    if (readBuffer[0] != _slaveAddr || readBuffer[1] != 0x03 || readBuffer[2] != 0x0E) return false;
     if (!validateCRC(readBuffer, 19)) return false;
 
     auto readWord = [&](size_t offset) -> uint16_t {
@@ -172,9 +180,9 @@ bool SoilSensor::processReadingAll()
 }
 
 // ── Individual reads ──────────────────────────────────────────────────────────
-static bool parseSingleRegister(const byte *buf, float &out, float scale = 1.0f)
+static bool parseSingleRegister(const byte *buf, float &out, float scale, uint8_t addr)
 {
-    if (buf[0] != 0x01 || buf[1] != 0x03 || buf[2] != 0x02) return false;
+    if (buf[0] != addr || buf[1] != 0x03 || buf[2] != 0x02) return false;
     if (!validateCRC(buf, 7)) return false;
     uint16_t raw = ((uint16_t)buf[3] << 8) | buf[4];
     out = raw * scale;
@@ -183,56 +191,103 @@ static bool parseSingleRegister(const byte *buf, float &out, float scale = 1.0f)
 
 bool SoilSensor::readTemperature()
 {
-    if (!sendCommand(READ_TEMP_REG, sizeof(READ_TEMP_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, temperature, 0.1f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0001, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, temperature, 0.1f, _slaveAddr);
     if (ok) tempFresh = true;
     return ok;
 }
 
 bool SoilSensor::readHumidity()
 {
-    if (!sendCommand(READ_HUM_REG, sizeof(READ_HUM_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, humidity, 0.1f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0000, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, humidity, 0.1f, _slaveAddr);
     if (ok) humFresh = true;
     return ok;
 }
 
 bool SoilSensor::readEC()
 {
-    if (!sendCommand(READ_EC_REG, sizeof(READ_EC_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, ec, 1.0f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0002, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, ec, 1.0f, _slaveAddr);
     if (ok) ecFresh = true;
     return ok;
 }
 
 bool SoilSensor::readPH()
 {
-    if (!sendCommand(READ_PH_REG, sizeof(READ_PH_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, ph, 0.1f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0003, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, ph, 0.1f, _slaveAddr);
     if (ok) phFresh = true;
     return ok;
 }
 
 bool SoilSensor::readNitrogen()
 {
-    if (!sendCommand(READ_N_REG, sizeof(READ_N_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, nitrogen, 1.0f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0004, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, nitrogen, 1.0f, _slaveAddr);
     if (ok) nFresh = true;
     return ok;
 }
 
 bool SoilSensor::readPhosphorus()
 {
-    if (!sendCommand(READ_P_REG, sizeof(READ_P_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, phosphorus, 1.0f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0005, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, phosphorus, 1.0f, _slaveAddr);
     if (ok) pFresh = true;
     return ok;
 }
 
 bool SoilSensor::readPotassium()
 {
-    if (!sendCommand(READ_K_REG, sizeof(READ_K_REG))) return false;
-    bool ok = parseSingleRegister(readBuffer, potassium, 1.0f);
+    byte cmd[8];
+    buildReadCmd(_slaveAddr, 0x0006, 1, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    bool ok = parseSingleRegister(readBuffer, potassium, 1.0f, _slaveAddr);
     if (ok) kFresh = true;
     return ok;
+}
+
+// ── probe() ───────────────────────────────────────────────────────────────────
+bool SoilSensor::probe(uint8_t addr)
+{
+    byte cmd[8];
+    buildReadCmd(addr, 0x0000, 7, cmd);
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    if (readBuffer[0] != addr || readBuffer[1] != 0x03 || readBuffer[2] != 0x0E) return false;
+    return validateCRC(readBuffer, 19);
+}
+
+// ── changeAddress() ───────────────────────────────────────────────────────────
+bool SoilSensor::changeAddress(uint8_t currentAddr, uint8_t newAddr)
+{
+    if (newAddr < 1 || newAddr > 247) return false;
+    // FC 0x06: Write Single Register → register 0x0100 (slave address, YIERYI family)
+    byte cmd[8];
+    cmd[0] = currentAddr;
+    cmd[1] = 0x06;
+    cmd[2] = 0x01;
+    cmd[3] = 0x00;
+    cmd[4] = 0x00;
+    cmd[5] = newAddr;
+    uint16_t c = crc16(cmd, 6);
+    cmd[6] = c & 0xFF;
+    cmd[7] = c >> 8;
+
+    if (!sendCommand(cmd, sizeof(cmd))) return false;
+    // Successful write echoes the full 8-byte command
+    return (readBuffer[0] == currentAddr && readBuffer[1] == 0x06
+            && readBuffer[5] == newAddr
+            && validateCRC(readBuffer, 8));
 }

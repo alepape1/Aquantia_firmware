@@ -154,6 +154,29 @@ void provisioning_clear() {
   prov_ssid[0] = prov_password[0] = prov_mqtt_token[0] = '\0';
 }
 
+/** Borra solo las credenciales WiFi del NVS (mantiene mqtt_token). */
+void provisioning_clear_wifi() {
+  _prov_prefs.begin("aquantia", /*readOnly=*/false);
+  _prov_prefs.remove("ssid");
+  _prov_prefs.remove("password");
+  _prov_prefs.end();
+  prov_ssid[0] = prov_password[0] = '\0';
+}
+
+// ── Auto AP mode tras fallo prolongado de WiFi ────────────────────────────────
+// El networkTask escribe este flag en RTC RAM antes de reiniciar.
+// En el siguiente boot, setup() lo detecta y lanza el portal SoftAP sin borrar
+// credenciales, permitiendo al usuario actualizarlas si cambiaron.
+RTC_DATA_ATTR static uint8_t _prov_ap_forced_flag = 0;
+
+inline void provisioning_set_ap_forced() { _prov_ap_forced_flag = 1; }
+
+/** Devuelve true (y borra el flag) si networkTask solicitó modo AP tras fallo WiFi. */
+inline bool provisioning_check_ap_forced() {
+  if (_prov_ap_forced_flag) { _prov_ap_forced_flag = 0; return true; }
+  return false;
+}
+
 // ── HTML del captive portal ───────────────────────────────────────────────────
 
 static const char _PROV_HTML[] PROGMEM = R"rawliteral(

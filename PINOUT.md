@@ -1,6 +1,6 @@
 # Aquantia — Pinout de dispositivos
 
-Tres perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo de compilación con `DEVICE_PROFILE`.
+Cuatro perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo de compilación con `DEVICE_PROFILE`.
 
 ---
 
@@ -22,7 +22,7 @@ Tres perfiles de hardware, un mismo firmware. El perfil se selecciona en tiempo 
 | Relay 1 (electroválvula) | 26 | Activo-LOW, JQC-3FF-S-Z |
 | Botón izquierdo (BOOT) | 0 | INPUT_PULLUP, activo LOW |
 | Botón derecho | 35 | INPUT, activo LOW — sin pull-up interno; debounce 400 ms en firmware |
-| LED onboard | 2 | Activo-LOW. Estados: parpadeo rápido=WiFi buscando, doble parpadeo=MQTT pendiente, latido=idle, triple=TX OK, 1s/1s=error |
+| LED onboard | — | Sin LED accesible en LilyGo T-Display (`LED_PIN = -1`) |
 | RS485 Serial2 RX (DI) | **13** | Helissense sensor suelo — **NO usar GPIO16 (= TFT_DC)** |
 | RS485 Serial2 TX (RO) | 17 | Helissense sensor suelo |
 | RS485 DE/RE | 27 | Control half-duplex Helissense |
@@ -130,8 +130,10 @@ Ajustar en `ESP_monitor_server.ino` según el sensor real:
 | LED estado | 23 | Activo-LOW. Mismos estados que METEO + encendido fijo cuando relay activo |
 | I2C SDA | 21 | Sin sensores en v actual |
 | I2C SCL | 22 | Sin sensores en v actual |
+| Caudalímetro (pulsos ISR) | 34 | ADC1_CH6, solo entrada — sin pull-up interno; requiere pull-up externo, ISR FALLING |
 | RS485 Serial2 RX (RO) | 14 | Helissense sensor suelo — RX (ESP32 ← sensor) |
 | RS485 Serial2 TX (DI) | 13 | Helissense sensor suelo — TX (ESP32 → sensor) |
+| RS485 DE/RE | 27 | Control half-duplex Helissense |
 
 > Este perfil no tiene pantalla. Gestiona los 4 relays por MQTT y lee temperatura/humedad ambiente (AHT20), voltaje/corriente/potencia (INA219) y presión atmosférica (BMP280) por I2C.
 
@@ -189,16 +191,61 @@ Cada relay:
 
 ---
 
-## Caudalímetro de tubería (PROFILE_METEO y PROFILE_AGROMETEO)
+## PROFILE_AQUALEAK (3) — Wemos D1 Mini ESP32
+
+**Placa:** Wemos D1 Mini ESP32 + módulo CJMCU-14 (BH1750 + HDC1080 + BMP280 + MicroPressure)
+**Conectividad:** WiFi. 1 relay de corte. Caudalímetro YF-B9 (K_FACTOR = 288).
+
+### GPIO del firmware
+
+| Función | GPIO | Notas |
+|---------|:----:|-------|
+| I2C SDA | 21 | Bus sensores: BH1750, HDC1080, BMP280, MicroPressure, Qwiic Switch |
+| I2C SCL | 22 | Bus sensores |
+| Caudalímetro (pulsos ISR) | 17 | INPUT_PULLUP, ISR FALLING — GPIO libre, sin función especial |
+| Relay 1 (corte electroválvula) | 26 | Activo-HIGH, JQC-3FF-S-Z |
+| LED onboard | 2 | Activo-HIGH |
+
+### Sensores I2C (SDA=21, SCL=22)
+
+| Sensor | Dirección I2C | Función |
+|--------|:-------------:|---------|
+| BH1750 | 0x23 | Iluminancia (lux) |
+| HDC1080 | 0x40 | Temperatura + humedad |
+| BMP280 | 0x76/0x77 | Temperatura + presión atmosférica (fallback) |
+| SparkFun MicroPressure | 0x18 | Presión atmosférica principal |
+| Qwiic Power Switch (PCA9536) | 0x41 | Alimenta el bus I2C secundario antes de la lectura |
+
+> Este perfil publica el campo adicional `dew_point` (punto de rocío calculado) en la telemetría.
+
+### Diagrama de conexiones
+
+```
+Wemos D1 Mini ESP32
+┌────────────────────┐
+│  3V3 ──────────────┼──► VCC sensores I2C / Qwiic Switch
+│  GND ──────────────┼──► GND común
+│  GPIO21 (SDA) ─────┼──► SDA → BH1750, HDC1080, BMP280, MicroPressure
+│  GPIO22 (SCL) ─────┼──► SCL → (mismos sensores)
+│  GPIO17 ───────────┼──► Caudalímetro (colector BC547 NPN)
+│  GPIO26 ───────────┼──► IN del relay (JQC-3FF-S-Z)
+└────────────────────┘
+```
+
+---
+
+## Caudalímetro de tubería (todos los perfiles)
 
 El firmware implementa la lectura de caudal mediante **interrupciones hardware** para no perder ningún pulso.
 
 ### GPIO y circuito
 
-| Perfil | Función | GPIO | Notas |
-|--------|---------|:----:|-------|
-| METEO (LilyGo TTGO T-Display) | Caudalímetro (pulsos) | **32** | INPUT_PULLUP, ISR FALLING edge |
-| AGROMETEO (WEMOS D1 MINI ESP32) | Caudalímetro (pulsos) | **17** | INPUT_PULLUP, ISR FALLING edge — sin función especial, libre en esta placa |
+| Perfil | GPIO | K_FACTOR | Sensor | Notas |
+|--------|:----:|:--------:|--------|-------|
+| METEO | 32 | 660 | YF-B4 | INPUT_PULLUP, ISR FALLING (BC547 NPN invierte señal) |
+| IRRIGATION | 34 | 660 | YF-B4 | Input-only, sin pull-up interno — pull-up externo obligatorio, ISR FALLING |
+| AQUALEAK | 17 | 288 | YF-B9 | INPUT_PULLUP, ISR FALLING (medido: ~9 L / 2678 pulsos) |
+| AQUA_SMART_REMOTE | 34 | 660 | YF-B4 | Input-only, sin pull-up interno — pull-up externo obligatorio, ISR FALLING |
 
 ### Transistor de acondicionamiento BC547 NPN
 
@@ -224,7 +271,7 @@ La señal llega **invertida**: el firmware cuenta flancos `FALLING`.
 
 | Constante | Valor por defecto | Descripción |
 |-----------|:-----------------:|-------------|
-| `FLOW_K_FACTOR` | `450` | Pulsos por litro — YF-S201; **ajustar según sensor real** con agua calibrada |
+| `FLOW_K_FACTOR` | `660` (METEO/IRRIGATION/AQUA_SMART_REMOTE) · `288` (AQUALEAK) | Pulsos por litro — **ajustar según sensor real** con agua calibrada |
 
 Fórmula de cálculo:
 
@@ -249,14 +296,14 @@ Estos tres campos se almacenan en la base de datos del backend (`pipeline_source
 
 ---
 
-## Comportamiento del relay (ambos perfiles)
+## Comportamiento del relay (todos los perfiles)
 
-Los relays **JQC-3FF-S-Z** son **activo-LOW**:
+Los relays **JQC-3FF-S-Z** son **activo-HIGH** (lote Aquantia):
 
 | GPIO | Estado | Relay | Válvula |
 |------|--------|:-----:|---------|
-| HIGH | Arranque / seguro | OFF | Cerrada |
-| LOW | Activado | ON | Abierta |
+| LOW | Arranque / seguro | OFF | Cerrada |
+| HIGH | Activado | ON | Abierta |
 
 Durante una actualización OTA todos los relays pasan a OFF (HIGH) automáticamente por seguridad.
 
@@ -304,7 +351,7 @@ RSSI reportado como CSQ (0–31) via `modemSIM.getSignalQuality()` en campo `rss
 |---------|:----:|-------|
 | I2C SDA | 21 | Bus sensores: AHT20, BMP280, INA219 |
 | I2C SCL | 22 | Bus sensores |
-| Caudalímetro (ISR) | 34 | ADC1_CH6, solo entrada — INPUT_PULLUP |
+| Caudalímetro (ISR) | 34 | ADC1_CH6, solo entrada — sin pull-up interno; requiere pull-up externo |
 | Relay 1 | 32 | Libre, sin conflicto con modem |
 | Relay 2 | 33 | Libre |
 | Relay 3 | 16 | Libre |
