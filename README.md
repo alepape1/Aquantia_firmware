@@ -43,7 +43,7 @@ El firmware compila un binario distinto para cada dispositivo. El perfil se pasa
 | **METEO** | 1 | LilyGo TTGO T-Display | 1 × GPIO26 | ST7789 240×135 | Sí (MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, YL-69) |
 | **IRRIGATION** | 2 | ESP32 4-Relay Board | 4 × GPIO32/33/25/26 | No | AHT20 (T+H), INA219 (V/I/P), BMP280 (T+P, fallback) |
 | **AQUALEAK** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | 1 × GPIO26 | No | Sí (BH1750, HDC1080, BMP280, MicroPressure) |
-| **AQUA_SMART_REMOTE** | 4 | LilyGO T-SIM7000G | 4 × GPIO32/33/25/26 | No | SIM Onomondo (2G/LTE-M), RS485, AHT20, INA219 |
+| **AQUA_SMART_REMOTE** | 4 | LilyGO T-SIM7000G | 4 × GPIO32/33/16/17 | No | SIM Onomondo (2G/LTE-M), RS485, AHT20, INA219 |
 
 > **Nota:** El perfil AQUALEAK publica el campo `dew_point` (punto de rocío calculado). AQUA_SMART_REMOTE usa red celular LTE-M/2G (SIM Onomondo) en lugar de WiFi y envía un **payload reducido** (~350 B) para minimizar datos transferidos.
 
@@ -66,7 +66,7 @@ tools/
 
 | Función | Descripción |
 |---------|-------------|
-| Selector de perfil | METEO / IRRIGATION |
+| Selector de perfil | METEO / IRRIGATION / AQUALEAK / AQUA_SMART_REMOTE |
 | Selector de versión | Working copy, tags, commits históricos |
 | Info de commit | Muestra hash, fecha, autor y mensaje antes de flashear |
 | Estado del binario | Indica si el binario en caché es válido o hay que recompilar |
@@ -154,11 +154,11 @@ Instalar desde el gestor de librerías de Arduino IDE 2.x:
 | `TFT_eSPI` | Bodmer | METEO | Pantalla ST7789 |
 | *(sin librería externa)* | — | METEO | Sensor suelo Helissense — driver RS485 Modbus RTU en `SoilSensor.h/.cpp` |
 | `Adafruit MCP9808 Library` | Adafruit | METEO | Temperatura exterior |
-| `Adafruit BMP280 Library` | Adafruit | METEO, AGROMETEO | Temperatura + presión atmosférica |
-| `SparkFun MicroPressure Library` | SparkFun | METEO, AGROMETEO | Barómetro principal |
+| `Adafruit BMP280 Library` | Adafruit | METEO, AQUALEAK | Temperatura + presión atmosférica |
+| `SparkFun MicroPressure Library` | SparkFun | METEO, AQUALEAK | Barómetro principal |
 | `DHTesp` | beegee-tokyo | METEO | DHT11 |
-| `BH1750` | claws | AGROMETEO | Iluminancia |
-| `SparkFun Qwiic Power Switch Library` | SparkFun | AGROMETEO | PCA9536 — alimenta el bus I2C |
+| `BH1750` | claws | AQUALEAK | Iluminancia |
+| `SparkFun Qwiic Power Switch Library` | SparkFun | AQUALEAK | PCA9536 — alimenta el bus I2C |
 | `ArduinoJson` | Benoit Blanchon | Todos | Payloads JSON |
 | `PubSubClient` | knolleary | Todos (MQTT) | Cliente MQTT |
 
@@ -253,7 +253,7 @@ Core 1 — loop()
  ├─ Cada 200ms   → [solo pipeline_mode=real] Leer XDB401 + caudalímetro
  │                Actualizar display y LeakDetector sin enviar a backend
  ├─ Cada 20s*    → Leer I2C: sensores meteo según perfil
- │                Calcular parámetros agrometeorológicos (AGROMETEO)
+ │                Calcular parámetros agrometeorológicos (AQUALEAK)
  │                Construir TelemetrySnapshot → xQueueOverwrite (sin bloqueo)
  │                Actualizar pantalla TFT (METEO)
  └─ Siempre      → Gestionar botones y timeout de pantalla (METEO)
@@ -314,7 +314,7 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 | Intervalo | Constante | Core | Qué ocurre | Perfiles |
 |----------:|-----------|:----:|-----------|:--------:|
 | **100 ms** | `WIND_MS` | 1 | Lee ADC anemómetro (GPIO 36) → `windSpeed`; ADC veleta → `windDirection`; acumula vector | METEO |
-| **200 ms** | `PIPELINE_FAST_MS` | 1 | Lee XDB401 (presión + temperatura agua) y caudalímetro → actualiza display y LeakDetector. **Solo activo cuando `pipeline_mode = real`** | METEO, AGROMETEO |
+| **200 ms** | `PIPELINE_FAST_MS` | 1 | Lee XDB401 (presión + temperatura agua) y caudalímetro → actualiza display y LeakDetector. **Solo activo cuando `pipeline_mode = real`** | METEO, AQUALEAK |
 | **1 s** | `SCREEN_MS` | 1 | Refresca pantalla TFT (doble buffer, sin parpadeo) | METEO |
 | **2 s** | `RELAY_MS` | 0 | `GET /api/relay/command` — solo modo HTTP legacy | Todos |
 | **10 s** | `DEBUG_INTERVAL_MS` | 1 | Imprime reporte de estado por Serial — **solo con `DEBUG_MODE` activo** | Todos |
@@ -328,7 +328,7 @@ Todos los intervalos son constantes de compilación definidas al inicio de `ESP_
 
 ### Sensores leídos en el ciclo de 20 s (por perfil)
 
-| Sensor | Magnitudes | METEO | IRRIGATION | AGROMETEO |
+| Sensor | Magnitudes | METEO | IRRIGATION | AQUALEAK |
 |--------|-----------|:-----:|:----------:|:---------:|
 | **MCP9808** | Temperatura exterior | ✓ | — | — |
 | **HTU2x** | Temperatura + humedad | ✓ | — | — |
@@ -717,15 +717,15 @@ Los botones (GPIO0/BOOT y GPIO35) reactivan la pantalla y reinician el timer de 
 
 ## Sensor de suelo RS485 Helissense
 
-Solo `PROFILE_METEO`. Sensor Modbus RTU conectado por RS485 half-duplex a `Serial2`.
+Disponible en `PROFILE_METEO`, `PROFILE_IRRIGATION` y `PROFILE_AQUA_SMART_REMOTE`. Sensor Modbus RTU conectado por RS485 half-duplex a `Serial2`.
 
 ### Hardware y pines
 
-| Señal | GPIO | Notas |
-|-------|:----:|-------|
-| Serial2 RX (DI del sensor) | **13** | NO usar GPIO16 — es TFT_DC |
-| Serial2 TX (RO del sensor) | 17 | |
-| DE/RE (control half-duplex) | 27 | |
+| Perfil | RX (ESP32 ← sensor) | TX (ESP32 → sensor) | DE/RE | Notas |
+|--------|:-------------------:|:-------------------:|:-----:|-------|
+| METEO | 13 | 17 | 27 | NO usar GPIO16 — es TFT_DC |
+| IRRIGATION | 14 | 13 | 27 | |
+| AQUA_SMART_REMOTE | 18 | 19 | 23 | Pines libres, sin conflicto con SD card ni modem |
 
 > **Advertencia de hardware:** GPIO16 está asignado a TFT_DC por `Setup25_TTGO_T_Display.h`. Si el RX de RS485 se conecta a GPIO16, TFT_eSPI inyecta transiciones falsas en UART2 que corrompen las lecturas del sensor y provocan que los colores de la pantalla cambien aleatoriamente. Conectar siempre el DI del adaptador RS485 a **GPIO13**.
 

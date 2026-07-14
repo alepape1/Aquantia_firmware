@@ -69,7 +69,7 @@ Core 0 (networkTask) — Conectividad
 | **METEO** | 1 | LilyGo TTGO T-Display | WiFi + OTA | 1 × GPIO26 | ST7789 240×135 | MCP9808, HTU2x, DHT11, BMP280, MicroPressure, TSL2584/APDS, Helissense RS485, YL-69 ADC |
 | **IRRIGATION** | 2 | ESP32 4-Relay Board | WiFi + OTA | 4 × GPIO32/33/25/26 | — | AHT20, INA219, BMP280, Helissense RS485 |
 | **AQUALEAK** | 3 | Wemos D1 Mini ESP32 + CJMCU-14 | WiFi + OTA | 1 × GPIO26 | — | BH1750, HDC1080, BMP280, MicroPressure, LeakDetector completo |
-| **AQUA_SMART_REMOTE** | 4 | LilyGO T-SIM7000G | LTE-M/2G + BearSSL | 4 × GPIO32/33/25/26 | — | AHT20, INA219, BMP280, Helissense RS485; payload slim ~350 B |
+| **AQUA_SMART_REMOTE** | 4 | LilyGO T-SIM7000G | LTE-M/2G + BearSSL | 4 × GPIO32/33/16/17 | — | AHT20, INA219, BMP280, Helissense RS485; payload slim ~350 B |
 
 ### Cadena de fallback de sensores
 
